@@ -26,6 +26,7 @@ dependencies = [
     "fhaviary[server]>=0.31.0",  # Pin for Message.is_multimodal fix
     "jupyter-client",
     "nbformat",
+    "pillow",
     "pydantic",
 ]
 description = "hypotest package"
