@@ -10,11 +10,9 @@ import asyncio
 import logging
 import os
 import time
-from enum import StrEnum
 from pathlib import Path
 from typing import Any, cast
 
-import nbformat
 from jupyter_client.asynchronous.client import AsyncKernelClient
 from jupyter_client.manager import AsyncKernelManager
 from nbformat import NotebookNode
@@ -22,68 +20,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import config as cfg
 from . import utils
+from .kernel_server import MessageType
 
 logger = logging.getLogger(__name__)
-
-
-class MessageType(StrEnum):
-    """Jupyter kernel IOPub message types.
-
-    See: https://jupyter-client.readthedocs.io/en/latest/messaging.html#messages-on-the-iopub-pub-sub-channel
-    """
-
-    STREAM = "stream"
-    EXECUTE_RESULT = "execute_result"
-    DISPLAY_DATA = "display_data"
-    ERROR = "error"
-    STATUS = "status"
-
-    @classmethod
-    def from_string(cls, value: str) -> MessageType | None:
-        """Convert string to MessageType, returning None for unknown types."""
-        try:
-            return cls(value)
-        except ValueError:
-            return None
-
-    def to_notebook_output(self, content: dict[str, Any]) -> NotebookNode | None:
-        """Convert this message type to an nbformat output node.
-
-        Args:
-            content: The message content dictionary from the kernel
-
-        Returns:
-            NotebookNode output or None if this message type doesn't produce output
-        """
-        match self:
-            case MessageType.STREAM:
-                return nbformat.v4.new_output(
-                    output_type="stream",
-                    name=content.get("name", "stdout"),
-                    text=content.get("text", ""),
-                )
-            case MessageType.EXECUTE_RESULT:
-                return nbformat.v4.new_output(
-                    output_type="execute_result",
-                    data=content.get("data", {}),
-                    metadata=content.get("metadata", {}),
-                    execution_count=content.get("execution_count"),
-                )
-            case MessageType.DISPLAY_DATA:
-                return nbformat.v4.new_output(
-                    output_type="display_data",
-                    data=content.get("data", {}),
-                    metadata=content.get("metadata", {}),
-                )
-            case MessageType.ERROR:
-                return nbformat.v4.new_output(
-                    output_type="error",
-                    ename=content.get("ename", ""),
-                    evalue=content.get("evalue", ""),
-                    traceback=content.get("traceback", []),
-                )
-            case MessageType.STATUS:
-                return None
 
 
 class ExecutionResult(BaseModel):

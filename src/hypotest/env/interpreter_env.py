@@ -4,15 +4,20 @@ This module provides a lightweight, execution-focused environment for running
 code in Jupyter kernels. It focuses on direct code execution via run_cell().
 """
 
+import asyncio
 import logging
 import os
 import shutil
+import socket
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+import aiodocker
+import httpx
 import nbformat
 import numpy as np
+import tenacity
 from aviary.core import (
     EnvStateMessage,
     Frame,
@@ -27,13 +32,29 @@ from pydantic import BaseModel, Field
 
 from . import config as cfg
 from .config import ExecutionConfig
-from .interpreter import Interpreter
+from .interpreter import ExecutionResult, Interpreter
 from .prompts import PromptingConfig
 from .tools.filesystem import list_dir_tool
 from .utils import NBLanguage
 
 if TYPE_CHECKING:
-    from .interpreter import ExecutionResult
+    from aiodocker.containers import DockerContainer
+
+
+# Port management for Docker containers
+_USED_PORTS: set[int] = set()
+
+
+def get_free_port() -> int:
+    """Get a free port for the kernel server container."""
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            port = s.getsockname()[1]
+        if port not in _USED_PORTS:
+            _USED_PORTS.add(port)
+            return port
+
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +72,7 @@ class InterpreterEnvState:
     """State container for the InterpreterEnv.
 
     Manages the kernel, notebook state, and execution tracking.
+    Supports both local kernel execution and Docker-based execution.
     """
 
     def __init__(
@@ -60,29 +82,40 @@ class InterpreterEnvState:
         execution_timeout: int = 600,
         use_host_env_vars: bool = False,
         extra_envs: dict[str, str] | None = None,
+        use_docker: bool = cfg.USE_DOCKER,
     ):
         self.work_dir = work_dir
         self.language = language
+        self.execution_timeout = execution_timeout
         self.total_reward = 0.0
         self.use_host_env_vars = use_host_env_vars
         self.extra_envs = extra_envs or {}
         self.answer: str | float | int | dict[str, Any] | None = None
         self.actions: list[str] = []
         self.done = False
+        self.use_docker = use_docker
 
         # Create kernel metadata directory OUTSIDE work_dir
         self.kernel_meta_dir = work_dir.parent / f".kernel_meta_{work_dir.name}"
         self.kernel_meta_dir.mkdir(exist_ok=True)
 
-        # Initialize interpreter (kernel manager)
-        self.interpreter = Interpreter(
-            work_dir=work_dir,
-            language=language,
-            execution_timeout=execution_timeout,
-            use_host_env_vars=use_host_env_vars,
-            extra_envs=extra_envs,
-            kernel_meta_dir=self.kernel_meta_dir,
-        )
+        # Local interpreter (only used when use_docker=False)
+        self.interpreter: Interpreter | None = None
+        if not use_docker:
+            self.interpreter = Interpreter(
+                work_dir=work_dir,
+                language=language,
+                execution_timeout=execution_timeout,
+                use_host_env_vars=use_host_env_vars,
+                extra_envs=extra_envs,
+                kernel_meta_dir=self.kernel_meta_dir,
+            )
+
+        # Docker container state (only used when use_docker=True)
+        self._docker_client: aiodocker.Docker | None = None
+        self._container: DockerContainer | None = None
+        self._container_port: int | None = None
+        self._http_client: httpx.AsyncClient | None = None
 
         # Initialize notebook structure for state tracking
         self.nb: NotebookNode = nbformat.v4.new_notebook()
@@ -91,12 +124,120 @@ class InterpreterEnvState:
         self._execution_count = 0
 
     async def start(self):
-        """Start the interpreter."""
-        await self.interpreter.start()
+        """Start the interpreter (local or Docker-based)."""
+        if self.use_docker:
+            await self._start_container()
+        else:
+            assert self.interpreter is not None
+            await self.interpreter.start()
+
+    async def _start_container(self) -> None:
+        """Start a Docker container with the kernel server."""
+        self._docker_client = aiodocker.Docker()
+        self._container_port = get_free_port()
+
+        docker_config = {
+            "Image": cfg.NB_ENVIRONMENT_DOCKER_IMAGE,
+            "Cmd": [
+                "/app/kernel_env/bin/python",
+                "/envs/kernel_server.py",
+                "--work_dir",
+                "/workspace",
+                "--language",
+                self.language.value,
+            ],
+            "HostConfig": {
+                "Binds": [f"{self.work_dir}:/workspace"],
+                "PortBindings": {f"{cfg.KERNEL_SERVER_PORT}/tcp": [{"HostPort": str(self._container_port)}]},
+            },
+            "WorkingDir": "/workspace",
+            "Tty": True,
+            "ExposedPorts": {f"{cfg.KERNEL_SERVER_PORT}/tcp": {}},
+        }
+
+        self._container = await self._docker_client.containers.run(config=cast(dict[str, Any], docker_config))
+        logger.info(f"Started container on port {self._container_port}")
+
+        # Create HTTP client
+        self._http_client = httpx.AsyncClient(
+            base_url=f"http://localhost:{self._container_port}",
+            timeout=httpx.Timeout(self.execution_timeout + 10, connect=30.0),
+        )
+
+        # Wait for health check
+        await self._wait_for_health()
+
+    async def _wait_for_health(self) -> None:
+        """Wait for the kernel server to become healthy."""
+        start_time = time.perf_counter()
+        while time.perf_counter() - start_time < cfg.KERNEL_SERVER_STARTUP_TIMEOUT:
+            try:
+                assert self._http_client is not None
+                response = await self._http_client.get("/health")
+                if response.status_code == 200:
+                    logger.info("Kernel server is healthy")
+                    return
+            except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError):
+                pass
+            await asyncio.sleep(0.5)
+        raise TimeoutError(f"Kernel server did not become healthy within {cfg.KERNEL_SERVER_STARTUP_TIMEOUT}s")
+
+    @tenacity.retry(
+        retry=tenacity.retry_if_exception_type((httpx.ConnectError, httpx.ReadError)),
+        stop=tenacity.stop_after_attempt(3),
+        wait=tenacity.wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
+    async def _execute_via_http(self, code: str, timeout: float | None = None) -> ExecutionResult:  # noqa: ASYNC109
+        """Execute code via HTTP to the containerized kernel server."""
+        assert self._http_client is not None
+
+        response = await self._http_client.post(
+            "/execute",
+            json={"code": code, "timeout": timeout},
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        # Convert serialized outputs back to NotebookNode
+        notebook_outputs = [nbformat.from_dict(o) for o in data["notebook_outputs"]]
+
+        return ExecutionResult(
+            notebook_outputs=notebook_outputs,
+            error_occurred=data["error_occurred"],
+            execution_time=data.get("execution_time"),
+        )
+
+    async def _reset_via_http(self) -> None:
+        """Reset the kernel via HTTP."""
+        assert self._http_client is not None
+        response = await self._http_client.post("/reset")
+        response.raise_for_status()
 
     async def close(self):
-        """Close the interpreter."""
-        await self.interpreter.close()
+        """Close the interpreter or container."""
+        if self.use_docker:
+            if self._container_port is not None:
+                _USED_PORTS.discard(self._container_port)
+
+            if self._http_client is not None:
+                await self._http_client.aclose()
+                self._http_client = None
+
+            if self._container is not None:
+                try:
+                    await self._container.stop()
+                    await self._container.delete()
+                except Exception as e:
+                    logger.warning(f"Failed to stop/delete container: {e}")
+                self._container = None
+
+            if self._docker_client is not None:
+                await self._docker_client.close()
+                self._docker_client = None
+        elif self.interpreter is not None:
+            await self.interpreter.close()
+
         if self.kernel_meta_dir.exists():
             shutil.rmtree(self.kernel_meta_dir)
 
@@ -151,12 +292,34 @@ class InterpreterEnvState:
                 ]
                 self.notebook_runtime_errors.append(f"Cell {idx + 1}: {error_msg}")
 
+    def get_execution_summary(self) -> dict[str, Any]:
+        """Get a summary of execution history and current state.
+
+        Works in both local and Docker modes.
+        """
+        if not self.use_docker and self.interpreter is not None:
+            return self.interpreter.get_execution_summary()
+
+        # For Docker mode, build summary from notebook state
+        error_count = len(self.notebook_runtime_errors)
+        recent_errors = self.notebook_runtime_errors[-3:] if self.notebook_runtime_errors else []
+
+        return {
+            "total_executions": self._execution_count,
+            "error_count": error_count,
+            "recent_errors": recent_errors,
+            "last_execution": None,  # Not tracked in Docker mode
+            "is_ready": self._http_client is not None,
+            "language": self.language.value,
+            "work_dir": str(self.work_dir),
+        }
+
     async def execute_and_add_cell(
         self,
         code: str,
         cell_idx: int | None = None,
         timeout: float | None = None,  # noqa: ASYNC109
-    ) -> tuple["ExecutionResult", int]:
+    ) -> tuple[ExecutionResult, int]:
         """Execute code and atomically update notebook.
 
         Args:
@@ -167,7 +330,11 @@ class InterpreterEnvState:
         Returns:
             Tuple of (ExecutionResult, actual_cell_index)
         """
-        result = await self.interpreter.execute_code(code, timeout)
+        if self.use_docker:
+            result = await self._execute_via_http(code, timeout)
+        else:
+            assert self.interpreter is not None
+            result = await self.interpreter.execute_code(code, timeout)
 
         if cell_idx is None or cell_idx >= len(self.nb.cells):
             actual_idx = self._add_cell(code, result)
@@ -394,7 +561,11 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         This clears all variables and execution state.
         """
-        await self.state.interpreter.reset()
+        if self.state.use_docker:
+            await self.state._reset_via_http()
+        else:
+            assert self.state.interpreter is not None
+            await self.state.interpreter.reset()
 
         # Reset notebook state to match kernel reset
         self.state.nb = nbformat.v4.new_notebook()
@@ -465,7 +636,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
     def get_env_state_msg(self) -> EnvStateMessage:
         """Get the current environment state message."""
-        summary = self.state.interpreter.get_execution_summary()
+        summary = self.state.get_execution_summary()
 
         state_summary = (
             f"{summary['language']} Interpreter Environment\n"

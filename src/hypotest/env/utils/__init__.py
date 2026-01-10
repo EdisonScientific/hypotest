@@ -19,6 +19,8 @@ __all__ = [
     "view_notebook",
 ]
 
+from hypotest.env.kernel_server import NBLanguage
+
 from .core import extract_code_from_markdown, extract_xml_content
 from .img_utils import (
     compress_image_if_needed,
@@ -29,7 +31,6 @@ from .img_utils import (
 from .notebook_utils import (
     JUPYTER_IMAGE_OUTPUT_TYPES,
     JUPYTER_TABLE_OUTPUT_TYPES_TO_IGNORE,
-    NBLanguage,
     collect_notebook_stats,
     exec_cmd,
     limit_notebook_output,

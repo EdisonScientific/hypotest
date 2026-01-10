@@ -176,6 +176,9 @@ RUN /app/kernel_env/bin/python -m ipykernel install --name python3 --display-nam
     export PATH="/app/kernel_env/bin:$PATH" && \
     /app/kernel_env/bin/R -e 'IRkernel::installspec(user = FALSE, name = "ir", displayname = "R")'
 
+# Install kernel server dependencies
+RUN /app/kernel_env/bin/pip install --no-cache-dir fastapi uvicorn
+
 # Clean up conda caches
 RUN mamba clean -all -y && \
     find /app/miniconda \( -type d -name __pycache__ -o -type d -name tests -o -type d -name '*.tests' -o -type d -name 'test' \) -exec rm -rf {} + || true && \
@@ -185,7 +188,10 @@ RUN mamba clean -all -y && \
     find /app/kernel_env -type f -name '*.a' -delete && \
     find /app/kernel_env -type f -name '*.js.map' -delete
 
-WORKDIR /work
-EXPOSE 8888
+# Copy kernel server for Docker-based execution
+COPY src/hypotest/env/kernel_server.py /envs/kernel_server.py
 
-CMD ["/app/kernel_env/bin/jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root", "--NotebookApp.token=''"]
+WORKDIR /workspace
+EXPOSE 8000
+
+CMD ["/app/kernel_env/bin/python", "/envs/kernel_server.py", "--work_dir", "/workspace"]

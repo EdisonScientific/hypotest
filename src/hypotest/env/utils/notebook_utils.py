@@ -3,8 +3,7 @@
 import asyncio
 import logging
 from collections.abc import Iterable
-from enum import StrEnum, auto
-from typing import TYPE_CHECKING, assert_never
+from typing import TYPE_CHECKING
 
 import nbformat
 from aiodocker.containers import DockerContainer
@@ -30,35 +29,6 @@ JUPYTER_TABLE_OUTPUT_TYPES_TO_IGNORE = {
     "text/markdown",
     "application/vnd.jupyter.widget-view+json",
 }
-
-
-class NBLanguage(StrEnum):
-    PYTHON = auto()
-    R = auto()
-
-    def make_kernelspec(self) -> dict[str, str]:
-        match self:
-            # These are the default kernelspecs set by Jupyter and IRkernel respectively.
-            case NBLanguage.PYTHON:
-                kspec = {"name": "python", "display_name": "Python 3 (ipykernel)"}
-            case NBLanguage.R:
-                kspec = {"name": "ir", "display_name": "R"}
-            case _:
-                assert_never(self)
-
-        return kspec | {"language": self.value}
-
-    @classmethod
-    def from_string(cls, s: str) -> "NBLanguage | None":
-        """Parse language string, returning None for AUTO."""
-        s = s.upper()
-        if s == "AUTO":
-            return None
-        try:
-            return cls[s]
-        except KeyError:
-            logger.warning(f"Invalid language '{s}', defaulting to PYTHON")
-            return cls.PYTHON
 
 
 def limit_notebook_output(output: str | list[str]) -> str:
