@@ -21,7 +21,9 @@ classifiers = [
     "Programming Language :: Python",
     "Topic :: Software Development",
 ]
-dependencies = []
+dependencies = [
+    "pydantic",
+]
 description = "hypotest package"
 keywords = []
 maintainers = [
@@ -33,7 +35,10 @@ requires-python = ">=3.11,<3.14"
 version = "0.0.1"
 
 [project.optional-dependencies]
-dev = []
+dev = [
+    "mypy>=1.8",
+    "prek",
+]
 
 [tool.codespell]
 check-filenames = true
