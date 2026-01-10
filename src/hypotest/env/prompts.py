@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from . import config as cfg
-
 CPU_ENVIRONMENT_CAPABILITIES = """5. Your environment has multiple CPUs and ample RAM
 
 You are operating in a fully-equipped production environment with significant computational resources, internet access, and all necessary tools for advanced data analysis, API calls, and data retrieval. You do NOT have access to GPUs or any other specialized hardware and you are limited to {job_timeout} seconds of runtime."""
@@ -135,6 +133,7 @@ class PromptingConfig(BaseModel):
     """
 
     system_prompt: str = Field(default=DEFAULT_SYSTEM_PROMPT)
+    output_format_prompt: str = ""
     additional_system_prompt_guidelines: str = ""
 
     def interpolate(

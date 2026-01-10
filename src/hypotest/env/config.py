@@ -3,16 +3,15 @@ from pathlib import Path
 
 from pydantic import BaseModel, model_validator
 
+AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "30"))
+
 USE_DOCKER = bool(os.getenv("USE_DOCKER", "false").lower() == "true")
 USE_HOST_ENV_VARS = bool(os.getenv("USE_HOST_ENV_VARS", "false").lower() == "true")
 REQUIRED_PATH_ENV_VARS = os.getenv("REQUIRED_PATH_ENV_VARS", "PATH,PYTHONPATH,CUDA_HOME,LD_LIBRARY_PATH,PATH']").split(
     ","
 )
 NB_ENVIRONMENT_DOCKER_IMAGE = os.getenv("NB_ENVIRONMENT_DOCKER_IMAGE", "interpreter-env:latest")
-USE_KERNEL_ISOLATION = os.getenv("USE_KERNEL_ISOLATION", "true").lower() == "true"
-KERNEL_USER = os.getenv("KERNEL_USER", "kerneluser")
 KERNEL_ENV_PATH = os.getenv("KERNEL_ENV_PATH", "/app/kernel_env")
-PACKAGE_NAME = "heron"
 
 MAX_FILES_TO_UPLOAD = int(os.getenv("MAX_FILES_TO_UPLOAD", "100"))
 
@@ -28,17 +27,6 @@ DATA_STORAGE_PATH = Path("storage") if STAGE == "local" else Path("/storage")
 
 VALID_FROM_TASK_KWARGS = [
     "run_notebook_on_edit",
-    "additional_tools",
-]
-
-DEFAULT_DA_ADDITIONAL_TOOLS = ["query_biology_databases"]
-DEFAULT_ADDITIONAL_TOOLS = [
-    "filesystem",
-    "todo_write",
-    "think",
-    "task",
-    "skill",
-    "get_guidance",
 ]
 
 

@@ -1,9 +1,5 @@
 import logging
-import shutil
-from importlib.resources import as_file, files
 from pathlib import Path
-
-from hypotest.env import config as cfg
 
 logger = logging.getLogger(__name__)
 
@@ -25,17 +21,3 @@ def validate_workspace_path(workspace_path: Path) -> None:
         logger.warning(f"No files found in workspace path: {workspace_path}")
 
     # TODO: check that config and packages directories exist?
-
-
-def install_config(dest: Path) -> Path:
-    """Copy packaged `config/` directory to dest."""
-    dest.mkdir(parents=True, exist_ok=True)
-
-    src_traversable = files(cfg.PACKAGE_NAME).joinpath("config")
-    if not src_traversable.is_dir():
-        raise RuntimeError(f"Could not find '{cfg.PACKAGE_NAME}/config' in the installed package.")
-
-    with as_file(src_traversable) as src_path:
-        shutil.copytree(src_path, dest, dirs_exist_ok=True)
-
-        return dest

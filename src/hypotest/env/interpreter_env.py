@@ -22,30 +22,15 @@ from aviary.core import (
     ToolRequestMessage,
 )
 from aviary.env import Environment
-from heron.utils.workspace_utils import (
-    collect_input_data,
-    fetch_continuation_data,
-    install_config,
-    resolve_auto_language,
-    validate_workspace_path,
-)
-from lmi.cost_tracker import GLOBAL_COST_TRACKER, enable_cost_tracking
 from nbformat import NotebookNode
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 from . import config as cfg
-from . import prompts
 from .config import ExecutionConfig
 from .interpreter import Interpreter
-from .prompts import LLMConfig, PromptingConfig
+from .prompts import PromptingConfig
 from .tools.filesystem import list_dir_tool
-from .tools.registry import resolve_tools
-from .utils import (
-    NBLanguage,
-    TrajectoryLoggerAdapter,
-    download_files_from_data_storage_service,
-    upload_files_from_trajectory_run,
-)
+from .utils import NBLanguage
 
 if TYPE_CHECKING:
     from .interpreter import ExecutionResult
@@ -56,37 +41,10 @@ logger = logging.getLogger(__name__)
 class InterpreterConfig(BaseModel):
     """Configuration for preparing the InterpreterEnv during task creation."""
 
-    # Core configs
-    user_id: str | None = None
-    trajectory_id: str | None = None
-    language: NBLanguage | None = Field(default=None, description="None means 'auto' - to be resolved via LLM")
-    data_storage_uris: list[str] = Field(default_factory=list)
-
-    # Continuation-specific fields
-    continued_trajectory_id: str | None = None
-    previous_research_question: str | None = None
-    previous_final_answer: str | None = None
-
-    # Nested configs
+    language: NBLanguage = Field(default=NBLanguage.PYTHON)
     prompting_config: PromptingConfig = Field(default_factory=PromptingConfig)
-    llm_config: LLMConfig = Field(default_factory=LLMConfig)
     execution_config: ExecutionConfig = Field(default_factory=ExecutionConfig)
-
-    # Agent behavior limits
     max_steps: int = cfg.AGENT_MAX_STEPS
-
-    # Environment kwargs extracted from environment_config
-    additional_tools: list[str] | None = Field(
-        default=None,
-        description="Additional tools to register beyond the defaults",
-    )
-
-    @model_validator(mode="after")
-    def validate_config_requirements(self) -> "InterpreterConfig":
-        """Validate that required conditions are met."""
-        if not self.continued_trajectory_id and not self.data_storage_uris:
-            logger.warning("Running jobs without data_storage_uris")
-        return self
 
 
 class InterpreterEnvState:
@@ -112,7 +70,6 @@ class InterpreterEnvState:
         self.actions: list[str] = []
         self.done = False
 
-        self.use_kernel_isolation = cfg.USE_KERNEL_ISOLATION
         # Create kernel metadata directory OUTSIDE work_dir
         self.kernel_meta_dir = work_dir.parent / f".kernel_meta_{work_dir.name}"
         self.kernel_meta_dir.mkdir(exist_ok=True)
@@ -124,7 +81,6 @@ class InterpreterEnvState:
             execution_timeout=execution_timeout,
             use_host_env_vars=use_host_env_vars,
             extra_envs=extra_envs,
-            use_kernel_isolation=self.use_kernel_isolation,
             kernel_meta_dir=self.kernel_meta_dir,
         )
 
@@ -236,12 +192,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         problem: str,
         work_dir: Path,
         config: InterpreterConfig | None = None,
-        additional_tools: list[str] | None = None,
-        enabled_subagents: list[str] | None = None,
         input_data: list[dict[str, str | int | None]] | None = None,
         use_host_env_vars: bool = False,
         extra_envs: dict[str, str] | None = None,
-        persist_outputs: bool = True,
         include_env_state_msg: bool = False,
     ):
         if config is None:
@@ -259,15 +212,11 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.execution_timeout = self.execution_config.cell_execution_timeout
         self.max_steps = self.config.max_steps
 
-        self.additional_tools = additional_tools if additional_tools is not None else cfg.DEFAULT_ADDITIONAL_TOOLS
-        self.enabled_subagents = enabled_subagents
         self.input_data = input_data
         self.output_data: list[dict[str, str | int]] = []
-        self.trajectory_id = config.trajectory_id
-        self.logger = TrajectoryLoggerAdapter(logger, {"trajectory_id": self.trajectory_id or "unknown"})
+        self.logger = logger
         self.start_time: float | None = None
         self.step_count = 0
-        self.persist_outputs = persist_outputs
         self.include_env_state_msg = include_env_state_msg
         self.state: InterpreterEnvState
         # prompting_config is set during reset() after language resolution
@@ -276,68 +225,21 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
     async def close(self) -> None:
         """Close the environment, save notebook, and upload files."""
         await super().close()
-
-        # Save notebook to disk
-        if self.state is not None:
-            nb_dir = self.work_dir / "notebooks"
-            nb_dir.mkdir(exist_ok=True)
-            nb_path = nb_dir / f"{self.trajectory_id}.ipynb"
-            try:
-                nbformat.write(self.state.nb, nb_path)
-                self.logger.info(f"Saved notebook to {nb_path}")
-            except Exception as e:
-                self.logger.warning(f"Failed to save notebook: {e}")
-
-            await self.state.close()
-
+        # TODO: save notebook to disk
         self.logger.info("Closing environment")
-        if self.persist_outputs:
-            self.logger.info("Uploading files to data storage service")
-            self.output_data = upload_files_from_trajectory_run(
-                input_data=self.input_data or [],
-                work_dir=self.work_dir,
-                trajectory_id=self.trajectory_id or "",
-            )
 
     async def reset(self) -> tuple[Messages, list[Tool]]:
         """Reset the environment and prepare for execution."""
-        # Handle language resolution (must happen before state creation
-        # because InterpreterEnvState needs the resolved language)
-        if self.language is None:
-            self.language = await resolve_auto_language(
-                self.language, self.problem, self.config.llm_config.utility_model
-            )
-            self.logger.info(f"Language resolved to: {self.language}")
-
-        # Interpolate prompting config now that language is resolved
-        language_display = self.language.value.capitalize()
-
         # Format environment capabilities with job_timeout
         env_capabilities = self.execution_config.environment_capabilities_prompt.format(
             job_timeout=self.execution_config.job_timeout
         )
 
         self.prompting_config = self.config.prompting_config.interpolate(
-            language=language_display,
+            language=self.language.value.capitalize(),
             environment_capabilities=env_capabilities,
             job_timeout=self.execution_config.job_timeout,
         )
-
-        # Handle continuation prompts if applicable
-        if self.config.continued_trajectory_id:
-            self.problem = prompts.INTERPRETER_CONTINUATION_PROMPT_TEMPLATE.format(
-                previous_research_question=self.config.previous_research_question or "",
-                previous_final_answer=self.config.previous_final_answer or "",
-                query=self.problem,
-            )
-            self.logger.info("Applied continuation prompt template")
-
-        # Set up config directory (must be writable)
-        config_dir = self.work_dir / ".config"
-        if config_dir.exists():
-            shutil.rmtree(config_dir)
-
-        install_config(config_dir)
 
         # Use kernel environment paths for isolated execution
         kernel_env_path = Path(cfg.KERNEL_ENV_PATH)
@@ -349,10 +251,6 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             execution_timeout=self.execution_timeout,
             use_host_env_vars=self.use_host_env_vars,
             extra_envs={
-                "XDG_CONFIG_HOME": str(config_dir),
-                # on non-linux, matploltlib will ignore XDG_CONFIG_HOME
-                # (this is for unit tests on mac)
-                "MPLCONFIGDIR": str(config_dir / "matplotlib"),
                 # Point to kernel environment's site-packages
                 "PYTHONPATH": str(kernel_site_packages),
                 # Include kernel environment bin in PATH
@@ -376,16 +274,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             Tool.from_function(self.run_cell),
             Tool.from_function(self.reset_kernel),
             Tool.from_function(self.submit_answer),
+            Tool.from_function(list_dir_tool),
         ]
-
-        # Add additional tools from registry (includes filesystem tools with list_dir)
-        if self.additional_tools:
-            additional = resolve_tools(
-                self.additional_tools,
-                self.work_dir,
-                enabled_subagents=self.enabled_subagents,
-            )
-            self.tools.extend(additional)
 
         messages.append(Message(content=self.problem))
 
@@ -567,7 +457,6 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             info={
                 "language": self.state.language,
                 "problem": self.problem,
-                "cost": GLOBAL_COST_TRACKER.lifetime_cost_usd,
                 "work_dir": self.work_dir,
                 "input_data": self.input_data,
                 "output_data": self.output_data,
@@ -610,116 +499,3 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 state_summary += f"Images generated: {images_count}\n"
 
         return EnvStateMessage.create_message(text=state_summary, images=[])
-
-    # ========== Factory Methods ==========
-
-    @staticmethod
-    def _build_config(
-        trajectory_id: str | None = None,
-        user_id: str | None = None,
-        environment_config: dict[str, Any] | None = None,
-        continued_trajectory_id: str | None = None,
-    ) -> InterpreterConfig:
-        """Build and validate config given task specification."""
-        safe_env_config = environment_config or {}
-        safe_user_id = user_id or "default_user"
-        safe_trajectory_id = trajectory_id or f"trajectory-{time.time()}"
-
-        data_storage_uris = safe_env_config.get("data_storage_uris", [])
-        language_str = safe_env_config.get("language", "AUTO").upper()
-        prompting_config = PromptingConfig(**safe_env_config.get("prompting_config", {}))
-        llm_config = LLMConfig(**safe_env_config.get("llm_config", {}))
-
-        # Build execution config from deployment profile
-        profile = os.getenv("DEPLOYMENT_PROFILE") or safe_env_config.get("deployment_profile", "standard")
-        exec_config = ExecutionConfig.from_profile(profile)
-
-        language = NBLanguage.from_string(language_str)
-
-        # Config validation is performed automatically by Pydantic model validators
-        return InterpreterConfig(
-            user_id=safe_user_id,
-            trajectory_id=safe_trajectory_id,
-            continued_trajectory_id=continued_trajectory_id,
-            language=language,
-            data_storage_uris=data_storage_uris,
-            additional_tools=safe_env_config.get("additional_tools"),
-            prompting_config=prompting_config,
-            llm_config=llm_config,
-            execution_config=exec_config,
-        )
-
-    @classmethod
-    def from_task(
-        cls,
-        task: str,
-        *,
-        trajectory_id: str | None = None,
-        user_id: str | None = None,
-        environment_config: dict[str, Any] | None = None,
-        continued_trajectory_id: str | None = None,
-        user_jwt: str | None = None,
-    ) -> "InterpreterEnv":
-        """Create an InterpreterEnv from a task specification.
-
-        Args:
-            task: The user query/research question
-            trajectory_id: Unique identifier for this trajectory
-            user_id: Unique identifier for the user
-            environment_config: Environment configuration dict
-            continued_trajectory_id: ID of trajectory to continue from
-            user_jwt: JWT token for the user
-
-        Returns:
-            Configured InterpreterEnv instance
-        """
-        logger.info(
-            "\n".join([
-                f"User task: {task[:50]}",
-                f"environment_config: {environment_config}",
-                f"trajectory_id: {trajectory_id}",
-                f"user_id: {user_id}",
-                f"continued_trajectory_id: {continued_trajectory_id}",
-            ])
-        )
-
-        enable_cost_tracking()
-
-        # Build configuration
-        config = cls._build_config(
-            trajectory_id=trajectory_id,
-            user_id=user_id,
-            environment_config=environment_config,
-            continued_trajectory_id=continued_trajectory_id,
-        )
-
-        config = fetch_continuation_data(config)
-        workspace_path = Path(cfg.DATA_STORAGE_PATH) if cfg.STAGE == "local" else cfg.DATA_STORAGE_PATH / "workspace"
-
-        logger.info("Creating InterpreterEnv with workspace_path: %s", workspace_path)
-
-        # Download files
-        workspace_path, files_downloaded = download_files_from_data_storage_service(
-            workspace_path,
-            config.data_storage_uris,
-            user_jwt=user_jwt,
-            trajectory_id=trajectory_id,
-        )
-
-        validate_workspace_path(workspace_path)
-
-        input_data = collect_input_data(
-            workspace_path,
-            files_downloaded,
-            config.data_storage_uris,
-        )
-
-        # Create environment - language resolution and prompt interpolation happen in reset()
-        return cls(
-            problem=task,
-            work_dir=workspace_path,
-            config=config,
-            additional_tools=config.additional_tools,
-            user_jwt=user_jwt,
-            input_data=input_data,
-        )

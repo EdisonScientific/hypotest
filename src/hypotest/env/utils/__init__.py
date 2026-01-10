@@ -10,6 +10,8 @@ __all__ = [
     "encode_image_to_base64",
     "ensure_dir_exists",
     "exec_cmd",
+    "extract_code_from_markdown",
+    "extract_xml_content",
     "limit_notebook_output",
     "nbformat_run_notebook",
     "process_cell_output",
@@ -17,6 +19,7 @@ __all__ = [
     "view_notebook",
 ]
 
+from .core import extract_code_from_markdown, extract_xml_content
 from .img_utils import (
     compress_image_if_needed,
     create_image_message,
