@@ -9,7 +9,7 @@ dev = [
 
 [project]
 authors = [
-    {email = "hello@futurehouse.org", name = "FutureHouse technical staff"},
+    {email = "support@edisonscientific.com", name = "Edison Scientific Technical Staff"},
 ]
 classifiers = [
     "Intended Audience :: Developers",
@@ -22,12 +22,16 @@ classifiers = [
     "Topic :: Software Development",
 ]
 dependencies = [
+    "aiodocker",
+    "fhaviary[server]>=0.31.0",  # Pin for Message.is_multimodal fix
+    "jupyter-client",
+    "nbformat",
     "pydantic",
 ]
 description = "hypotest package"
 keywords = []
 maintainers = [
-    {email = "hello@futurehouse.org", name = "FutureHouse technical staff"},
+    {email = "support@edisonscientific.com", name = "Edison Scientific Technical Staff"},
 ]
 name = "hypotest"
 readme = "README.md"
@@ -36,8 +40,20 @@ version = "0.0.1"
 
 [project.optional-dependencies]
 dev = [
+    "fhlmi>=0.25.0",  # Pin for headers
     "mypy>=1.8",
     "prek",
+    "pytest-asyncio",
+    "pytest-recording",
+    "pytest-rerunfailures",
+    "pytest-subtests",  # TODO remove after pytest v9
+    "pytest-sugar",
+    "pytest-timeout",
+    "pytest-timer[colorama]",
+    "pytest-xdist",
+    "pytest>=8",  # Pin to keep recent
+    "types-Flask-SocketIO>=5.3.0",
+    "vcrpy>=8",  # Pin for dropping unused requests support
 ]
 
 [tool.codespell]
