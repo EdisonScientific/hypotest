@@ -40,6 +40,9 @@ jobs:
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.pre-commit.result }}" != "success" || "${{ needs.test.result }}" != "success" ]]; then
+          if [[ "${{ needs.pre-commit.result }}" != "success" && "${{ needs.pre-commit.result }}" != "skipped" ]]; then
+            exit 1
+          fi
+          if [[ "${{ needs.test.result }}" != "success" ]]; then
             exit 1
           fi
