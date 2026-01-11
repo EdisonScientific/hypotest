@@ -23,10 +23,14 @@ classifiers = [
 ]
 dependencies = [
     "aiodocker",
-    "fhaviary[server]>=0.31.0",  # Pin for Message.is_multimodal fix
+    "fhaviary[server,notebook]>=0.31.0",  # Pin for Message.is_multimodal fix
+    "httpx>=0.27",
     "jupyter-client",
     "nbformat",
+    "numpy",
+    "pillow",
     "pydantic",
+    "tenacity>=8.0",
 ]
 description = "hypotest package"
 keywords = []
@@ -41,6 +45,7 @@ version = "0.0.1"
 [project.optional-dependencies]
 dev = [
     "fhlmi>=0.25.0",  # Pin for headers
+    "matplotlib",  # For tests that generate plots
     "mypy>=1.8",
     "prek",
     "pytest-asyncio",
@@ -390,6 +395,7 @@ ignore = [
     "TD003",
     "TID252",
     "TRY003",
+    "W505",
 ]
 preview = true
 select = ["ALL"]
@@ -408,6 +414,9 @@ unfixable = [
 mypy-init-return = true
 
 [tool.ruff.lint.per-file-ignores]
+"**/prompts.py" = [
+    "E501",
+]
 "**/tests/*.py" = [
     "N802",
     "PLR0914",
