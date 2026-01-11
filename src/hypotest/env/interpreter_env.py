@@ -4,14 +4,18 @@ This module provides a lightweight, execution-focused environment for running
 code in Jupyter kernels. It focuses on direct code execution via run_cell().
 """
 
+import argparse
 import asyncio
+import json
 import logging
 import os
 import shutil
 import socket
 import time
 from pathlib import Path
+from tempfile import mkdtemp
 from typing import TYPE_CHECKING, Any, cast
+from uuid import UUID
 
 import aiodocker
 import httpx
@@ -24,18 +28,20 @@ from aviary.core import (
     Message,
     Messages,
     Tool,
+    ToolCall,
     ToolRequestMessage,
 )
 from aviary.env import Environment
+from lmi import LiteLLMModel
 from nbformat import NotebookNode
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, JsonValue
 
 from . import config as cfg
 from .config import ExecutionConfig
 from .interpreter import ExecutionResult, Interpreter
-from .prompts import PromptingConfig
+from .prompts import CORRECT_MSG, INCORRECT_MSG, RUBRIC_SCORE_PROMPT, PromptingConfig
 from .tools.filesystem import list_dir_tool
-from .utils import NBLanguage
+from .utils import NBLanguage, view_notebook
 
 if TYPE_CHECKING:
     from aiodocker.containers import DockerContainer
@@ -59,13 +65,14 @@ def get_free_port() -> int:
 logger = logging.getLogger(__name__)
 
 
-class InterpreterConfig(BaseModel):
-    """Configuration for preparing the InterpreterEnv during task creation."""
-
-    language: NBLanguage = Field(default=NBLanguage.PYTHON)
-    prompting_config: PromptingConfig = Field(default_factory=PromptingConfig)
-    execution_config: ExecutionConfig = Field(default_factory=ExecutionConfig)
-    max_steps: int = cfg.AGENT_MAX_STEPS
+class ProblemInstance(BaseModel):
+    uuid: UUID
+    hypothesis: str
+    objective: str
+    accepted: bool = Field(alias="answer")
+    rubric: str
+    max_score: int = Field(alias="max_points")
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
 
 class InterpreterEnvState:
@@ -91,7 +98,7 @@ class InterpreterEnvState:
         self.total_reward = 0.0
         self.use_host_env_vars = use_host_env_vars
         self.extra_envs = extra_envs or {}
-        self.answer: str | float | int | dict[str, Any] | None = None
+        self.answer: str | None = None
         self.actions: list[str] = []
         self.done = False
         self.use_docker = use_docker
@@ -119,6 +126,10 @@ class InterpreterEnvState:
         self.nb.metadata.kernelspec = language.make_kernelspec()
         self.notebook_runtime_errors: list[str] = []
         self._execution_count = 0
+
+        self.raw_score: int = 0
+        self.score: float = 0.0
+        self.score_metadata: dict[str, str | int] = {}
 
     async def start(self):
         """Start the interpreter (local or Docker-based)."""
@@ -346,6 +357,17 @@ class InterpreterEnvState:
         return result, actual_idx
 
 
+class InterpreterEnvConfig(BaseModel):
+    """Configuration for preparing the InterpreterEnv during task creation."""
+
+    language: NBLanguage = Field(default=NBLanguage.PYTHON)
+    prompting_config: PromptingConfig = Field(default_factory=PromptingConfig)
+    execution_config: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    max_steps: int = cfg.AGENT_MAX_STEPS
+    use_docker: bool = cfg.USE_DOCKER
+    normalize_reward: bool = True
+
+
 class InterpreterEnv(Environment[InterpreterEnvState]):
     """Standalone environment for code execution and data analysis.
 
@@ -357,20 +379,19 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
     def __init__(
         self,
         *,
-        problem: str,
+        problem: ProblemInstance,
         work_dir: Path,
-        config: InterpreterConfig | None = None,
+        rubric_model: LiteLLMModel | None = None,
+        config: InterpreterEnvConfig | None = None,
         input_data: list[dict[str, str | int | None]] | None = None,
         use_host_env_vars: bool = False,
         extra_envs: dict[str, str] | None = None,
         include_env_state_msg: bool = False,
         save_dir: Path | None = None,
     ):
-        if config is None:
-            config = InterpreterConfig()
-        self.config = config
+        self.config = config or InterpreterEnvConfig()
         self.work_dir = work_dir
-        self.language = config.language  # Convenience attribute, may be None for auto
+        self.rubric_model = rubric_model
         self.done = False
         self.problem = problem
         self.use_host_env_vars = use_host_env_vars
@@ -391,6 +412,10 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.state: InterpreterEnvState
         # prompting_config is set during reset() after language resolution
         self.prompting_config: PromptingConfig
+
+    @property
+    def language(self) -> NBLanguage:
+        return self.config.language
 
     async def close(self) -> None:
         """Save notebook, shut down interpreter/container."""
@@ -429,6 +454,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             }
             | self.extra_envs,
             save_dir=self.save_dir,
+            use_docker=self.config.use_docker,
         )
         await self.state.start()
 
@@ -447,7 +473,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             Tool.from_function(list_dir_tool),
         ]
 
-        messages.append(Message(content=self.problem))
+        # TODO: FORMAT THIS PROPELRY
+        messages.append(Message(content=self.problem.hypothesis))
 
         if self.include_env_state_msg:
             messages.append(self.get_env_state_msg())
@@ -477,7 +504,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             obs.append(Message(content=cfg.FORCE_MSG))
 
         self.state.actions.append(str(action))
-        return obs, 0, self.state.done, False
+        reward = self.state.score if self.state.done else 0.0
+        return obs, reward, self.state.done, False
 
     # ========== Tools ==========
 
@@ -578,16 +606,79 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         return "Kernel reset successfully."
 
+    @property
+    def score_info_path(self) -> Path:
+        return self.work_dir / "score_info.json"
+
+    @tenacity.retry(stop=tenacity.stop_after_attempt(3), retry=tenacity.retry_if_exception_type(ValueError))
+    async def _score_solution(self, solution: str) -> bool:
+        assert self.rubric_model is not None
+        nb_content, _ = view_notebook(self.state.nb.cells, self.language.value)
+
+        prompt = self.state.score_metadata["prompt"] = RUBRIC_SCORE_PROMPT.format(
+            hypothesis=self.problem.hypothesis,
+            accepted=self.problem.accepted,
+            rubric=self.problem.rubric,
+            notebook=nb_content,
+            proposed_solution=solution,
+        )
+
+        resp = await self.rubric_model.call_single(prompt, timeout=3 * 60)
+        if not resp.text:
+            raise ValueError("No response from rubric model")
+        self.state.score_metadata["response"] = resp.text
+
+        try:
+            raw_score = int(resp.text.split("<score>")[1].split("</score>")[0])
+            self.state.raw_score = raw_score
+
+        except Exception as e:
+            raise ValueError("Failed to parse score from response") from e
+
+        else:
+            correct = raw_score == self.problem.max_score
+            score = raw_score / self.problem.max_score if self.config.normalize_reward else raw_score
+            score = max(
+                0.0,
+                min(1.0 if self.config.normalize_reward else self.problem.max_score, score),
+            )
+
+            self.state.score = score
+            self.state.total_reward += score
+            return correct
+
+        finally:
+            score_info = {
+                **self.state.score_metadata,
+                "score": self.state.score,
+                "raw_score": self.state.raw_score,
+                "max_score": self.problem.max_score,
+            }
+            with self.score_info_path.open("w") as f:
+                json.dump(score_info, f, indent=2)
+
+            self.logger.info(f"Received solution ({self.state.raw_score}/{self.problem.max_score}): {solution!r}.")
+
     async def submit_answer(self, answer: str) -> str:
         """Submit your response to the research question.
+
+        Note that this tool may only be called once and ends the episode.
 
         Args:
             answer: Your final response to the research question
         """
+        if self.state.done:
+            return "Episode already finished."
+
         self.state.answer = answer
         self.state.done = True
-        self.logger.info("Submitting answer: %s", answer)
-        return answer
+
+        if self.rubric_model is None:
+            self.logger.warning("No rubric_model configured, skipping scoring")
+            return answer
+
+        correct = await self._score_solution(answer)
+        return CORRECT_MSG if correct else INCORRECT_MSG
 
     # ========== Time Management ==========
 
@@ -627,6 +718,10 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 "done": self.state.done,
                 "nb_state": self.state.nb,
                 "nb_runtime_errors": self.state.notebook_runtime_errors,
+                "raw_score": self.state.raw_score,
+                "score": self.state.score,
+                "score_metadata": self.state.score_metadata,
+                "total_reward": self.state.total_reward,
             },
             info={
                 "language": self.state.language,
@@ -673,3 +768,40 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 state_summary += f"Images generated: {images_count}\n"
 
         return EnvStateMessage.create_message(text=state_summary, images=[])
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--work_dir")
+    args = parser.parse_args()
+
+    work_dir = Path(args.work_dir or mkdtemp())
+    print(f"Working directory: {work_dir}")
+
+    problem = ProblemInstance(
+        uuid="",
+        hypothesis="",
+        objective="",
+        answer=False,
+        rubric="",
+        max_points=0,
+        metadata={},
+    )
+
+    env = InterpreterEnv(problem=problem, work_dir=work_dir, config=InterpreterEnvConfig(use_docker=True))
+    await env.reset()
+
+    code = ""
+    done = False
+    while not done:
+        breakpoint()  # noqa: T100
+        action = ToolRequestMessage(tool_calls=[ToolCall.from_name("run_cell", code=code)])
+        obs, *_ = await env.step(action)
+        for msg in obs:
+            print(msg.content)
+
+    await env.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

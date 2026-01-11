@@ -7,30 +7,33 @@ import tempfile
 from collections.abc import AsyncGenerator
 from typing import Any
 from unittest.mock import patch
+from uuid import UUID
 
 import pytest
 import pytest_asyncio
 from aviary.core import Message, ToolCall, ToolRequestMessage, ToolResponseMessage
 from conftest import requires_matplotlib, should_skip_docker_test
+from lmi import LiteLLMModel
 
 from hypotest.env import config as cfg
 from hypotest.env.config import ExecutionConfig
 from hypotest.env.interpreter_env import (
-    InterpreterConfig,
     InterpreterEnv,
+    InterpreterEnvConfig,
     InterpreterEnvState,
+    ProblemInstance,
 )
 from hypotest.env.kernel_server import NBLanguage
 
 
 @pytest_asyncio.fixture
-async def interpreter_env() -> AsyncGenerator[InterpreterEnv, Any]:
+async def interpreter_env(default_problem: ProblemInstance) -> AsyncGenerator[InterpreterEnv, Any]:
     """Fixture that creates and cleans up InterpreterEnv (local mode)."""
     with tempfile.TemporaryDirectory() as tmp:
         env = InterpreterEnv(
-            problem="Test problem",
+            problem=default_problem,
             work_dir=pathlib.Path(tmp),
-            config=InterpreterConfig(language=NBLanguage.PYTHON),
+            config=InterpreterEnvConfig(language=NBLanguage.PYTHON),
         )
         await env.reset()
         try:
@@ -44,19 +47,19 @@ class TestInterpreterConfig:
 
     def test_interpreter_config_defaults(self):
         """Test InterpreterConfig has sensible defaults."""
-        config = InterpreterConfig()
+        config = InterpreterEnvConfig()
         assert config.language == NBLanguage.PYTHON
         assert isinstance(config.execution_config, ExecutionConfig)
         assert config.max_steps == cfg.AGENT_MAX_STEPS
 
     def test_interpreter_config_with_language(self):
         """Test InterpreterConfig with explicit language."""
-        config = InterpreterConfig(language=NBLanguage.R)
+        config = InterpreterEnvConfig(language=NBLanguage.R)
         assert config.language == NBLanguage.R
 
     def test_interpreter_config_has_execution_config(self):
         """Test InterpreterConfig has execution_config field with defaults."""
-        config = InterpreterConfig()
+        config = InterpreterEnvConfig()
         assert hasattr(config, "execution_config")
         assert isinstance(config.execution_config, ExecutionConfig)
         assert config.execution_config.job_timeout == 60 * 60
@@ -67,7 +70,7 @@ class TestInterpreterConfig:
 
     def test_interpreter_config_max_steps_custom(self):
         """Test InterpreterConfig accepts custom max_steps value."""
-        config = InterpreterConfig(max_steps=30)
+        config = InterpreterEnvConfig(max_steps=30)
         assert config.max_steps == 30
 
 
@@ -190,7 +193,7 @@ class TestInterpreterEnv:
         messages, tools = await interpreter_env.reset()
 
         assert len(messages) >= 2
-        assert any("Test problem" in str(m.content) for m in messages)
+        assert any("Test hypothesis" in str(m.content) for m in messages)
 
         tool_names = {t.info.name for t in tools}
         assert "run_cell" in tool_names
@@ -267,7 +270,7 @@ plt.show()
         assert interpreter_env.state.done
 
     @pytest.mark.asyncio
-    async def test_interpreter_env_initial_dir_listing_in_reset(self):
+    async def test_interpreter_env_initial_dir_listing_in_reset(self, default_problem: ProblemInstance):
         """Test that reset() includes initial directory listing in messages."""
         with tempfile.TemporaryDirectory() as tmp:
             work_dir = pathlib.Path(tmp)
@@ -276,9 +279,9 @@ plt.show()
             (work_dir / "data.csv").write_text("a,b,c")
 
             env = InterpreterEnv(
-                problem="Test problem",
+                problem=default_problem,
                 work_dir=work_dir,
-                config=InterpreterConfig(language=NBLanguage.PYTHON),
+                config=InterpreterEnvConfig(language=NBLanguage.PYTHON),
             )
 
             try:
@@ -309,14 +312,14 @@ plt.show()
         assert "Execution History: 1" in content
 
     @pytest.mark.asyncio
-    async def test_interpreter_env_time_management(self):
+    async def test_interpreter_env_time_management(self, default_problem: ProblemInstance):
         """Test time management message generation."""
         with tempfile.TemporaryDirectory() as tmp:
             work_dir = pathlib.Path(tmp)
             env = InterpreterEnv(
-                problem="Test problem",
+                problem=default_problem,
                 work_dir=work_dir,
-                config=InterpreterConfig(language=NBLanguage.PYTHON),
+                config=InterpreterEnvConfig(language=NBLanguage.PYTHON),
             )
 
             try:
@@ -715,7 +718,7 @@ with open('test_data.txt', 'r') as f:
 
     @pytest.mark.parametrize("use_docker", [False, True])
     @pytest.mark.asyncio
-    async def test_interpreter_env_full_workflow(self, use_docker: bool):
+    async def test_interpreter_env_full_workflow(self, use_docker: bool, default_problem: ProblemInstance):
         """Test complete InterpreterEnv workflow in both modes."""
         if should_skip_docker_test(use_docker):
             pytest.skip("Docker not available or image not found")
@@ -727,9 +730,9 @@ with open('test_data.txt', 'r') as f:
             # Patch USE_DOCKER config to control mode
             with patch.object(cfg, "USE_DOCKER", use_docker):
                 env = InterpreterEnv(
-                    problem="Test problem",
+                    problem=default_problem,
                     work_dir=work_dir,
-                    config=InterpreterConfig(language=NBLanguage.PYTHON),
+                    config=InterpreterEnvConfig(language=NBLanguage.PYTHON),
                 )
 
                 try:
@@ -748,3 +751,75 @@ with open('test_data.txt', 'r') as f:
                     assert len(env.state.nb.cells) == 0
                 finally:
                     await env.close()
+
+
+class TestRubricGrading:
+    """Tests for rubric-based grading."""
+
+    GRADING_PROBLEM = ProblemInstance(
+        uuid=UUID("12345678-1234-5678-1234-567812345678"),
+        hypothesis="Numbers greater than 10 are large",
+        objective="Load data, compute statistics, determine if hypothesis holds",
+        answer=True,
+        rubric="""* 1 point: Data is loaded correctly
+* 1 point: Statistics are computed
+* 1 point: Correct conclusion is reached""",
+        max_points=3,
+    )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("code", "answer"),
+        [
+            pytest.param([], "True", id="empty_notebook_correct_answer"),
+            pytest.param(["data = [15, 20, 25]"], "True", id="partial_steps_correct_answer"),
+            pytest.param(
+                ["data = [15, 20, 25]", "mean = sum(data) / len(data)\nprint(f'Mean: {mean}')"],
+                "True",
+                id="all_steps_correct_answer",
+            ),
+            pytest.param(
+                ["data = [15, 20, 25]", "mean = sum(data) / len(data)\nprint(f'Mean: {mean}')"],
+                "False",
+                id="all_steps_incorrect_answer",
+            ),
+        ],
+    )
+    async def test_rubric_grading(self, code: list[str], answer: str):
+        """Test rubric-based grading with gpt-5-mini."""
+        rubric_model = LiteLLMModel(name="openai/gpt-5-mini")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = pathlib.Path(tmp)
+            env = InterpreterEnv(
+                problem=self.GRADING_PROBLEM,
+                work_dir=work_dir,
+                rubric_model=rubric_model,
+                config=InterpreterEnvConfig(language=NBLanguage.PYTHON, normalize_reward=False),
+            )
+
+            try:
+                await env.reset()
+
+                for cell_code in code:
+                    action = ToolRequestMessage(tool_calls=[ToolCall.from_name("run_cell", code=cell_code)])
+                    await env.step(action)
+
+                submit_action = ToolRequestMessage(tool_calls=[ToolCall.from_name("submit_answer", answer=answer)])
+                _, reward, done, _ = await env.step(submit_action)
+
+                assert done is True
+                assert 0 <= env.state.raw_score <= self.GRADING_PROBLEM.max_score
+                assert env.state.score == env.state.raw_score
+                assert env.state.total_reward == env.state.score
+                assert reward == env.state.score
+
+                assert env.score_info_path.exists()
+                score_info = json.loads(env.score_info_path.read_text())
+                assert score_info["raw_score"] == env.state.raw_score
+                assert score_info["max_score"] == self.GRADING_PROBLEM.max_score
+                assert "prompt" in score_info
+                assert "response" in score_info
+
+            finally:
+                await env.close()

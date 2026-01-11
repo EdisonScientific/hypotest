@@ -58,6 +58,7 @@ dev = [
     "pytest-xdist",
     "pytest>=8",  # Pin to keep recent
     "types-Flask-SocketIO>=5.3.0",
+    "types-PyYAML",
     "vcrpy>=8",  # Pin for dropping unused requests support
 ]
 

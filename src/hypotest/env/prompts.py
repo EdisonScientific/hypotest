@@ -119,6 +119,36 @@ scatter_plot <- ggplot2::ggplot(plot_data, ggplot2::aes(x = `FSC-A`, y = `SSC-A`
    ```
 """
 
+CORRECT_MSG = "Correct answer!"
+INCORRECT_MSG = "Incorrect answer."
+
+RUBRIC_SCORE_PROMPT = """
+Your task is to fairly and accurately score a solution to a bioinformatics task.
+
+The task was to substantiate or reject a hypothesis given a dataset. It was executed
+by writing a Jupyter notebook to analyze the provided data.
+
+Here is the hypothesis: {hypothesis!r}.
+
+The hypothesis is known to be {accepted}. You are to score both the final outcome and the procedure used to arrive at it. Use the following rubric:
+<rubric>
+{rubric}
+</rubric>
+
+Now, I will provide you with the solution. First, the notebook:
+<notebook>
+{notebook}
+</notebook>
+
+The final conclusion derived from the notebook:
+<proposed-solution>
+{proposed_solution}
+</proposed-solution>
+
+Be scientifically rigorous. Reason through each criterion in the rubric and provide brief justification for your score. Do not assign partial score for any rubric item (i.e. 0.5 points).
+At the very end, provide an integer score based on the rubric, enclosed in <score>...</score> tags.
+""".strip()
+
 
 class PromptingConfig(BaseModel):
     """Configuration for prompting the LLM.

@@ -23,6 +23,8 @@ jobs:
         if: always()
   test:
     runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     strategy:
       matrix:
         python-version: ["3.11", "3.13"]
@@ -40,6 +42,9 @@ jobs:
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.pre-commit.result }}" != "success" || "${{ needs.test.result }}" != "success" ]]; then
+          if [[ "${{ needs.pre-commit.result }}" != "success" && "${{ needs.pre-commit.result }}" != "skipped" ]]; then
+            exit 1
+          fi
+          if [[ "${{ needs.test.result }}" != "success" ]]; then
             exit 1
           fi
