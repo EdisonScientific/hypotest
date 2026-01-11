@@ -23,6 +23,8 @@ jobs:
         if: always()
   test:
     runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     strategy:
       matrix:
         python-version: ["3.11", "3.13"]
