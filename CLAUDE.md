@@ -13,8 +13,9 @@ hypotest is a Python package that provides a Jupyter kernel-based code execution
 uv sync
 
 # Run tests
-pytest tests/
-pytest tests/test_foo.py::test_specific  # single test
+pytest tests/                             # all tests
+pytest tests/test_foo.py::test_specific   # single test
+pytest -n auto tests/                     # parallel execution
 
 # Type checking
 uv run mypy --scripts-are-modules
@@ -34,6 +35,7 @@ src/hypotest/env/
 ├── config.py           # ExecutionConfig with profiles: standard, gpu, long_timeout
 ├── interpreter.py      # Interpreter class - Jupyter kernel lifecycle & code execution
 ├── interpreter_env.py  # InterpreterEnv - lightweight env for standalone execution
+├── kernel_server.py    # Kernel server management
 ├── prompts.py          # System prompts & capability descriptions
 ├── tools/
 │   └── filesystem.py   # File I/O tools (read/write/edit) with format support
@@ -42,6 +44,11 @@ src/hypotest/env/
     ├── img_utils.py    # Image encoding/compression
     ├── notebook_utils.py  # Cell execution, NBLanguage enum (PYTHON, R)
     └── workspace_utils.py # Workspace management
+
+tests/
+├── conftest.py              # Shared fixtures
+├── test_interpreter.py      # Interpreter class tests
+└── test_interpreter_env.py  # InterpreterEnv tests
 ```
 
 **Key patterns:**
@@ -61,6 +68,14 @@ src/hypotest/env/
 - `AGENT_MAX_STEPS`: Max agent steps (default: 30)
 
 **File limits:** 256KB text, 10MB PDF/PowerPoint, 3000 char notebook output
+
+## CI
+
+GitHub Actions workflow (`.github/workflows/tests.yml`) runs on PRs and pushes to main:
+
+- Pre-commit checks (ruff, mypy, etc.)
+- Pytest with parallel execution (`-n auto`)
+- Matrix: Python 3.11 and 3.13
 
 ## Code Style
 

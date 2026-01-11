@@ -185,7 +185,6 @@ class Interpreter:
         execution_timeout: float = 600,
         use_host_env_vars: bool = False,
         extra_envs: dict[str, str] | None = None,
-        kernel_meta_dir: Path | None = None,
     ):
         """Initialize the interpreter.
 
@@ -195,14 +194,12 @@ class Interpreter:
             execution_timeout: Timeout for code execution in seconds
             use_host_env_vars: Whether to use host environment variables
             extra_envs: Additional environment variables to pass to the kernel
-            kernel_meta_dir: Directory for kernel metadata (connection files, etc.)
         """
         self.work_dir = work_dir
         self.language = language
         self.execution_timeout = execution_timeout
         self.use_host_env_vars = use_host_env_vars
         self.extra_envs = extra_envs or {}
-        self.kernel_meta_dir = kernel_meta_dir
 
         # Execution state
         self.execution_history: list[ExecutionResult] = []
@@ -240,7 +237,19 @@ class Interpreter:
             self._is_ready = True
             logger.debug(f"Kernel {kernel_name} started successfully in {self.work_dir}")
         except Exception as e:
-            raise RuntimeError(f"Kernel failed to start: {e}") from e
+            # Capture kernel process info for debugging
+            debug_info: list[str] = []
+            if hasattr(self.kernel_manager, "provisioner") and self.kernel_manager.provisioner:
+                prov = self.kernel_manager.provisioner
+                debug_info.extend((
+                    f"pid={getattr(prov, 'pid', None)}",
+                    f"connection_file={self.kernel_manager.connection_file}",
+                ))
+                if hasattr(prov, "process") and prov.process:
+                    proc = prov.process
+                    debug_info.extend((f"returncode={proc.returncode}", f"poll={proc.poll()}"))
+            debug_str = "; ".join(debug_info) if debug_info else "no debug info"
+            raise RuntimeError(f"Kernel failed to start: {e} ({debug_str})") from e
 
     async def _execute_code(self, code: str) -> ExecutionResult:
         """Internal method to execute code and collect outputs.

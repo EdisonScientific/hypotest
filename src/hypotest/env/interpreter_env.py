@@ -83,6 +83,7 @@ class InterpreterEnvState:
         use_host_env_vars: bool = False,
         extra_envs: dict[str, str] | None = None,
         use_docker: bool = cfg.USE_DOCKER,
+        save_dir: Path | None = None,
     ):
         self.work_dir = work_dir
         self.language = language
@@ -94,10 +95,7 @@ class InterpreterEnvState:
         self.actions: list[str] = []
         self.done = False
         self.use_docker = use_docker
-
-        # Create kernel metadata directory OUTSIDE work_dir
-        self.kernel_meta_dir = work_dir.parent / f".kernel_meta_{work_dir.name}"
-        self.kernel_meta_dir.mkdir(exist_ok=True)
+        self.save_dir = save_dir
 
         # Local interpreter (only used when use_docker=False)
         self.interpreter: Interpreter | None = None
@@ -108,7 +106,6 @@ class InterpreterEnvState:
                 execution_timeout=execution_timeout,
                 use_host_env_vars=use_host_env_vars,
                 extra_envs=extra_envs,
-                kernel_meta_dir=self.kernel_meta_dir,
             )
 
         # Docker container state (only used when use_docker=True)
@@ -215,7 +212,14 @@ class InterpreterEnvState:
         response.raise_for_status()
 
     async def close(self):
-        """Close the interpreter or container."""
+        """Save the notebook and close the interpreter or container."""
+        nbformat.write(self.nb, self.work_dir / "notebook.ipynb")
+
+        if self.save_dir is not None:
+            shutil.rmtree(self.save_dir, ignore_errors=True)
+            self.save_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(self.work_dir, self.save_dir)
+
         if self.use_docker:
             if self._container_port is not None:
                 _USED_PORTS.discard(self._container_port)
@@ -237,9 +241,6 @@ class InterpreterEnvState:
                 self._docker_client = None
         elif self.interpreter is not None:
             await self.interpreter.close()
-
-        if self.kernel_meta_dir.exists():
-            shutil.rmtree(self.kernel_meta_dir)
 
     def _add_cell(self, code: str, result: "ExecutionResult") -> int:
         """Add a new code cell to the notebook with execution results.
@@ -363,6 +364,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         use_host_env_vars: bool = False,
         extra_envs: dict[str, str] | None = None,
         include_env_state_msg: bool = False,
+        save_dir: Path | None = None,
     ):
         if config is None:
             config = InterpreterConfig()
@@ -373,6 +375,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.problem = problem
         self.use_host_env_vars = use_host_env_vars
         self.extra_envs = extra_envs or {}
+        self.save_dir = save_dir
 
         # Execution config for timeouts and capabilities
         self.execution_config = self.config.execution_config
@@ -390,10 +393,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.prompting_config: PromptingConfig
 
     async def close(self) -> None:
-        """Close the environment, save notebook, and upload files."""
-        await super().close()
-        # TODO: save notebook to disk
+        """Save notebook, shut down interpreter/container."""
         self.logger.info("Closing environment")
+        await self.state.close()
 
     async def reset(self) -> tuple[Messages, list[Tool]]:
         """Reset the environment and prepare for execution."""
@@ -426,6 +428,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 "R_LIBS_USER": str(kernel_env_path / "lib" / "R" / "library"),
             }
             | self.extra_envs,
+            save_dir=self.save_dir,
         )
         await self.state.start()
 
