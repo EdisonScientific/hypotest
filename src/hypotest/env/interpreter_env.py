@@ -6,6 +6,7 @@ code in Jupyter kernels. It focuses on direct code execution via run_cell().
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -37,9 +38,9 @@ from pydantic import BaseModel, Field, JsonValue
 from . import config as cfg
 from .config import ExecutionConfig
 from .interpreter import ExecutionResult, Interpreter
-from .prompts import PromptingConfig
+from .prompts import CORRECT_MSG, INCORRECT_MSG, RUBRIC_SCORE_PROMPT, PromptingConfig
 from .tools.filesystem import list_dir_tool
-from .utils import NBLanguage
+from .utils import NBLanguage, view_notebook
 
 if TYPE_CHECKING:
     from aiodocker.containers import DockerContainer
@@ -124,6 +125,10 @@ class InterpreterEnvState:
         self.nb.metadata.kernelspec = language.make_kernelspec()
         self.notebook_runtime_errors: list[str] = []
         self._execution_count = 0
+
+        self.raw_score: int = 0
+        self.score: float = 0.0
+        self.score_metadata: dict[str, str | int] = {}
 
     async def start(self):
         """Start the interpreter (local or Docker-based)."""
@@ -498,7 +503,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             obs.append(Message(content=cfg.FORCE_MSG))
 
         self.state.actions.append(str(action))
-        return obs, 0, self.state.done, False
+        reward = self.state.score if self.state.done else 0.0
+        return obs, reward, self.state.done, False
 
     # ========== Tools ==========
 
@@ -599,16 +605,79 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         return "Kernel reset successfully."
 
+    @property
+    def score_info_path(self) -> Path:
+        return self.work_dir / "score_info.json"
+
+    @tenacity.retry(stop=tenacity.stop_after_attempt(3), retry=tenacity.retry_if_exception_type(ValueError))
+    async def _score_solution(self, solution: str) -> bool:
+        assert self.rubric_model is not None
+        nb_content, _ = view_notebook(self.state.nb.cells, self.language.value)
+
+        prompt = self.state.score_metadata["prompt"] = RUBRIC_SCORE_PROMPT.format(
+            hypothesis=self.problem.hypothesis,
+            accepted=self.problem.accepted,
+            rubric=self.problem.rubric,
+            notebook=nb_content,
+            proposed_solution=solution,
+        )
+
+        resp = await self.rubric_model.call_single(prompt, timeout=3 * 60)
+        if not resp.text:
+            raise ValueError("No response from rubric model")
+        self.state.score_metadata["response"] = resp.text
+
+        try:
+            raw_score = int(resp.text.split("<score>")[1].split("</score>")[0])
+            self.state.raw_score = raw_score
+
+        except Exception as e:
+            raise ValueError("Failed to parse score from response") from e
+
+        else:
+            correct = raw_score == self.problem.max_score
+            score = raw_score / self.problem.max_score if self.config.normalize_reward else raw_score
+            score = max(
+                0.0,
+                min(1.0 if self.config.normalize_reward else self.problem.max_score, score),
+            )
+
+            self.state.score = score
+            self.state.total_reward += score
+            return correct
+
+        finally:
+            score_info = {
+                **self.state.score_metadata,
+                "score": self.state.score,
+                "raw_score": self.state.raw_score,
+                "max_score": self.problem.max_score,
+            }
+            with self.score_info_path.open("w") as f:
+                json.dump(score_info, f, indent=2)
+
+            self.logger.info(f"Received solution ({self.state.raw_score}/{self.problem.max_score}): {solution!r}.")
+
     async def submit_answer(self, answer: str) -> str:
         """Submit your response to the research question.
+
+        Note that this tool may only be called once and ends the episode.
 
         Args:
             answer: Your final response to the research question
         """
+        if self.state.done:
+            return "Episode already finished."
+
         self.state.answer = answer
         self.state.done = True
-        self.logger.info("Submitting answer: %s", answer)
-        return answer
+
+        if self.rubric_model is None:
+            self.logger.warning("No rubric_model configured, skipping scoring")
+            return answer
+
+        correct = await self._score_solution(answer)
+        return CORRECT_MSG if correct else INCORRECT_MSG
 
     # ========== Time Management ==========
 
@@ -648,6 +717,10 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 "done": self.state.done,
                 "nb_state": self.state.nb,
                 "nb_runtime_errors": self.state.notebook_runtime_errors,
+                "raw_score": self.state.raw_score,
+                "score": self.state.score,
+                "score_metadata": self.state.score_metadata,
+                "total_reward": self.state.total_reward,
             },
             info={
                 "language": self.state.language,
