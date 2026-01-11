@@ -7,11 +7,13 @@ import tempfile
 from collections.abc import AsyncGenerator
 from typing import Any
 from unittest.mock import patch
+from uuid import UUID
 
 import pytest
 import pytest_asyncio
 from aviary.core import Message, ToolCall, ToolRequestMessage, ToolResponseMessage
 from conftest import requires_matplotlib, should_skip_docker_test
+from lmi import LiteLLMModel
 
 from hypotest.env import config as cfg
 from hypotest.env.config import ExecutionConfig
@@ -749,3 +751,75 @@ with open('test_data.txt', 'r') as f:
                     assert len(env.state.nb.cells) == 0
                 finally:
                     await env.close()
+
+
+class TestRubricGrading:
+    """Tests for rubric-based grading."""
+
+    GRADING_PROBLEM = ProblemInstance(
+        uuid=UUID("12345678-1234-5678-1234-567812345678"),
+        hypothesis="Numbers greater than 10 are large",
+        objective="Load data, compute statistics, determine if hypothesis holds",
+        answer=True,
+        rubric="""* 1 point: Data is loaded correctly
+* 1 point: Statistics are computed
+* 1 point: Correct conclusion is reached""",
+        max_points=3,
+    )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("code", "answer"),
+        [
+            pytest.param([], "True", id="empty_notebook_correct_answer"),
+            pytest.param(["data = [15, 20, 25]"], "True", id="partial_steps_correct_answer"),
+            pytest.param(
+                ["data = [15, 20, 25]", "mean = sum(data) / len(data)\nprint(f'Mean: {mean}')"],
+                "True",
+                id="all_steps_correct_answer",
+            ),
+            pytest.param(
+                ["data = [15, 20, 25]", "mean = sum(data) / len(data)\nprint(f'Mean: {mean}')"],
+                "False",
+                id="all_steps_incorrect_answer",
+            ),
+        ],
+    )
+    async def test_rubric_grading(self, code: list[str], answer: str):
+        """Test rubric-based grading with gpt-5-mini."""
+        rubric_model = LiteLLMModel(name="openai/gpt-5-mini")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = pathlib.Path(tmp)
+            env = InterpreterEnv(
+                problem=self.GRADING_PROBLEM,
+                work_dir=work_dir,
+                rubric_model=rubric_model,
+                config=InterpreterEnvConfig(language=NBLanguage.PYTHON, normalize_reward=False),
+            )
+
+            try:
+                await env.reset()
+
+                for cell_code in code:
+                    action = ToolRequestMessage(tool_calls=[ToolCall.from_name("run_cell", code=cell_code)])
+                    await env.step(action)
+
+                submit_action = ToolRequestMessage(tool_calls=[ToolCall.from_name("submit_answer", answer=answer)])
+                _, reward, done, _ = await env.step(submit_action)
+
+                assert done is True
+                assert 0 <= env.state.raw_score <= self.GRADING_PROBLEM.max_score
+                assert env.state.score == env.state.raw_score
+                assert env.state.total_reward == env.state.score
+                assert reward == env.state.score
+
+                assert env.score_info_path.exists()
+                score_info = json.loads(env.score_info_path.read_text())
+                assert score_info["raw_score"] == env.state.raw_score
+                assert score_info["max_score"] == self.GRADING_PROBLEM.max_score
+                assert "prompt" in score_info
+                assert "response" in score_info
+
+            finally:
+                await env.close()

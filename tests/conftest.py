@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import subprocess
+from uuid import UUID
 
 import pytest
 from jupyter_client.kernelspec import KernelSpecManager, NoSuchKernel
@@ -82,7 +83,7 @@ def skip_if_r_unavailable(request):
 def default_problem() -> ProblemInstance:
     """Default ProblemInstance for tests."""
     return ProblemInstance(
-        uuid="test-uuid",
+        uuid=UUID("00000000-0000-0000-0000-000000000000"),
         hypothesis="Test hypothesis",
         objective="Test objective",
         answer=True,

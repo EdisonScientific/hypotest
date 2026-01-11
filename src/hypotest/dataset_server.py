@@ -6,6 +6,7 @@ from collections import Counter
 from pathlib import Path
 from tempfile import mkdtemp
 from typing import Self, cast
+from uuid import UUID
 
 import yaml
 from aviary.core import TaskDataset, TaskDatasetServer
@@ -51,7 +52,7 @@ class Dataset(TaskDataset[InterpreterEnv]):
 
         self.rubric_model = LiteLLMModel(name=self.config.rubric_model, config=self.config.rubric_model_config)
 
-        self.problem_counter: Counter[str] = Counter()
+        self.problem_counter: Counter[UUID] = Counter()
 
     def get_new_env_by_idx(self, idx: int) -> InterpreterEnv:
         problem = self.problems[idx]

@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from tempfile import mkdtemp
 from typing import TYPE_CHECKING, Any, cast
+from uuid import UUID
 
 import aiodocker
 import httpx
@@ -65,7 +66,7 @@ logger = logging.getLogger(__name__)
 
 
 class ProblemInstance(BaseModel):
-    uuid: str
+    uuid: UUID
     hypothesis: str
     objective: str
     accepted: bool = Field(alias="answer")
