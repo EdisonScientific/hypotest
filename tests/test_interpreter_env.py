@@ -16,21 +16,22 @@ from conftest import requires_matplotlib, should_skip_docker_test
 from hypotest.env import config as cfg
 from hypotest.env.config import ExecutionConfig
 from hypotest.env.interpreter_env import (
-    InterpreterConfig,
     InterpreterEnv,
+    InterpreterEnvConfig,
     InterpreterEnvState,
+    ProblemInstance,
 )
 from hypotest.env.kernel_server import NBLanguage
 
 
 @pytest_asyncio.fixture
-async def interpreter_env() -> AsyncGenerator[InterpreterEnv, Any]:
+async def interpreter_env(default_problem: ProblemInstance) -> AsyncGenerator[InterpreterEnv, Any]:
     """Fixture that creates and cleans up InterpreterEnv (local mode)."""
     with tempfile.TemporaryDirectory() as tmp:
         env = InterpreterEnv(
-            problem="Test problem",
+            problem=default_problem,
             work_dir=pathlib.Path(tmp),
-            config=InterpreterConfig(language=NBLanguage.PYTHON),
+            config=InterpreterEnvConfig(language=NBLanguage.PYTHON),
         )
         await env.reset()
         try:
@@ -44,19 +45,19 @@ class TestInterpreterConfig:
 
     def test_interpreter_config_defaults(self):
         """Test InterpreterConfig has sensible defaults."""
-        config = InterpreterConfig()
+        config = InterpreterEnvConfig()
         assert config.language == NBLanguage.PYTHON
         assert isinstance(config.execution_config, ExecutionConfig)
         assert config.max_steps == cfg.AGENT_MAX_STEPS
 
     def test_interpreter_config_with_language(self):
         """Test InterpreterConfig with explicit language."""
-        config = InterpreterConfig(language=NBLanguage.R)
+        config = InterpreterEnvConfig(language=NBLanguage.R)
         assert config.language == NBLanguage.R
 
     def test_interpreter_config_has_execution_config(self):
         """Test InterpreterConfig has execution_config field with defaults."""
-        config = InterpreterConfig()
+        config = InterpreterEnvConfig()
         assert hasattr(config, "execution_config")
         assert isinstance(config.execution_config, ExecutionConfig)
         assert config.execution_config.job_timeout == 60 * 60
@@ -67,7 +68,7 @@ class TestInterpreterConfig:
 
     def test_interpreter_config_max_steps_custom(self):
         """Test InterpreterConfig accepts custom max_steps value."""
-        config = InterpreterConfig(max_steps=30)
+        config = InterpreterEnvConfig(max_steps=30)
         assert config.max_steps == 30
 
 
@@ -190,7 +191,7 @@ class TestInterpreterEnv:
         messages, tools = await interpreter_env.reset()
 
         assert len(messages) >= 2
-        assert any("Test problem" in str(m.content) for m in messages)
+        assert any("Test hypothesis" in str(m.content) for m in messages)
 
         tool_names = {t.info.name for t in tools}
         assert "run_cell" in tool_names
@@ -267,7 +268,7 @@ plt.show()
         assert interpreter_env.state.done
 
     @pytest.mark.asyncio
-    async def test_interpreter_env_initial_dir_listing_in_reset(self):
+    async def test_interpreter_env_initial_dir_listing_in_reset(self, default_problem: ProblemInstance):
         """Test that reset() includes initial directory listing in messages."""
         with tempfile.TemporaryDirectory() as tmp:
             work_dir = pathlib.Path(tmp)
@@ -276,9 +277,9 @@ plt.show()
             (work_dir / "data.csv").write_text("a,b,c")
 
             env = InterpreterEnv(
-                problem="Test problem",
+                problem=default_problem,
                 work_dir=work_dir,
-                config=InterpreterConfig(language=NBLanguage.PYTHON),
+                config=InterpreterEnvConfig(language=NBLanguage.PYTHON),
             )
 
             try:
@@ -309,14 +310,14 @@ plt.show()
         assert "Execution History: 1" in content
 
     @pytest.mark.asyncio
-    async def test_interpreter_env_time_management(self):
+    async def test_interpreter_env_time_management(self, default_problem: ProblemInstance):
         """Test time management message generation."""
         with tempfile.TemporaryDirectory() as tmp:
             work_dir = pathlib.Path(tmp)
             env = InterpreterEnv(
-                problem="Test problem",
+                problem=default_problem,
                 work_dir=work_dir,
-                config=InterpreterConfig(language=NBLanguage.PYTHON),
+                config=InterpreterEnvConfig(language=NBLanguage.PYTHON),
             )
 
             try:
@@ -715,7 +716,7 @@ with open('test_data.txt', 'r') as f:
 
     @pytest.mark.parametrize("use_docker", [False, True])
     @pytest.mark.asyncio
-    async def test_interpreter_env_full_workflow(self, use_docker: bool):
+    async def test_interpreter_env_full_workflow(self, use_docker: bool, default_problem: ProblemInstance):
         """Test complete InterpreterEnv workflow in both modes."""
         if should_skip_docker_test(use_docker):
             pytest.skip("Docker not available or image not found")
@@ -727,9 +728,9 @@ with open('test_data.txt', 'r') as f:
             # Patch USE_DOCKER config to control mode
             with patch.object(cfg, "USE_DOCKER", use_docker):
                 env = InterpreterEnv(
-                    problem="Test problem",
+                    problem=default_problem,
                     work_dir=work_dir,
-                    config=InterpreterConfig(language=NBLanguage.PYTHON),
+                    config=InterpreterEnvConfig(language=NBLanguage.PYTHON),
                 )
 
                 try:

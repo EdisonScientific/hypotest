@@ -10,6 +10,7 @@ import pytest
 from jupyter_client.kernelspec import KernelSpecManager, NoSuchKernel
 
 from hypotest.env import config as cfg
+from hypotest.env.interpreter_env import ProblemInstance
 
 MATPLOTLIB_AVAILABLE = importlib.util.find_spec("matplotlib") is not None
 requires_matplotlib = pytest.mark.skipif(not MATPLOTLIB_AVAILABLE, reason="matplotlib not available")
@@ -75,3 +76,16 @@ def skip_if_r_unavailable(request):
     """Fixture to skip R tests when R kernel is not available."""
     if hasattr(request, "param") and request.param and should_skip_r_test(request.param):
         pytest.skip("R kernel is not available")
+
+
+@pytest.fixture
+def default_problem() -> ProblemInstance:
+    """Default ProblemInstance for tests."""
+    return ProblemInstance(
+        uuid="test-uuid",
+        hypothesis="Test hypothesis",
+        objective="Test objective",
+        answer=True,
+        rubric="Test rubric",
+        max_points=10,
+    )

@@ -4,6 +4,7 @@ This module provides a lightweight, execution-focused environment for running
 code in Jupyter kernels. It focuses on direct code execution via run_cell().
 """
 
+import argparse
 import asyncio
 import logging
 import os
@@ -11,6 +12,7 @@ import shutil
 import socket
 import time
 from pathlib import Path
+from tempfile import mkdtemp
 from typing import TYPE_CHECKING, Any, cast
 
 import aiodocker
@@ -24,11 +26,13 @@ from aviary.core import (
     Message,
     Messages,
     Tool,
+    ToolCall,
     ToolRequestMessage,
 )
 from aviary.env import Environment
+from lmi import LiteLLMModel
 from nbformat import NotebookNode
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, JsonValue
 
 from . import config as cfg
 from .config import ExecutionConfig
@@ -59,13 +63,14 @@ def get_free_port() -> int:
 logger = logging.getLogger(__name__)
 
 
-class InterpreterConfig(BaseModel):
-    """Configuration for preparing the InterpreterEnv during task creation."""
-
-    language: NBLanguage = Field(default=NBLanguage.PYTHON)
-    prompting_config: PromptingConfig = Field(default_factory=PromptingConfig)
-    execution_config: ExecutionConfig = Field(default_factory=ExecutionConfig)
-    max_steps: int = cfg.AGENT_MAX_STEPS
+class ProblemInstance(BaseModel):
+    uuid: str
+    hypothesis: str
+    objective: str
+    accepted: bool = Field(alias="answer")
+    rubric: str
+    max_score: int = Field(alias="max_points")
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
 
 class InterpreterEnvState:
@@ -91,7 +96,7 @@ class InterpreterEnvState:
         self.total_reward = 0.0
         self.use_host_env_vars = use_host_env_vars
         self.extra_envs = extra_envs or {}
-        self.answer: str | float | int | dict[str, Any] | None = None
+        self.answer: str | None = None
         self.actions: list[str] = []
         self.done = False
         self.use_docker = use_docker
@@ -346,6 +351,17 @@ class InterpreterEnvState:
         return result, actual_idx
 
 
+class InterpreterEnvConfig(BaseModel):
+    """Configuration for preparing the InterpreterEnv during task creation."""
+
+    language: NBLanguage = Field(default=NBLanguage.PYTHON)
+    prompting_config: PromptingConfig = Field(default_factory=PromptingConfig)
+    execution_config: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    max_steps: int = cfg.AGENT_MAX_STEPS
+    use_docker: bool = cfg.USE_DOCKER
+    normalize_reward: bool = True
+
+
 class InterpreterEnv(Environment[InterpreterEnvState]):
     """Standalone environment for code execution and data analysis.
 
@@ -357,20 +373,19 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
     def __init__(
         self,
         *,
-        problem: str,
+        problem: ProblemInstance,
         work_dir: Path,
-        config: InterpreterConfig | None = None,
+        rubric_model: LiteLLMModel | None = None,
+        config: InterpreterEnvConfig | None = None,
         input_data: list[dict[str, str | int | None]] | None = None,
         use_host_env_vars: bool = False,
         extra_envs: dict[str, str] | None = None,
         include_env_state_msg: bool = False,
         save_dir: Path | None = None,
     ):
-        if config is None:
-            config = InterpreterConfig()
-        self.config = config
+        self.config = config or InterpreterEnvConfig()
         self.work_dir = work_dir
-        self.language = config.language  # Convenience attribute, may be None for auto
+        self.rubric_model = rubric_model
         self.done = False
         self.problem = problem
         self.use_host_env_vars = use_host_env_vars
@@ -391,6 +406,10 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.state: InterpreterEnvState
         # prompting_config is set during reset() after language resolution
         self.prompting_config: PromptingConfig
+
+    @property
+    def language(self) -> NBLanguage:
+        return self.config.language
 
     async def close(self) -> None:
         """Save notebook, shut down interpreter/container."""
@@ -429,6 +448,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             }
             | self.extra_envs,
             save_dir=self.save_dir,
+            use_docker=self.config.use_docker,
         )
         await self.state.start()
 
@@ -447,7 +467,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             Tool.from_function(list_dir_tool),
         ]
 
-        messages.append(Message(content=self.problem))
+        # TODO: FORMAT THIS PROPELRY
+        messages.append(Message(content=self.problem.hypothesis))
 
         if self.include_env_state_msg:
             messages.append(self.get_env_state_msg())
@@ -673,3 +694,40 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 state_summary += f"Images generated: {images_count}\n"
 
         return EnvStateMessage.create_message(text=state_summary, images=[])
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--work_dir")
+    args = parser.parse_args()
+
+    work_dir = Path(args.work_dir or mkdtemp())
+    print(f"Working directory: {work_dir}")
+
+    problem = ProblemInstance(
+        uuid="",
+        hypothesis="",
+        objective="",
+        answer=False,
+        rubric="",
+        max_points=0,
+        metadata={},
+    )
+
+    env = InterpreterEnv(problem=problem, work_dir=work_dir, config=InterpreterEnvConfig(use_docker=True))
+    await env.reset()
+
+    code = ""
+    done = False
+    while not done:
+        breakpoint()  # noqa: T100
+        action = ToolRequestMessage(tool_calls=[ToolCall.from_name("run_cell", code=code)])
+        obs, *_ = await env.step(action)
+        for msg in obs:
+            print(msg.content)
+
+    await env.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
