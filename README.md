@@ -1,7 +1,5 @@
 # hypotest
 
-Jupyter kernel-based code execution environment for benchmarking agents.
-
 ## Installation
 
 ```bash
