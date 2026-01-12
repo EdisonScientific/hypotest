@@ -16,9 +16,6 @@ from pydantic import BaseModel, ConfigDict, DirectoryPath, Field, FilePath, fiel
 from hypotest.env.interpreter_env import InterpreterEnv, InterpreterEnvConfig, ProblemInstance
 from hypotest.env.kernel_server import NBLanguage
 
-CORRECT_MSG = "Correct answer!"
-INCORRECT_MSG = "Incorrect answer."
-
 
 class DatasetConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -63,7 +60,7 @@ class Dataset(TaskDataset[InterpreterEnv]):
         capsule_path = self.config.capsule_dir / f"CapsuleData-{problem.uuid}"
         problem_dir = Path(self.config.work_dir) / run_id if self.config.work_dir else Path(mkdtemp())
         problem_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(capsule_path, problem_dir)
+        shutil.copytree(capsule_path, problem_dir, dirs_exist_ok=True)
 
         save_dir = Path(self.config.save_dir) / run_id if self.config.save_dir else None
 
@@ -85,7 +82,7 @@ class Dataset(TaskDataset[InterpreterEnv]):
         return len(self.problems)
 
 
-DEFAULT_SERVER_PORT = 8123
+DEFAULT_SERVER_PORT = 8405
 
 
 class ServerConfig(BaseModel):
