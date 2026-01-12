@@ -26,29 +26,39 @@ ruff format src/
 
 # Build Docker image
 make image
+
+# Run dataset server (for benchmarking)
+make server CONFIG=server.yaml
+
+# Run benchmark agent
+uv run python src/hypotest/benchmark_agent.py benchmark.yaml
 ```
 
 ## Architecture
 
 ```
-src/hypotest/env/
-├── config.py           # ExecutionConfig with profiles: standard, gpu, long_timeout
-├── interpreter.py      # Interpreter class - Jupyter kernel lifecycle & code execution
-├── interpreter_env.py  # InterpreterEnv - lightweight env for standalone execution
-├── kernel_server.py    # Kernel server management
-├── prompts.py          # System prompts & capability descriptions
-├── tools/
-│   └── filesystem.py   # File I/O tools (read/write/edit) with format support
-└── utils/
-    ├── core.py         # XML/markdown code extraction
-    ├── img_utils.py    # Image encoding/compression
-    ├── notebook_utils.py  # Cell execution, NBLanguage enum (PYTHON, R)
-    └── workspace_utils.py # Workspace management
+src/hypotest/
+├── dataset_server.py   # TaskDatasetServer for serving InterpreterEnv instances
+├── benchmark_agent.py  # Benchmark client using ldp RolloutManager
+└── env/
+    ├── config.py           # ExecutionConfig with profiles: standard, gpu, long_timeout
+    ├── interpreter.py      # Interpreter class - Jupyter kernel lifecycle & code execution
+    ├── interpreter_env.py  # InterpreterEnv - lightweight env for standalone execution
+    ├── kernel_server.py    # Kernel server management
+    ├── prompts.py          # System prompts & capability descriptions
+    ├── tools/
+    │   └── filesystem.py   # File I/O tools (read/write/edit) with format support
+    └── utils/
+        ├── core.py         # XML/markdown code extraction
+        ├── img_utils.py    # Image encoding/compression
+        ├── notebook_utils.py  # Cell execution, NBLanguage enum (PYTHON, R)
+        └── workspace_utils.py # Workspace management
 
 tests/
 ├── conftest.py              # Shared fixtures
 ├── test_interpreter.py      # Interpreter class tests
-└── test_interpreter_env.py  # InterpreterEnv tests
+├── test_interpreter_env.py  # InterpreterEnv tests
+└── test_system.py           # End-to-end system tests
 ```
 
 **Key patterns:**
@@ -56,6 +66,7 @@ tests/
 - `ExecutionResult` stores notebook outputs in nbformat as single source of truth
 - `ExecutionConfig` uses factory pattern with deployment profiles
 - Tools use `fhaviary` (aviary.core) for Message/Tool abstractions
+- Benchmarking uses `ldp` for agent rollouts and `aviary.core.TaskDatasetServer` for serving environments
 - Async throughout - uses jupyter_client's async APIs
 
 ## Configuration
