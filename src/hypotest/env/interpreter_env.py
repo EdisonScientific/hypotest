@@ -39,7 +39,7 @@ from pydantic import BaseModel, Field, JsonValue
 from . import config as cfg
 from .config import ExecutionConfig
 from .interpreter import ExecutionResult, Interpreter
-from .prompts import CORRECT_MSG, INCORRECT_MSG, RUBRIC_SCORE_PROMPT, PromptingConfig
+from .prompts import CORRECT_MSG, HYPOTHESIS_TASK_DESC, INCORRECT_MSG, RUBRIC_SCORE_PROMPT, PromptingConfig
 from .tools.filesystem import list_dir_tool
 from .utils import NBLanguage, view_notebook
 
@@ -473,8 +473,15 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             Tool.from_function(list_dir_tool),
         ]
 
-        # TODO: FORMAT THIS PROPELRY
-        messages.append(Message(content=self.problem.hypothesis))
+        messages.append(
+            Message(
+                content=HYPOTHESIS_TASK_DESC.format(
+                    language=self.language.value.capitalize(),
+                    hypothesis=self.problem.hypothesis,
+                    objective=self.problem.objective,
+                )
+            )
+        )
 
         if self.include_env_state_msg:
             messages.append(self.get_env_state_msg())
