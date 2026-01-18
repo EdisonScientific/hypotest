@@ -465,7 +465,6 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         if self.prompting_config.system_prompt:
             messages.append(Message(role="system", content=self.prompting_config.system_prompt))
 
-        # Define core tools
         self.tools = [
             Tool.from_function(self.run_cell),
             Tool.from_function(self.reset_kernel),
