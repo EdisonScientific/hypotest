@@ -6,7 +6,7 @@ HYPOTHESIS_TASK_DESC = """
 Your task is to rigorously evaluate a hypothesis given a dataset.
 Write and execute {language} code to analyze the provided data.
 Make sure to meet all objectives and/or instructions provided.
-After you have satisfactorily evaluate the hypothesis, call the submit_answer tool to submit your final conclusion.
+After you have satisfactorily evaluated the hypothesis, call the submit_answer tool to submit your final conclusion.
 
 <hypothesis>
 {hypothesis}
