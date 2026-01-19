@@ -2,6 +2,22 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+HYPOTHESIS_TASK_DESC = """
+Your task is to rigorously evaluate a hypothesis given a dataset.
+Write and execute {language} code to analyze the provided data.
+Make sure to meet all objectives and/or instructions provided.
+After you have satisfactorily evaluated the hypothesis, call the submit_answer tool to submit your final conclusion.
+
+<hypothesis>
+{hypothesis}
+</hypothesis>
+
+<objectives>
+{objective}
+</objectives>
+""".strip()
+
+
 CPU_ENVIRONMENT_CAPABILITIES = """5. Your environment has multiple CPUs and ample RAM
 
 You are operating in a fully-equipped production environment with significant computational resources, internet access, and all necessary tools for advanced data analysis, API calls, and data retrieval. You do NOT have access to GPUs or any other specialized hardware and you are limited to {job_timeout} seconds of runtime."""
