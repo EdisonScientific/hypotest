@@ -4,6 +4,7 @@ import os
 import shutil
 from collections import Counter
 from pathlib import Path
+import socket
 from tempfile import mkdtemp
 from typing import Self, cast, Union
 from uuid import UUID
@@ -108,6 +109,9 @@ async def launch_server():
 
     dataset = Dataset(config.dataset)
     server = TaskDatasetServer(dataset, port=config.port, api_key=config.api_key)
+
+    print(f"Starting dataset server: Node={socket.gethostname()} IPAddress={socket.gethostbyname(socket.gethostname())} Port={config.port}")
+
     await server.astart()
 
 
