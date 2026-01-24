@@ -5,7 +5,7 @@ import shutil
 from collections import Counter
 from pathlib import Path
 from tempfile import mkdtemp
-from typing import Self, cast
+from typing import Self, cast, Union
 from uuid import UUID
 
 import yaml
@@ -23,7 +23,7 @@ class DatasetConfig(BaseModel):
     problem_jsonl: FilePath
     capsule_dir: DirectoryPath
     rubric_model: str = "openai/gpt-5"
-    rubric_model_config: dict[str, str] = Field(default_factory=lambda: {"reasoning_effort": "medium"})
+    rubric_model_config: dict[str, Union[str, list]] = Field(default_factory=lambda: {"reasoning_effort": "medium"})
 
     work_dir: Path | None = None
     use_docker: bool = True
