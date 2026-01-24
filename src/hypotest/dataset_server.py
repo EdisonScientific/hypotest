@@ -4,6 +4,7 @@ import os
 import shutil
 from collections import Counter
 from pathlib import Path
+import random
 import socket
 from tempfile import mkdtemp
 from typing import Self, cast, Union
@@ -100,6 +101,10 @@ class ServerConfig(BaseModel):
     def read_from_env(cls, val: str) -> str:
         return os.getenv(val, val)
 
+    def model_post_init(self, _):
+        ## Assign a random port when non-positive value.
+        if self.port <= 0:
+            self.port = random.randint(1024, 65535)
 
 async def launch_server():
     parser = argparse.ArgumentParser()
