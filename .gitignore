@@ -131,3 +131,5 @@ cython_debug/
 *.secrets.*
 .secrets
 *.pem
+
+server.yaml
