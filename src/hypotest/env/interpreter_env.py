@@ -40,7 +40,7 @@ from . import config as cfg
 from .config import ExecutionConfig
 from .interpreter import ExecutionResult, Interpreter
 from .prompts import CORRECT_MSG, HYPOTHESIS_TASK_DESC, INCORRECT_MSG, RUBRIC_SCORE_PROMPT, PromptingConfig
-from .tools.filesystem import list_dir_tool
+from .tools.filesystem import FilesystemTool
 from .utils import NBLanguage, view_notebook
 
 if TYPE_CHECKING:
@@ -465,11 +465,12 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         if self.prompting_config.system_prompt:
             messages.append(Message(role="system", content=self.prompting_config.system_prompt))
 
+        self._filesystem_tool = FilesystemTool(self.work_dir)
         self.tools = [
             Tool.from_function(self.run_cell),
             Tool.from_function(self.reset_kernel),
             Tool.from_function(self.submit_answer),
-            Tool.from_function(list_dir_tool),
+            Tool.from_function(self._filesystem_tool.list_dir),
         ]
 
         messages.append(
@@ -486,7 +487,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             messages.append(self.get_env_state_msg())
 
         # Always show initial directory listing (with truncation protection)
-        messages.append(Message(content=list_dir_tool(str(self.work_dir))))
+        messages.append(Message(content=self._filesystem_tool.list_dir()))
 
         return messages, self.tools
 

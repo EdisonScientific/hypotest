@@ -2,6 +2,7 @@
 
 import base64
 import json
+import os
 import pathlib
 import tempfile
 from collections.abc import AsyncGenerator
@@ -199,7 +200,7 @@ class TestInterpreterEnv:
         assert "run_cell" in tool_names
         assert "submit_answer" in tool_names
         assert "reset_kernel" in tool_names
-        assert "list_dir_tool" in tool_names
+        assert "list_dir" in tool_names
 
     @pytest.mark.asyncio
     async def test_interpreter_env_run_cell_append(self, interpreter_env: InterpreterEnv):
@@ -751,6 +752,102 @@ with open('test_data.txt', 'r') as f:
                     assert len(env.state.nb.cells) == 0
                 finally:
                     await env.close()
+
+
+class TestListDirTool:
+    """Tests for list_dir_tool behavior in InterpreterEnv."""
+
+    @pytest.mark.asyncio
+    async def test_list_dir_respects_work_dir(self, default_problem: ProblemInstance):
+        """Test that list_dir called with relative path uses work_dir, not process CWD."""
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = pathlib.Path(tmp)
+
+            (work_dir / "work_dir_file.txt").write_text("in work_dir")
+            (work_dir / "data").mkdir()
+            (work_dir / "data" / "nested.csv").write_text("nested")
+
+            env = InterpreterEnv(
+                problem=default_problem,
+                work_dir=work_dir,
+                config=InterpreterEnvConfig(language=NBLanguage.PYTHON),
+            )
+
+            try:
+                await env.reset()
+
+                original_cwd = os.getcwd()
+                assert pathlib.Path(original_cwd) != work_dir, "Test requires CWD != work_dir"
+
+                action = ToolRequestMessage(tool_calls=[ToolCall.from_name("list_dir", directory=".")])
+                obs, _, _, _ = await env.step(action)
+                result = obs[0].content
+                assert result is not None
+
+                assert "work_dir_file.txt" in result, (
+                    f"list_dir('.') should list work_dir contents, not CWD. Got: {result}"
+                )
+                assert "data/nested.csv" in result
+
+                action_subdir = ToolRequestMessage(tool_calls=[ToolCall.from_name("list_dir", directory="data")])
+                obs_subdir, _, _, _ = await env.step(action_subdir)
+                result_subdir = obs_subdir[0].content
+                assert result_subdir is not None
+
+                assert "nested.csv" in result_subdir, (
+                    f"list_dir('data') should list work_dir/data contents. Got: {result_subdir}"
+                )
+
+            finally:
+                await env.close()
+
+
+class TestToolSchemas:
+    """Tests for tool schema stability and correctness."""
+
+    EXPECTED_SCHEMAS_PATH = pathlib.Path(__file__).parent / "fixtures" / "expected_tool_schemas.json"
+
+    @pytest.mark.asyncio
+    async def test_tool_schemas_match_expected(self, default_problem: ProblemInstance):
+        """Test that tool schemas returned by reset() match expected schemas.
+
+        This test validates that docstrings and annotations are properly propagated
+        to the tool schemas. The expected schemas are stored in a JSON file and
+        should remain stable across refactors (e.g., switching to FilesystemTool).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = pathlib.Path(tmp)
+
+            env = InterpreterEnv(
+                problem=default_problem,
+                work_dir=work_dir,
+                config=InterpreterEnvConfig(language=NBLanguage.PYTHON),
+            )
+
+            try:
+                _, tools = await env.reset()
+
+                with self.EXPECTED_SCHEMAS_PATH.open() as f:
+                    expected_schemas = json.load(f)
+
+                actual_schemas = {tool.info.name: tool.info.model_dump() for tool in tools}
+
+                assert set(actual_schemas.keys()) == set(expected_schemas.keys()), (
+                    f"Tool names mismatch. "
+                    f"Expected: {set(expected_schemas.keys())}, "
+                    f"Actual: {set(actual_schemas.keys())}"
+                )
+
+                for tool_name, expected_schema in expected_schemas.items():
+                    actual_schema = actual_schemas[tool_name]
+                    assert actual_schema == expected_schema, (
+                        f"Schema mismatch for tool '{tool_name}'.\n"
+                        f"Expected:\n{json.dumps(expected_schema, indent=2)}\n"
+                        f"Actual:\n{json.dumps(actual_schema, indent=2)}"
+                    )
+
+            finally:
+                await env.close()
 
 
 class TestRubricGrading:
