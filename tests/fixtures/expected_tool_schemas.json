@@ -1,0 +1,82 @@
+{
+  "run_cell": {
+    "name": "run_cell",
+    "description": "Run code in a notebook cell and return the execution output.\n\nThis method allows running code in a new cell (append) or re-running\nan existing cell with updated code.\n\nUsage Examples:\n    run_cell(\"print('Hello, world!')\")           # Run code in new cell\n    run_cell(\"print('Hello, world!')\", idx=0)    # Run code in existing cell at index 0\n\nError Recovery:\n    When a cell fails with an error, you MUST fix it by calling run_cell\n    with the corrected code and the SAME idx as the failed cell:\n\n    run_cell(\"corrected_code\", idx=3)  # Fix error in Cell #3\n\n    The cell number is shown in the output prefix (e.g., \"[Cell #3]\").\n    Do NOT create a new cell to fix an error - always edit the failed cell.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "Code to execute",
+          "title": "Code",
+          "type": "string"
+        },
+        "idx": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Cell index to run. If None or >= len(cells), appends a new cell.\nIf provided, updates and re-runs the existing cell at that index.\nUse this to fix errors in existing cells.",
+          "title": "Idx"
+        }
+      },
+      "required": ["code"]
+    }
+  },
+  "reset_kernel": {
+    "name": "reset_kernel",
+    "description": "Reset the kernel to a clean state.\n\nThis clears all variables and execution state.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  },
+  "submit_answer": {
+    "name": "submit_answer",
+    "description": "Submit your response to the research question.\n\nNote that this tool may only be called once and ends the episode.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "answer": {
+          "description": "Your final response to the research question",
+          "title": "Answer",
+          "type": "string"
+        }
+      },
+      "required": ["answer"]
+    }
+  },
+  "list_dir": {
+    "name": "list_dir",
+    "description": "List contents of a directory with truncation protection.\n\nRecursively lists files in a directory, with built-in protection against\noverwhelming the context with too many files. Use this tool instead of\nwriting code to list directories to avoid context bloat.\n\nUsage Examples:\n    list_dir()                      # List working directory\n    list_dir(\"data/\")               # List specific folder\n    list_dir(max_files=50)          # Show more files\n    list_dir(show_hidden=True)      # Include hidden files",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "directory": {
+          "default": ".",
+          "description": "Directory path to list (default: current working directory)",
+          "title": "Directory",
+          "type": "string"
+        },
+        "max_files": {
+          "default": 20,
+          "description": "Maximum number of files to display (default: 20)",
+          "title": "Max Files",
+          "type": "integer"
+        },
+        "show_hidden": {
+          "default": false,
+          "description": "Whether to show hidden files starting with '.' (default: False)",
+          "title": "Show Hidden",
+          "type": "boolean"
+        }
+      },
+      "required": []
+    }
+  }
+}
