@@ -8,7 +8,7 @@ help:
 
 server:
 	@test -n "$(CONFIG)" || (echo "Error: CONFIG is required. Usage: make server CONFIG=path/to/config.yaml" && exit 1)
-	uv run python src/hypotest/dataset_server.py $(CONFIG)
+	uv run -p /app/kernel_env/bin/python src/hypotest/dataset_server.py $(CONFIG)
 
 image:
 	DOCKER_BUILDKIT=1 docker build -t interpreter-env:latest .

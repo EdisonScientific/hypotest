@@ -1,3 +1,4 @@
+import json
 import argparse
 import asyncio
 import os
@@ -15,8 +16,14 @@ from aviary.core import TaskDataset, TaskDatasetServer
 from lmi import LiteLLMModel
 from pydantic import BaseModel, ConfigDict, DirectoryPath, Field, FilePath, field_validator, model_validator
 
-from hypotest.env.interpreter_env import InterpreterEnv, InterpreterEnvConfig, ProblemInstance
+from hypotest.env.interpreter_env import InterpreterEnv, InterpreterEnvConfig, InterpreterPool, ProblemInstance
 from hypotest.env.kernel_server import NBLanguage
+
+
+def get_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))  # Bind to port 0 to let the OS choose a free port
+        return s.getsockname()[1]
 
 
 class DatasetConfig(BaseModel):
@@ -32,6 +39,9 @@ class DatasetConfig(BaseModel):
     force_python: bool = True
     normalize_reward: bool = True
     save_dir: Path | None = None
+
+    pool_size: int = 512
+    warm_size: int = 32
 
     @model_validator(mode="after")
     def make_dirs(self) -> Self:
@@ -52,6 +62,18 @@ class Dataset(TaskDataset[InterpreterEnv]):
         self.rubric_model = LiteLLMModel(name=self.config.rubric_model, config=self.config.rubric_model_config)
 
         self.problem_counter: Counter[UUID] = Counter()
+
+    async def initialize(self):
+        work_dir = Path(self.config.work_dir) if self.config.work_dir else Path(mkdtemp())
+
+        # initialize python and R notebook pools
+        python_pool = InterpreterPool(self.config.pool_size, NBLanguage.PYTHON, spares=self.config.warm_size)
+        await python_pool.initialize(work_dir=work_dir, execution_timeout=600)
+
+        r_lang_pool = InterpreterPool(self.config.pool_size, NBLanguage.R, spares=self.config.warm_size)
+        await r_lang_pool.initialize(work_dir=work_dir, execution_timeout=600)
+
+        self.interpreter_pool_dict = {NBLanguage.PYTHON: python_pool, NBLanguage.R: r_lang_pool}
 
     def get_new_env_by_idx(self, idx: int) -> InterpreterEnv:
         problem = self.problems[idx]
@@ -78,6 +100,7 @@ class Dataset(TaskDataset[InterpreterEnv]):
             work_dir=problem_dir,
             save_dir=save_dir,
             config=InterpreterEnvConfig(language=language, **self.config.model_dump()),
+            interpreter_pool_dict=self.interpreter_pool_dict
         )
 
     def __len__(self) -> int:
@@ -102,23 +125,38 @@ class ServerConfig(BaseModel):
         return os.getenv(val, val)
 
     def model_post_init(self, _):
-        ## Assign a random port when non-positive value.
+        ## Assign a random free port when non-positive value.
         if self.port <= 0:
-            self.port = random.randint(1024, 65535)
+            self.port = get_free_port()
 
 async def launch_server():
     parser = argparse.ArgumentParser()
     parser.add_argument("config", type=FilePath)
-    config_path = parser.parse_args().config
+    parser.add_argument('-p', '--port', type=int, default=None)
+    parser.add_argument('-d', '--registry-dir', type=str, default="/registry")
+    parser.add_argument('-w', '--work-dir', type=str, default=None)
+    args = parser.parse_args()
+    config_path = args.config
     config = ServerConfig.model_validate(yaml.safe_load(config_path.read_text()))
 
+    # if we get work dir in through args, override the config
+    if args.work_dir is not None:
+        config.dataset.work_dir = Path(args.work_dir)
+
     dataset = Dataset(config.dataset)
-    server = TaskDatasetServer(dataset, port=config.port, api_key=config.api_key)
+    await dataset.initialize()
+    server = TaskDatasetServer(dataset, port=config.port if args.port is None else args.port, api_key=config.api_key)
 
     print(f"Starting dataset server: Node={socket.gethostname()} IPAddress={socket.gethostbyname(socket.gethostname())} Port={config.port}")
 
+    hostname = socket.gethostname()
+    with open(os.path.join(args.registry_dir, f"{hostname}.json"), 'w') as f:
+        reg_entry = {'host': hostname, 'port': server.port}
+        json.dump(reg_entry, f)
+
     await server.astart()
 
+    
 
 if __name__ == "__main__":
     asyncio.run(launch_server())

@@ -74,6 +74,65 @@ class ProblemInstance(BaseModel):
     max_score: int = Field(alias="max_points")
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
+class InterpreterPool:
+    def __init__(self, size: int, language: NBLanguage, spares: int = 32, flexible: bool = False):
+        self.size = size
+        self.spares = spares
+        self.language = language
+        self.kernel_pool = asyncio.Queue()
+        self.warmer_pool = asyncio.Queue(maxsize=spares)
+        self._warmer_task = None
+        self.flexible = flexible
+
+    async def initialize(self, **kwargs):
+        num_batches = (self.size // 32)
+        i = 0
+        num_interpreters = 0
+        while i <= num_batches:
+            interpreters = []
+            promises = []
+            num_init = min(self.size - num_interpreters, 32)
+            for _ in range(num_init):
+                # just initialize/start the interpreter with placeholder args, we'll replace these using init() on alloc()
+                interpreter = Interpreter(
+                    language=self.language, 
+                    **kwargs
+                )
+                interpreters += [interpreter]
+                promises += [interpreter.start()]
+            await asyncio.gather(*promises)
+            num_interpreters += len(interpreters)
+
+            promises = []
+            for interpreter in interpreters:
+                promises += [self.kernel_pool.put(interpreter)]
+            await asyncio.gather(*promises)
+            i += 1
+        if self.flexible:
+            self._warmer_task = asyncio.create_task(self._warmer(**kwargs))
+        
+    async def alloc(self, work_dir: Path, execution_timeout: float, use_host_env_vars: bool = False, extra_envs: dict[str, str] | None = None) -> Interpreter:
+        if not self.kernel_pool.empty() or not self.flexible:
+            interpreter = await self.kernel_pool.get()
+        elif self.flexible:
+            print("falling back to querying warmer pool")
+            interpreter = await self.warmer_pool.get()
+
+        await interpreter.initialize(work_dir, language=self.language, execution_timeout=execution_timeout, use_host_env_vars=use_host_env_vars, extra_envs=extra_envs)
+        return interpreter
+    
+    async def free(self, interpreter: Interpreter):
+        await interpreter.reset()
+        await self.kernel_pool.put(interpreter)
+
+    async def _warmer(self, **kwargs):
+        while True:
+            if self.warmer_pool.qsize() < self.spares and (self.warmer_pool.qsize() + self.kernel_pool.qsize()) < (self.size + self.spares):
+                interpreter = Interpreter(language=self.language, **kwargs)
+                await interpreter.start()
+                await self.warmer_pool.put(interpreter)
+            await asyncio.sleep(0.5)
+
 
 class InterpreterEnvState:
     """State container for the InterpreterEnv.
@@ -91,6 +150,7 @@ class InterpreterEnvState:
         extra_envs: dict[str, str] | None = None,
         use_docker: bool = cfg.USE_DOCKER,
         save_dir: Path | None = None,
+        interpreter_pool_dict: dict[NBLanguage, InterpreterPool] | None = None
     ):
         self.work_dir = work_dir
         self.language = language
@@ -106,7 +166,9 @@ class InterpreterEnvState:
 
         # Local interpreter (only used when use_docker=False)
         self.interpreter: Interpreter | None = None
-        if not use_docker:
+        self.interpreter_pool_dict = interpreter_pool_dict
+        self.language = language
+        if not use_docker and interpreter_pool_dict is None:
             self.interpreter = Interpreter(
                 work_dir=work_dir,
                 language=language,
@@ -136,6 +198,9 @@ class InterpreterEnvState:
         if self.use_docker:
             await self._start_container()
         else:
+            if self.interpreter is None:
+                interpreter_pool = self.interpreter_pool_dict[self.language]
+                self.interpreter = await interpreter_pool.alloc(work_dir=self.work_dir, execution_timeout=self.execution_timeout, use_host_env_vars=self.use_host_env_vars, extra_envs=self.extra_envs)
             assert self.interpreter is not None
             await self.interpreter.start()
 
@@ -251,7 +316,10 @@ class InterpreterEnvState:
                 await self._docker_client.close()
                 self._docker_client = None
         elif self.interpreter is not None:
-            await self.interpreter.close()
+            if self.interpreter_pool_dict is not None:
+                await self.interpreter_pool_dict[self.language].free(self.interpreter)
+            # await self.interpreter.close()
+            self.interpreter = None
 
     def _add_cell(self, code: str, result: "ExecutionResult") -> int:
         """Add a new code cell to the notebook with execution results.
@@ -388,6 +456,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         extra_envs: dict[str, str] | None = None,
         include_env_state_msg: bool = False,
         save_dir: Path | None = None,
+        interpreter_pool_dict: dict[NBLanguage, InterpreterPool] | None = None
     ):
         self.config = config or InterpreterEnvConfig()
         self.work_dir = work_dir
@@ -412,6 +481,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.state: InterpreterEnvState
         # prompting_config is set during reset() after language resolution
         self.prompting_config: PromptingConfig
+        self.interpreter_pool_dict = interpreter_pool_dict
 
     @property
     def language(self) -> NBLanguage:
@@ -455,6 +525,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             | self.extra_envs,
             save_dir=self.save_dir,
             use_docker=self.config.use_docker,
+            interpreter_pool_dict=self.interpreter_pool_dict,
         )
         await self.state.start()
 

@@ -6,6 +6,7 @@ and executing code, with optional security isolation via SecureKernelManager.
 
 from __future__ import annotations
 
+import uuid
 import asyncio
 import logging
 import os
@@ -201,21 +202,44 @@ class Interpreter:
         self.use_host_env_vars = use_host_env_vars
         self.extra_envs = extra_envs or {}
 
-        # Execution state
-        self.execution_history: list[ExecutionResult] = []
-
         # Kernel state
         self.kernel_manager: AsyncKernelManager
         self.client: AsyncKernelClient | None = None
         self._is_ready = False
+
+        # Execution state
+        self.execution_history: list[ExecutionResult] = []
+
+    # convenience method for setting useful vars in interpreter pools
+    async def initialize(self, work_dir: Path, language: utils.NBLanguage = utils.NBLanguage.PYTHON, execution_timeout: float = 600, use_host_env_vars: bool = False, extra_envs: dict[str, str] | None = None):
+        self.work_dir = work_dir
+        self.language = language
+        self.execution_timeout = execution_timeout
+        self.use_host_env_vars = use_host_env_vars
+        self.extra_envs = extra_envs or {}
+
+        # if the jupyter kernel is up and ready, reset it to the new params
+        if self.client and self._is_ready:
+            # await self.reset()
+            # NOTE: this is a bit of a hack to force the kernel into a different workdir
+            if self.language == utils.NBLanguage.PYTHON:
+                await self.execute_code(f"import os; os.chdir('{self.work_dir}')", execution_timeout=self.execution_timeout, extract_code=False)
+                await self.execute_code("%reset -f", execution_timeout=self.execution_timeout, extract_code=False)
+            elif self.language == utils.NBLanguage.R:
+                await self.execute_code(f'setwd("{self.work_dir}")', execution_timeout=self.execution_timeout, extract_code=False)
+                # await self.execute_code("rm(list = ls())", execution_timeout=self.execution_timeout, extract_code=False)
+
+        # Execution state
+        self.execution_history: list[ExecutionResult] = []
 
     async def start(self) -> None:
         """Start the kernel and prepare for execution."""
         if self._is_ready:
             return
 
+        kernel_uuid = str(uuid.uuid4())
         kernel_name = self.language.make_kernelspec()["name"]
-        self.kernel_manager = AsyncKernelManager(kernel_name=kernel_name)
+        self.kernel_manager = AsyncKernelManager(kernel_name=kernel_name, transport='ipc', connection_file=os.path.join(self.work_dir, f'conn_{kernel_uuid}.json'))
 
         # Prepare kernel startup kwargs with environment variables
         kwargs: dict[str, Any] = {"cwd": str(self.work_dir)}
@@ -227,6 +251,7 @@ class Interpreter:
             } | self.extra_envs
         else:
             kwargs["env"] = os.environ | self.extra_envs
+        kwargs["extra_arguments"] = ['--HistoryManager.hist_file=:memory:']
 
         await self.kernel_manager.start_kernel(**kwargs)
         self.client = self.kernel_manager.client()
@@ -387,9 +412,29 @@ class Interpreter:
 
     async def reset(self) -> None:
         """Reset the kernel to a clean state."""
-        if self._is_ready:
-            await self.close()
-        await self.start()
+
+        kwargs: dict[str, Any] = {"cwd": str(self.work_dir)}
+        if not self.use_host_env_vars:
+            kwargs["env"] = {
+                required_env_var: os.environ[required_env_var]
+                for required_env_var in cfg.REQUIRED_PATH_ENV_VARS
+                if os.environ.get(required_env_var)
+            } | self.extra_envs
+        else:
+            kwargs["env"] = os.environ | self.extra_envs
+        kwargs["extra_arguments"] = ['--HistoryManager.hist_file=:memory:']
+
+        if self._is_ready and self.client:
+            self.client.stop_channels()
+            await self.kernel_manager.restart_kernel(now=True, **kwargs) # use restart_kernel instead of full shutdown/start
+            self.client = self.kernel_manager.client()
+            self.client.start_channels()
+            await self.client.wait_for_ready(timeout=60)
+        elif not self._is_ready:
+            await self.start() # if we dont have a client ready, just start the session
+
+        # move kernel to saved work_dir
+        # await self.execute_code(f"import os; os.chdir('{self.work_dir}')", execution_timeout=self.execution_timeout, extract_code=False) # NOTE: this is a bit of a hack to force the kernel into a different workdir
 
         # Clear execution history
         self.execution_history.clear()
