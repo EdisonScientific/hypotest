@@ -19,6 +19,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           activate-environment: true
       - run: uv sync
+      - run: uv run prek run -a
       - uses: pre-commit-ci/lite-action@v1.1.0
         if: always()
   test:

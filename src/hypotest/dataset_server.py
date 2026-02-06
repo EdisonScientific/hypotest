@@ -1,13 +1,13 @@
 import argparse
 import asyncio
 import os
+import random
 import shutil
+import socket
 from collections import Counter
 from pathlib import Path
-import random
-import socket
 from tempfile import mkdtemp
-from typing import Self, cast, Union
+from typing import Any, Self, cast
 from uuid import UUID
 
 import yaml
@@ -25,7 +25,9 @@ class DatasetConfig(BaseModel):
     problem_jsonl: FilePath
     capsule_dir: DirectoryPath
     rubric_model: str = "openai/gpt-5"
-    rubric_model_config: dict[str, Union[str, list]] = Field(default_factory=lambda: {"reasoning_effort": "medium"})
+    rubric_model_config: dict[str, str | list[Any]] = Field(
+        default_factory=lambda: cast(dict[str, str | list[Any]], {"reasoning_effort": "medium"})
+    )
 
     work_dir: Path | None = None
     use_docker: bool = True
@@ -102,9 +104,10 @@ class ServerConfig(BaseModel):
         return os.getenv(val, val)
 
     def model_post_init(self, _):
-        ## Assign a random port when non-positive value.
+        # Assign a random port when non-positive value.
         if self.port <= 0:
             self.port = random.randint(1024, 65535)
+
 
 async def launch_server():
     parser = argparse.ArgumentParser()
@@ -115,7 +118,8 @@ async def launch_server():
     dataset = Dataset(config.dataset)
     server = TaskDatasetServer(dataset, port=config.port, api_key=config.api_key)
 
-    print(f"Starting dataset server: Node={socket.gethostname()} IPAddress={socket.gethostbyname(socket.gethostname())} Port={config.port}")
+    ip_address = socket.gethostbyname(socket.gethostname())
+    print(f"Starting dataset server: Node={socket.gethostname()} IPAddress={ip_address} Port={config.port}")
 
     await server.astart()
 
