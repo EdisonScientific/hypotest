@@ -13,7 +13,6 @@ from uuid import UUID
 import pytest
 import pytest_asyncio
 from aviary.core import Message, ToolCall, ToolRequestMessage, ToolResponseMessage
-from conftest import requires_matplotlib, should_skip_docker_test
 from lmi import LiteLLMModel
 
 from hypotest.env import config as cfg
@@ -25,6 +24,8 @@ from hypotest.env.interpreter_env import (
     ProblemInstance,
 )
 from hypotest.env.kernel_server import NBLanguage
+
+from .conftest import requires_matplotlib, should_skip_docker_test
 
 
 @pytest_asyncio.fixture

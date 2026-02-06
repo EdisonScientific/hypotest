@@ -5,10 +5,11 @@ import tempfile
 
 import nbformat
 import pytest
-from conftest import requires_matplotlib
 
 from hypotest.env.interpreter import ExecutionResult, Interpreter
 from hypotest.env.kernel_server import MessageType, NBLanguage
+
+from .conftest import requires_matplotlib
 
 
 class TestExecutionResult:
