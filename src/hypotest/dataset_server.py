@@ -94,6 +94,7 @@ class ServerConfig(BaseModel):
 
     dataset: DatasetConfig
     api_key: str = Field(
+        default="EMPTY",
         description="API key to access the server; passed either by value or as an environment variable."
     )
     port: int = DEFAULT_SERVER_PORT
@@ -111,15 +112,49 @@ class ServerConfig(BaseModel):
 
 async def launch_server():
     parser = argparse.ArgumentParser()
-    parser.add_argument("config", type=FilePath)
-    config_path = parser.parse_args().config
-    config = ServerConfig.model_validate(yaml.safe_load(config_path.read_text()))
+    parser.add_argument("--config-file", type=FilePath)
+    parser.add_argument("--port", type=int, default=DEFAULT_SERVER_PORT)
+    parser.add_argument("--problem-jsonl", type=FilePath)
+    parser.add_argument("--capsule-dir", type=DirectoryPath)
+    parser.add_argument("--rubric-model", type=str)
+    parser.add_argument("--reasoning-effort", type=str, default="medium")
+    parser.add_argument("--rubric-model-api-base", type=str, default=os.getenv("HYPOTEST_RUBRIC_MODEL_API_BASE"))
+    parser.add_argument("--rubric-model-api-key", type=str, default=os.getenv("HYPOTEST_RUBRIC_MODEL_API_KEY"))
+    parser.add_argument("--use-docker", action="store_true")
+
+    args = parser.parse_args()
+
+    if args.config_file and args.config_file.exists():
+        config = ServerConfig.model_validate(yaml.safe_load(args.config.read_text()))
+    else:
+        config = ServerConfig(
+            dataset=DatasetConfig(
+                problem_jsonl=args.problem_jsonl,
+                capsule_dir=args.capsule_dir,
+                rubric_model=args.rubric_model,
+                rubric_model_config=dict(
+                    model_list=[
+                        dict(
+                            model_name=args.rubric_model,
+                            litellm_params=dict(
+                                model=args.rubric_model,
+                                api_base=args.rubric_model_api_base,
+                                api_key=args.rubric_model_api_key,
+                                reasoning_effort=args.reasoning_effort,
+                            ),
+                        ),
+                    ],
+                ),
+                use_docker=args.use_docker,
+            ),
+            port=args.port,
+        )
 
     dataset = Dataset(config.dataset)
     server = TaskDatasetServer(dataset, port=config.port, api_key=config.api_key)
 
     ip_address = socket.gethostbyname(socket.gethostname())
-    print(f"Starting dataset server: Node={socket.gethostname()} IPAddress={ip_address} Port={config.port}")
+    print(f"Starting dataset server: IPAddress={ip_address} Port={config.port}")
 
     await server.astart()
 
