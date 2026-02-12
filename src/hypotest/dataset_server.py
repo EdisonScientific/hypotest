@@ -94,7 +94,6 @@ class ServerConfig(BaseModel):
 
     dataset: DatasetConfig
     api_key: str = Field(
-        default="EMPTY",
         description="API key to access the server; passed either by value or as an environment variable."
     )
     port: int = DEFAULT_SERVER_PORT
@@ -112,8 +111,9 @@ class ServerConfig(BaseModel):
 
 async def launch_server():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config-file", type=FilePath)
+    parser.add_argument("config", type=FilePath, nargs="?")
     parser.add_argument("--port", type=int, default=DEFAULT_SERVER_PORT)
+    parser.add_argument("--api-key", type=str, default=os.getenv("HYPOTEST_API_KEY"))
     parser.add_argument("--problem-jsonl", type=FilePath)
     parser.add_argument("--capsule-dir", type=DirectoryPath)
     parser.add_argument("--rubric-model", type=str)
@@ -124,7 +124,7 @@ async def launch_server():
 
     args = parser.parse_args()
 
-    if args.config_file and args.config_file.exists():
+    if args.config and args.config.exists():
         config = ServerConfig.model_validate(yaml.safe_load(args.config.read_text()))
     else:
         config = ServerConfig(
@@ -132,22 +132,23 @@ async def launch_server():
                 problem_jsonl=args.problem_jsonl,
                 capsule_dir=args.capsule_dir,
                 rubric_model=args.rubric_model,
-                rubric_model_config=dict(
-                    model_list=[
-                        dict(
-                            model_name=args.rubric_model,
-                            litellm_params=dict(
-                                model=args.rubric_model,
-                                api_base=args.rubric_model_api_base,
-                                api_key=args.rubric_model_api_key,
-                                reasoning_effort=args.reasoning_effort,
-                            ),
-                        ),
+                rubric_model_config={
+                    "model_list": [
+                        {
+                            "model_name": args.rubric_model,
+                            "litellm_params": {
+                                "model": args.rubric_model,
+                                "api_base": args.rubric_model_api_base,
+                                "api_key": args.rubric_model_api_key,
+                                "reasoning_effort": args.reasoning_effort,
+                            },
+                        },
                     ],
-                ),
+                },
                 use_docker=args.use_docker,
             ),
             port=args.port,
+            api_key=args.api_key,
         )
 
     dataset = Dataset(config.dataset)
