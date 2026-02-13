@@ -1,3 +1,4 @@
+import json
 import argparse
 import asyncio
 import os
@@ -34,6 +35,12 @@ class DatasetConfig(BaseModel):
     force_python: bool = True
     normalize_reward: bool = True
     save_dir: Path | None = None
+
+    pool_size: int = 1
+    warm_size: int = 0
+    greedy_init_interpreter: bool = False
+
+    execution_config: dict = {}
 
     @model_validator(mode="after")
     def make_dirs(self) -> Self:
@@ -112,14 +119,31 @@ class ServerConfig(BaseModel):
 async def launch_server():
     parser = argparse.ArgumentParser()
     parser.add_argument("config", type=FilePath)
-    config_path = parser.parse_args().config
+    parser.add_argument('-p', '--port', type=int, default=None)
+    parser.add_argument('-d', '--registry-dir', type=str, default="/registry")
+    parser.add_argument('-w', '--work-dir', type=str, default=None)
+    parser.add_argument('-t', '--timeout', type=float, default=600)
+    args = parser.parse_args()
+    config_path = args.config
     config = ServerConfig.model_validate(yaml.safe_load(config_path.read_text()))
 
-    dataset = Dataset(config.dataset)
-    server = TaskDatasetServer(dataset, port=config.port, api_key=config.api_key)
+    # if we get work dir in through args, override the config
+    if args.work_dir is not None:
+        config.dataset.work_dir = Path(args.work_dir)
 
-    ip_address = socket.gethostbyname(socket.gethostname())
-    print(f"Starting dataset server: Node={socket.gethostname()} IPAddress={ip_address} Port={config.port}")
+    if 'cell_execution_timeout' not in config.execution_config:
+        config.execution_config['cell_execution_timeout'] = args.timeout
+
+    dataset = Dataset(config.dataset)
+    # await dataset.initialize()
+    server = TaskDatasetServer(dataset, port=config.port if args.port is None else args.port, api_key=config.api_key)
+
+    print(f"Starting dataset server: Node={socket.gethostname()} IPAddress={socket.gethostbyname(socket.gethostname())} Port={config.port}")
+
+    hostname = socket.gethostname()
+    with open(os.path.join(args.registry_dir, f"{hostname}.json"), 'w') as f:
+        reg_entry = {'host': hostname, 'port': server.port}
+        json.dump(reg_entry, f)
 
     await server.astart()
 

@@ -6,6 +6,7 @@ and executing code, with optional security isolation via SecureKernelManager.
 
 from __future__ import annotations
 
+import uuid
 import asyncio
 import logging
 import os
@@ -17,6 +18,7 @@ from jupyter_client.asynchronous.client import AsyncKernelClient
 from jupyter_client.manager import AsyncKernelManager
 from nbformat import NotebookNode
 from pydantic import BaseModel, ConfigDict, Field
+from asyncio.exceptions import CancelledError
 
 from . import config as cfg
 from . import utils
@@ -214,8 +216,9 @@ class Interpreter:
         if self._is_ready:
             return
 
+        kernel_uuid = str(uuid.uuid4())
         kernel_name = self.language.make_kernelspec()["name"]
-        self.kernel_manager = AsyncKernelManager(kernel_name=kernel_name)
+        self.kernel_manager = AsyncKernelManager(kernel_name=kernel_name, transport='ipc', connection_file=os.path.join(self.work_dir, f'conn_{kernel_uuid}.json'))
 
         # Prepare kernel startup kwargs with environment variables
         kwargs: dict[str, Any] = {"cwd": str(self.work_dir)}
@@ -227,6 +230,7 @@ class Interpreter:
             } | self.extra_envs
         else:
             kwargs["env"] = os.environ | self.extra_envs
+        kwargs["extra_arguments"] = ['--HistoryManager.hist_file=:memory:']
 
         await self.kernel_manager.start_kernel(**kwargs)
         self.client = self.kernel_manager.client()
@@ -331,10 +335,20 @@ class Interpreter:
         # Use provided timeout or fall back to instance default
         timeout = execution_timeout if execution_timeout is not None else self.execution_timeout
 
+        exec_uuid = uuid.uuid4()
+
         try:
+            start_time = time.time()
             async with asyncio.timeout(timeout):
+                inner_start_time = time.time()
                 result = await self._execute_code(code)
-        except TimeoutError:
+                inner_time = time.time() - inner_start_time
+            exec_time = time.time() - start_time
+            print(f"Exec Request {exec_uuid} Time: {exec_time:.4f}s")
+            print(f"Exec Request {exec_uuid} Inner Time: {inner_time:.4f}s")
+
+        except (TimeoutError, CancelledError):
+            handle_start_time = time.time()
             timeout_output = MessageType.ERROR.to_notebook_output({
                 "ename": "TimeoutError",
                 "evalue": f"Code execution timed out after {timeout} seconds",
@@ -344,6 +358,8 @@ class Interpreter:
                 notebook_outputs=[cast(NotebookNode, timeout_output)],
                 error_occurred=True,
             )
+            handle_time = time.time() - handle_start_time
+            print(f"Exec Request {exec_uuid} Handle Time: {handle_time:.4f}s")
         except Exception as e:
             error_output = MessageType.ERROR.to_notebook_output({
                 "ename": type(e).__name__,
