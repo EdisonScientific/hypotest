@@ -131,8 +131,8 @@ async def launch_server():
     if args.work_dir is not None:
         config.dataset.work_dir = Path(args.work_dir)
 
-    if 'cell_execution_timeout' not in config.execution_config:
-        config.execution_config['cell_execution_timeout'] = args.timeout
+    if 'cell_execution_timeout' not in config.dataset.execution_config:
+        config.dataset.execution_config['cell_execution_timeout'] = args.timeout
 
     dataset = Dataset(config.dataset)
     # await dataset.initialize()
