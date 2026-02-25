@@ -141,6 +141,7 @@ async def launch_server():
                                 "api_base": args.rubric_model_api_base,
                                 "api_key": args.rubric_model_api_key,
                                 "reasoning_effort": args.reasoning_effort,
+                                "drop_params": True,
                             },
                         },
                     ],
