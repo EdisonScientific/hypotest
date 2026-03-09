@@ -83,9 +83,9 @@ def skip_if_r_unavailable(request):
 def default_problem() -> ProblemInstance:
     """Default ProblemInstance for tests."""
     return ProblemInstance(
-        uuid=UUID("00000000-0000-0000-0000-000000000000"),
+        id=UUID("00000000-0000-0000-0000-000000000000"),
         hypothesis="Test hypothesis",
-        objective="Test objective",
+        protocol="Test objective",
         answer=True,
         rubric="Test rubric",
         max_points=10,

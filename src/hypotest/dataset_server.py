@@ -57,11 +57,11 @@ class Dataset(TaskDataset[InterpreterEnv]):
 
     def get_new_env_by_idx(self, idx: int) -> InterpreterEnv:
         problem = self.problems[idx]
-        problem_count = self.problem_counter[problem.uuid]
-        self.problem_counter[problem.uuid] += 1
-        run_id = f"{problem.uuid}-iter{problem_count}"
+        problem_count = self.problem_counter[problem.id]
+        self.problem_counter[problem.id] += 1
+        run_id = f"{problem.id}-iter{problem_count}"
 
-        capsule_path = self.config.capsule_dir / f"CapsuleData-{problem.uuid}"
+        capsule_path = self.config.capsule_dir / f"CapsuleData-{problem.id}"
         problem_dir = Path(self.config.work_dir) / run_id if self.config.work_dir else Path(mkdtemp())
         problem_dir.mkdir(parents=True, exist_ok=True)
         shutil.copytree(capsule_path, problem_dir, dirs_exist_ok=True)
@@ -71,7 +71,7 @@ class Dataset(TaskDataset[InterpreterEnv]):
         language = (
             NBLanguage.PYTHON
             if self.config.force_python
-            else NBLanguage.from_string(cast(str, problem.metadata["nb_primary_language"]).upper())
+            else NBLanguage.from_string(cast(str, problem.metadata.get("nb_primary_language", "python")).upper())
         )
 
         return InterpreterEnv(
