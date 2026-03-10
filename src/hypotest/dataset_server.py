@@ -19,7 +19,7 @@ from hypotest.env.interpreter_env import InterpreterEnv, InterpreterEnvConfig, P
 from hypotest.env.kernel_server import NBLanguage
 
 
-class DatasetConfig(BaseModel):
+class HypotestDatasetConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     problem_jsonl: FilePath
@@ -30,10 +30,14 @@ class DatasetConfig(BaseModel):
     )
 
     work_dir: Path | None = None
-    use_docker: bool = True
+    use_docker: bool = False
+    use_enroot: bool = True
+    container_sqsh_path: str | None = None
     force_python: bool = True
     normalize_reward: bool = True
     save_dir: Path | None = None
+
+    execution_config: dict[str, Any]
 
     @model_validator(mode="after")
     def make_dirs(self) -> Self:
@@ -43,8 +47,8 @@ class DatasetConfig(BaseModel):
         return self
 
 
-class Dataset(TaskDataset[InterpreterEnv]):
-    def __init__(self, config: DatasetConfig):
+class HypotestDataset(TaskDataset[InterpreterEnv]):
+    def __init__(self, config: HypotestDatasetConfig):
         self.config = config
 
         self.problems = [
@@ -71,7 +75,7 @@ class Dataset(TaskDataset[InterpreterEnv]):
         language = (
             NBLanguage.PYTHON
             if self.config.force_python
-            else NBLanguage.from_string(cast(str, problem.metadata["nb_primary_language"]).upper())
+            else NBLanguage.from_string(cast(str, problem.nb_primary_language).upper())
         )
 
         return InterpreterEnv(
