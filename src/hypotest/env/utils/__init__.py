@@ -19,7 +19,7 @@ __all__ = [
     "view_notebook",
 ]
 
-from hypotest.env.kernel_server import NBLanguage
+from resources_servers.aviary_hypotest.env.kernel_server import NBLanguage
 
 from .core import extract_code_from_markdown, extract_xml_content
 from .img_utils import (

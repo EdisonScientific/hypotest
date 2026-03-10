@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import nbformat
 from aiodocker.containers import DockerContainer
 
-from hypotest.env import config as cfg
+from resources_servers.aviary_hypotest.env import config as cfg
 
 from .img_utils import encode_image_to_base64
 
