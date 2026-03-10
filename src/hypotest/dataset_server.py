@@ -61,7 +61,9 @@ class Dataset(TaskDataset[InterpreterEnv]):
         self.problem_counter[problem.id] += 1
         run_id = f"{problem.id}-iter{problem_count}"
 
-        capsule_path = self.config.capsule_dir / f"CapsuleData-{problem.id}"
+        capsule_path = self.config.capsule_dir / problem.input_data_path
+        if not capsule_path.exists():
+            capsule_path = self.config.capsule_dir / f"CapsuleData-{problem.id}"
         problem_dir = Path(self.config.work_dir) / run_id if self.config.work_dir else Path(mkdtemp())
         problem_dir.mkdir(parents=True, exist_ok=True)
         shutil.copytree(capsule_path, problem_dir, dirs_exist_ok=True)
