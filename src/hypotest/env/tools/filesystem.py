@@ -23,8 +23,8 @@ import nbformat
 import numpy as np
 from aviary.core import Message, Tool
 
-from hypotest.env.utils import img_utils
-from hypotest.env.utils.notebook_utils import view_notebook
+from resources_servers.aviary_hypotest.env.utils import img_utils
+from resources_servers.aviary_hypotest.env.utils.notebook_utils import view_notebook
 
 # =============================================================================
 # CONSTANTS
@@ -343,25 +343,11 @@ def list_dir_tool(
     overwhelming the context with too many files. Use this tool instead of
     writing code to list directories to avoid context bloat.
 
-    Usage Examples:
-        list_dir()                      # List working directory
-        list_dir("data/")               # List specific folder
-        list_dir(max_files=50)          # Show more files
-        list_dir(show_hidden=True)      # Include hidden files
-
     Args:
         directory: Directory path to list (default: current working directory)
         max_files: Maximum number of files to display (default: 20)
         show_hidden: Whether to show hidden files starting with '.' (default: False)
     """
-    # LLM can sometimes generate string instead of int; fallback to default when typecast fails.
-    try:
-        max_files = int(max_files)
-    except ValueError:
-        max_files = 20
-
-    show_hidden = bool(show_hidden)
-
     try:
         dir_path = Path(directory).resolve()
         if not dir_path.exists() or not dir_path.is_dir():

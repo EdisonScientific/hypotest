@@ -4,6 +4,9 @@ This module provides a lightweight, execution-focused environment for running
 code in Jupyter kernels. It focuses on direct code execution via run_cell().
 """
 
+import sys
+import ray
+import signal
 import argparse
 import asyncio
 import json
@@ -11,11 +14,15 @@ import logging
 import os
 import shutil
 import socket
+import statistics
+import threading
 import time
+import random
 from pathlib import Path
 from tempfile import mkdtemp
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
+import uuid
 
 import aiodocker
 import httpx
@@ -36,6 +43,9 @@ from lmi import LiteLLMModel
 from nbformat import NotebookNode
 from pydantic import BaseModel, Field, JsonValue
 
+import subprocess
+from textwrap import dedent
+
 from . import config as cfg
 from .config import ExecutionConfig
 from .interpreter import ExecutionResult, Interpreter
@@ -49,20 +59,158 @@ if TYPE_CHECKING:
 
 # Port management for Docker containers
 _USED_PORTS: set[int] = set()
+used_ports_lock = asyncio.Lock()
 
+# container launch semaphore to limit concurrency
+CONTAINER_LAUNCH_SEM = asyncio.Semaphore(128)
 
-def get_free_port() -> int:
+async def get_free_port() -> int:
     """Get a free port for the kernel server container."""
     while True:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("", 0))
             port = s.getsockname()[1]
-        if port not in _USED_PORTS:
-            _USED_PORTS.add(port)
-            return port
+        async with used_ports_lock:
+            if port not in _USED_PORTS:
+                _USED_PORTS.add(port)
+                return port
 
 
 logger = logging.getLogger(__name__)
+
+# Container lifecycle log level: root logger defaults to WARNING and we
+# cannot reconfigure it, so use WARNING for all container diagnostics to
+# ensure they are visible in production logs.
+_CONTAINER_LOG_LEVEL = logging.WARNING
+
+
+def _kill_process_group(proc: subprocess.Popen, label: str = "enroot", sigterm_timeout: float = 15) -> None:
+    """Safely terminate a process group, escalating from SIGTERM to SIGKILL.
+
+    Handles all edge cases: already-dead process, missing process group, etc.
+    """
+    if proc.poll() is not None:
+        logger.log(
+            _CONTAINER_LOG_LEVEL,
+            "[%s] Process pid=%d already exited with returncode=%d",
+            label, proc.pid, proc.returncode,
+        )
+        return
+
+    pgid = None
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        logger.log(_CONTAINER_LOG_LEVEL, "[%s] Process pid=%d vanished before we could get pgid", label, proc.pid)
+        return
+
+    # SIGTERM the whole group
+    try:
+        logger.log(_CONTAINER_LOG_LEVEL, "[%s] Sending SIGTERM to pgid=%d (pid=%d)", label, pgid, proc.pid)
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        logger.log(_CONTAINER_LOG_LEVEL, "[%s] Process group pgid=%d already gone after SIGTERM", label, pgid)
+        return
+
+    try:
+        # proc.wait(timeout=sigterm_timeout)
+        proc.communicate(timeout=sigterm_timeout)
+        logger.log(
+            _CONTAINER_LOG_LEVEL,
+            "[%s] Process pid=%d exited after SIGTERM with returncode=%d",
+            label, proc.pid, proc.returncode,
+        )
+        return
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "[%s] Process pid=%d did not exit within %.1fs of SIGTERM, sending SIGKILL",
+            label, proc.pid, sigterm_timeout,
+        )
+
+    # SIGKILL the whole group
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        logger.log(_CONTAINER_LOG_LEVEL, "[%s] Process group pgid=%d already gone before SIGKILL", label, pgid)
+        return
+
+    try:
+        # proc.wait(timeout=5)
+        proc.communicate(timeout=5)
+        logger.log(
+            _CONTAINER_LOG_LEVEL,
+            "[%s] Process pid=%d exited after SIGKILL with returncode=%d",
+            label, proc.pid, proc.returncode,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("[%s] Process pid=%d still alive after SIGKILL — possible zombie", label, proc.pid)
+
+PERF_METRICS_ENABLED = os.getenv("NEMO_GYM_PERF_METRICS", "0") == "1"
+PERF_DETAIL_SAMPLE_RATE = float(os.getenv("NEMO_GYM_PERF_DETAIL_SAMPLE_RATE", "0.2"))
+PERF_SLOW_STEP_MS = float(os.getenv("NEMO_GYM_PERF_SLOW_STEP_MS", "5000"))
+PERF_AGGREGATE_INTERVAL_S = float(os.getenv("NEMO_GYM_PERF_AGGREGATE_INTERVAL_S", "30"))
+PERF_LOG_LEVEL = getattr(logging, os.getenv("NEMO_GYM_PERF_LOG_LEVEL", "WARNING").upper(), logging.WARNING)
+
+_PERF_METRIC_SAMPLES: dict[str, list[float]] = {}
+_PERF_LAST_FLUSH_TS = time.perf_counter()
+_PERF_LOCK = threading.Lock()
+
+
+def _log_perf(payload: dict[str, Any]) -> None:
+    logger.log(PERF_LOG_LEVEL, json.dumps(payload))
+
+
+def _percentile(sorted_values: list[float], pct: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    idx = (len(sorted_values) - 1) * pct
+    lo = int(idx)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = idx - lo
+    return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac
+
+
+def _maybe_flush_perf_aggregates() -> None:
+    global _PERF_LAST_FLUSH_TS, _PERF_METRIC_SAMPLES
+    now = time.perf_counter()
+    if now - _PERF_LAST_FLUSH_TS < PERF_AGGREGATE_INTERVAL_S:
+        return
+
+    with _PERF_LOCK:
+        now = time.perf_counter()
+        if now - _PERF_LAST_FLUSH_TS < PERF_AGGREGATE_INTERVAL_S:
+            return
+        snapshots = _PERF_METRIC_SAMPLES
+        _PERF_METRIC_SAMPLES = {}
+        _PERF_LAST_FLUSH_TS = now
+
+    for metric_name, values in snapshots.items():
+        if not values:
+            continue
+        ordered = sorted(values)
+        payload = {
+            "component": "aviary_hypotest.interpreter_env",
+            "event": "perf_aggregate",
+            "metric": metric_name,
+            "count": len(values),
+            "mean_ms": round(statistics.fmean(values), 3),
+            "p50_ms": round(_percentile(ordered, 0.50), 3),
+            "p90_ms": round(_percentile(ordered, 0.90), 3),
+            "p95_ms": round(_percentile(ordered, 0.95), 3),
+            "p99_ms": round(_percentile(ordered, 0.99), 3),
+            "max_ms": round(ordered[-1], 3),
+        }
+        _log_perf(payload)
+
+
+def _record_perf_metric(metric_name: str, value_ms: float) -> None:
+    if not PERF_METRICS_ENABLED:
+        return
+    with _PERF_LOCK:
+        _PERF_METRIC_SAMPLES.setdefault(metric_name, []).append(value_ms)
+    _maybe_flush_perf_aggregates()
 
 
 class ProblemInstance(BaseModel):
@@ -73,6 +221,376 @@ class ProblemInstance(BaseModel):
     rubric: str
     max_score: int = Field(alias="max_points")
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    nb_primary_language: str
+
+def _prep_workspace_dir(work_dir: str, workspace_path: str = "/data_workspace") -> None:
+    wd = Path(work_dir)
+    (wd / "pydeps").mkdir(parents=True, exist_ok=True)
+    (wd / "pip-cache").mkdir(parents=True, exist_ok=True)
+
+    (wd / "pip.conf").write_text(
+        "[global]\n"
+        "disable-pip-version-check = true\n"
+        "no-input = true\n"
+        f"cache-dir = {workspace_path}/pip-cache\n"
+        f"target = {workspace_path}/pydeps\n"
+    )
+
+@ray.remote(
+    scheduling_strategy="SPREAD",
+    runtime_env={
+        "py_executable": sys.executable,
+    },
+)
+class EnrootKernelServer:
+    def __init__(self, container_sqsh_path: Path, execution_timeout: float):
+        self.container_sqsh_path = container_sqsh_path
+        self.execution_timeout = execution_timeout
+        self._enroot_proc: subprocess.Popen[str] | None = None
+        self._http_client: httpx.AsyncClient | None = None
+        self._container_port: int | None = None
+        self._container_log_path: Path | None = None
+        self._container_log_file: Any | None = None
+
+    def _proc_label(self) -> str:
+        """Short label for log messages identifying this container."""
+        port = self._container_port or "?"
+        pid = self._enroot_proc.pid if self._enroot_proc else "?"
+        return f"enroot(port={port}, pid={pid})"
+
+    async def initialize(self, work_dir: Path, language: NBLanguage) -> None:
+        _prep_workspace_dir(work_dir)
+
+        online = False
+        attempt = 0
+        while not online:
+            attempt += 1
+            self._container_port = await get_free_port()
+            startup_token = str(uuid.uuid4())
+
+            bash = dedent(f"""\
+                set -euo pipefail
+
+                WORKDIR="$(mktemp -d /dev/shm/data_workspace.XXXXXX)"
+                trap 'rm -rf "$WORKDIR"' EXIT
+
+                mkdir -p /dev/shm/$WORKDIR
+                cp -a /data_workspace/. $WORKDIR/
+
+                cd $WORKDIR
+
+                mkdir -p "$WORKDIR/r_libs"
+                cat >"$WORKDIR/Rprofile" <<'EOF'
+                .local_lib <- Sys.getenv("R_LIBS_USER")
+                if (nzchar(.local_lib)) .libPaths(unique(c(.local_lib, .libPaths())))
+                EOF
+
+                mkdir -p $WORKDIR/r_libs
+                export R_LIBS_USER="$WORKDIR/r_libs"
+                export R_PROFILE_USER="$WORKDIR/Rprofile"
+
+                export PYTHONPATH="$WORKDIR/pydeps:${{PYTHONPATH}}"
+                export PIP_CONFIG_FILE=$WORKDIR/pip.conf
+                export target_platform=${{target_platform:-linux-64}}
+
+                source activate /app/kernel_env
+                exec /app/kernel_env/bin/python /envs/kernel_server.py \\
+                    --work_dir $WORKDIR \\
+                    --language {language.value} \\
+                    --port {self._container_port} \\
+                    --startup-token {startup_token}
+            """).strip()
+
+            env_dir = Path(__file__).parent
+            kernel_server_path = env_dir / "kernel_server.py"
+            assert kernel_server_path.is_file(), f"kernel server must be a valid path, found {kernel_server_path}"
+
+            cmd = [
+                "env", "-i", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", 'HOME="$HOME"', 'USER="$USER"',
+                "enroot", "start",
+                "--mount", f"{work_dir}:/data_workspace",
+                "--mount", f"{kernel_server_path.resolve()}:/envs/kernel_server.py",
+                str(self.container_sqsh_path.resolve()),
+                "/bin/bash", "-lc", bash,
+            ]
+
+            async with CONTAINER_LAUNCH_SEM:
+                launch_t0 = time.perf_counter()
+                # Redirect container output to a log file instead of
+                # subprocess.PIPE to avoid pipe-buffer deadlock (the 64KB
+                # OS pipe buffer fills up when the kernel server produces
+                # verbose DEBUG / uvicorn access logs, blocking the
+                # container process on write() and freezing the kernel).
+                log_dir = work_dir / ".container_logs"
+                log_dir.mkdir(exist_ok=True)
+                self._container_log_path = log_dir / "container.log"
+                self._container_log_file = open(self._container_log_path, "w")  # noqa: SIM115
+                self._enroot_proc = subprocess.Popen(
+                    cmd, text=True, start_new_session=True,
+                    stdout=self._container_log_file, stderr=subprocess.STDOUT,
+                )
+                logger.log(
+                    _CONTAINER_LOG_LEVEL,
+                    "[%s] Container launch attempt #%d started (work_dir=%s, token=%s)",
+                    self._proc_label(), attempt, work_dir, startup_token[:8],
+                )
+
+                # Create HTTP client
+                self._http_client = httpx.AsyncClient(
+                    base_url=f"http://localhost:{self._container_port}",
+                    timeout=httpx.Timeout(self.execution_timeout + 10, connect=30.0),
+                )
+
+                # Wait for health check
+                try:
+                    await self._wait_for_health(expected_startup_token=startup_token)
+                    launch_ms = (time.perf_counter() - launch_t0) * 1000.0
+                    logger.log(
+                        _CONTAINER_LOG_LEVEL,
+                        "[%s] Container online after %.1fms (attempt #%d)",
+                        self._proc_label(), launch_ms, attempt,
+                    )
+                    online = True
+                except Exception as e:
+                    launch_ms = (time.perf_counter() - launch_t0) * 1000.0
+                    self._log_container_failure(attempt, launch_ms, e)
+                    await self._cleanup_failed_startup()
+                    await asyncio.sleep(10)
+
+    def _log_container_failure(self, attempt: int, launch_ms: float, error: Exception) -> None:
+        """Log detailed diagnostics when a container fails to start."""
+        label = self._proc_label()
+        proc = self._enroot_proc
+
+        diag_parts = [
+            f"attempt=#{attempt}",
+            f"elapsed={launch_ms:.0f}ms",
+            f"error={error!r}",
+        ]
+
+        if proc is not None:
+            rc = proc.poll()
+            diag_parts.append(f"process_alive={rc is None}")
+            if rc is not None:
+                diag_parts.append(f"returncode={rc}")
+
+        # Read tail of the container log file for diagnostics
+        log_tail = self._read_container_log_tail()
+        if log_tail:
+            diag_parts.append(f"log_tail={log_tail!r}")
+
+        logger.warning("[%s] Container startup FAILED: %s", label, ", ".join(diag_parts))
+
+    def _read_container_log_tail(self, max_chars: int = 2000) -> str:
+        """Read the tail of the container log file for diagnostics."""
+        if self._container_log_path is None or not self._container_log_path.exists():
+            return ""
+        try:
+            # Flush so any buffered output is written to disk
+            if self._container_log_file and not self._container_log_file.closed:
+                self._container_log_file.flush()
+            text = self._container_log_path.read_text()
+            return text[-max_chars:] if len(text) > max_chars else text
+        except Exception:
+            return ""
+
+    def _close_container_log(self) -> None:
+        """Close the container log file handle."""
+        if self._container_log_file is not None:
+            try:
+                self._container_log_file.close()
+            except Exception:
+                pass
+            self._container_log_file = None
+
+    async def _cleanup_failed_startup(self) -> None:
+        """Best-effort cleanup for failed startup attempts before retrying."""
+        label = self._proc_label()
+
+        if self._container_port is not None:
+            async with used_ports_lock:
+                _USED_PORTS.discard(self._container_port)
+            self._container_port = None
+
+        if self._http_client is not None:
+            try:
+                await self._http_client.aclose()
+            except Exception:
+                pass
+            self._http_client = None
+
+        if self._enroot_proc is not None:
+            _kill_process_group(self._enroot_proc, label=label)
+            self._enroot_proc = None
+
+        self._close_container_log()
+
+    async def _wait_for_health(self, expected_startup_token: str | None = None) -> None:
+        """Wait for the kernel server to become healthy."""
+        start_time = time.perf_counter()
+        poll_count = 0
+        last_status = "no_attempt"
+        # Use a short per-request timeout for health checks so that a single
+        # poll can never block longer than a few seconds.  Without this, the
+        # client's default timeout (execution_timeout + 10 ≈ 190s) means one
+        # health poll can exceed the entire KERNEL_SERVER_STARTUP_TIMEOUT,
+        # e.g. when a port collision causes us to connect to the wrong server.
+        health_timeout = httpx.Timeout(5.0, connect=3.0)
+
+        while time.perf_counter() - start_time < cfg.KERNEL_SERVER_STARTUP_TIMEOUT:
+            poll_count += 1
+            elapsed = time.perf_counter() - start_time
+
+            # Check if the enroot process has died before we even get an HTTP response
+            if self._enroot_proc is not None and self._enroot_proc.poll() is not None:
+                rc = self._enroot_proc.returncode
+                log_tail = self._read_container_log_tail(1000)
+                raise RuntimeError(
+                    f"Enroot process exited prematurely with returncode={rc} "
+                    f"after {elapsed:.1f}s. log: {log_tail!r}"
+                )
+
+            try:
+                assert self._http_client is not None
+                response = await self._http_client.get("/health", timeout=health_timeout)
+                if response.status_code == 200:
+                    if expected_startup_token is None:
+                        logger.log(
+                            _CONTAINER_LOG_LEVEL,
+                            "[%s] Kernel server healthy after %.1fs (%d polls)",
+                            self._proc_label(), elapsed, poll_count,
+                        )
+                        return
+                    payload = response.json()
+                    if payload.get("startup_token") == expected_startup_token:
+                        logger.log(
+                            _CONTAINER_LOG_LEVEL,
+                            "[%s] Kernel server healthy (token matched) after %.1fs (%d polls)",
+                            self._proc_label(), elapsed, poll_count,
+                        )
+                        return
+                    else:
+                        last_status = f"token_mismatch(got={payload.get('startup_token', '?')[:8]})"
+                else:
+                    last_status = f"http_{response.status_code}"
+            except httpx.ConnectError:
+                last_status = "connect_error"
+            except httpx.ReadError:
+                last_status = "read_error"
+            except httpx.TimeoutException:
+                last_status = "timeout"
+            except httpx.RemoteProtocolError:
+                last_status = "protocol_error"
+
+            # Log progress every 5s
+            if poll_count % 10 == 0:
+                proc_alive = self._enroot_proc.poll() is None if self._enroot_proc else False
+                logger.log(
+                    _CONTAINER_LOG_LEVEL,
+                    "[%s] Health poll #%d at %.1fs: last_status=%s, process_alive=%s",
+                    self._proc_label(), poll_count, elapsed, last_status, proc_alive,
+                )
+
+            await asyncio.sleep(0.5)
+
+        total_elapsed = time.perf_counter() - start_time
+        raise TimeoutError(
+            f"Kernel server did not become healthy within {cfg.KERNEL_SERVER_STARTUP_TIMEOUT}s "
+            f"({poll_count} polls, last_status={last_status}, elapsed={total_elapsed:.1f}s)"
+        )
+
+    # @tenacity.retry(
+    #     retry=tenacity.retry_if_exception_type((httpx.ConnectError, httpx.ReadError)),
+    #     stop=tenacity.stop_after_attempt(3),
+    #     wait=tenacity.wait_exponential(multiplier=1, min=1, max=10),
+    #     reraise=True,
+    # )
+    async def _execute_via_http(self, code: str, timeout: float | None = None) -> ExecutionResult:  # noqa: ASYNC109
+        """Execute code via HTTP to the containerized kernel server.
+
+        Handles httpx.TimeoutException (including ReadTimeout) by converting to
+        an error ExecutionResult. This happens when the kernel server's internal
+        asyncio.timeout doesn't cancel the ZMQ recv promptly, causing the HTTP
+        read to time out before the kernel server responds.
+        """
+        assert self._http_client is not None
+
+        try:
+            response = await self._http_client.post(
+                "/execute",
+                json={"code": code, "timeout": timeout},
+            )
+            response.raise_for_status()
+        except httpx.TimeoutException as e:
+            effective_timeout = timeout if timeout is not None else self.execution_timeout
+            logger.warning(
+                "[%s] HTTP %s during /execute (requested kernel timeout=%.1fs): %s",
+                self._proc_label(), type(e).__name__, effective_timeout, e,
+            )
+            timeout_output = nbformat.v4.new_output(
+                output_type="error",
+                ename="TimeoutError",
+                evalue=f"Code execution timed out after {effective_timeout}s (HTTP layer)",
+                traceback=[f"TimeoutError: Code execution timed out after {effective_timeout}s (HTTP layer)"],
+            )
+            return ExecutionResult(
+                notebook_outputs=[timeout_output],
+                error_occurred=True,
+                execution_time=effective_timeout,
+            )
+
+        data = response.json()
+
+        # Convert serialized outputs back to NotebookNode
+        notebook_outputs = [nbformat.from_dict(o) for o in data["notebook_outputs"]]
+
+        return ExecutionResult(
+            notebook_outputs=notebook_outputs,
+            error_occurred=data["error_occurred"],
+            execution_time=data.get("execution_time"),
+        )
+
+    async def _reset_via_http(self) -> None:
+        """Reset the kernel via HTTP."""
+        assert self._http_client is not None
+        try:
+            response = await self._http_client.post("/reset")
+            response.raise_for_status()
+        except httpx.TimeoutException as e:
+            logger.warning(
+                "[%s] HTTP %s during /reset: %s",
+                self._proc_label(), type(e).__name__, e,
+            )
+            raise RuntimeError(f"Kernel reset timed out: {e}") from e
+
+    async def close(self):
+        label = self._proc_label()
+        logger.log(_CONTAINER_LOG_LEVEL, "[%s] Closing EnrootKernelServer", label)
+
+        if self._container_port is not None:
+            async with used_ports_lock:
+                _USED_PORTS.discard(self._container_port)
+
+        if self._http_client is not None:
+            try:
+                response = await self._http_client.post("/close")
+                response.raise_for_status()
+            except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.TimeoutException):
+                logger.log(_CONTAINER_LOG_LEVEL, "[%s] Graceful /close request failed (container may already be down)", label)
+            except Exception:
+                logger.warning("[%s] Unexpected error on /close request", label, exc_info=True)
+            try:
+                await self._http_client.aclose()
+            except Exception:
+                pass
+            self._http_client = None
+
+        if self._enroot_proc is not None:
+            _kill_process_group(self._enroot_proc, label=label)
+            self._enroot_proc = None
+
+        self._close_container_log()
+        logger.log(_CONTAINER_LOG_LEVEL, "[%s] EnrootKernelServer closed", label)
 
 
 class InterpreterEnvState:
@@ -90,6 +608,9 @@ class InterpreterEnvState:
         use_host_env_vars: bool = False,
         extra_envs: dict[str, str] | None = None,
         use_docker: bool = cfg.USE_DOCKER,
+        use_enroot: bool = False,
+        use_ray: bool = True,
+        container_sqsh_path: Path | None = None,
         save_dir: Path | None = None,
     ):
         self.work_dir = work_dir
@@ -102,11 +623,14 @@ class InterpreterEnvState:
         self.actions: list[str] = []
         self.done = False
         self.use_docker = use_docker
+        self.use_enroot = use_enroot
+        self.container_sqsh_path = container_sqsh_path
         self.save_dir = save_dir
+        self.use_ray = use_ray
 
         # Local interpreter (only used when use_docker=False)
         self.interpreter: Interpreter | None = None
-        if not use_docker:
+        if not use_docker and not use_enroot:
             self.interpreter = Interpreter(
                 work_dir=work_dir,
                 language=language,
@@ -115,11 +639,14 @@ class InterpreterEnvState:
                 extra_envs=extra_envs,
             )
 
-        # Docker container state (only used when use_docker=True)
+        # Docker/Enroot container state (only used when use_docker=True or use_enroot=True)
         self._docker_client: aiodocker.Docker | None = None
         self._container: DockerContainer | None = None
+        self._enroot_proc = None
         self._container_port: int | None = None
         self._http_client: httpx.AsyncClient | None = None
+        self._container_log_path: Path | None = None
+        self._container_log_file: Any | None = None
 
         # Initialize notebook structure for state tracking
         self.nb: NotebookNode = nbformat.v4.new_notebook()
@@ -133,13 +660,157 @@ class InterpreterEnvState:
 
     async def start(self):
         """Start the interpreter (local or Docker-based)."""
-        if self.use_docker:
-            await self._start_container()
+        if self.use_enroot:
+            assert self.container_sqsh_path is not None, "container_sqsh_path must be set in config to use enroot"
+            if self.use_ray:
+                await self._start_ray_enroot_container()
+            else:
+                await self._start_enroot_container()
+        elif self.use_docker:
+            await self._start_docker_container()
         else:
             assert self.interpreter is not None
             await self.interpreter.start()
 
-    async def _start_container(self) -> None:
+    async def _start_ray_enroot_container(self) -> None:
+        self.kernel_container = EnrootKernelServer.remote(self.container_sqsh_path, self.execution_timeout)
+        init_ref = self.kernel_container.initialize.remote(self.work_dir, self.language)
+        await init_ref
+
+    def _enroot_label(self) -> str:
+        port = self._container_port or "?"
+        pid = self._enroot_proc.pid if self._enroot_proc else "?"
+        return f"enroot-state(port={port}, pid={pid})"
+
+    async def _start_enroot_container(self) -> None:
+        _prep_workspace_dir(self.work_dir)
+
+        online = False
+        attempt = 0
+        while not online:
+            attempt += 1
+            self._container_port = await get_free_port()
+            startup_token = str(uuid.uuid4())
+
+            bash = dedent(f"""\
+                set -euo pipefail
+                cd /data_workspace
+
+                export PYTHONPATH="/data_workspace/pydeps:${{PYTHONPATH}}"
+                export PIP_CONFIG_FILE=/data_workspace/pip.conf
+                exec /app/kernel_env/bin/python /envs/kernel_server.py \\
+                    --work_dir /data_workspace \\
+                    --language {self.language.value} \\
+                    --port {self._container_port} \\
+                    --startup-token {startup_token}
+            """).strip()
+
+            env_dir = Path(__file__).parent
+            kernel_server_path = env_dir / "kernel_server.py"
+            assert kernel_server_path.is_file(), f"kernel server must be a valid path, found {kernel_server_path}"
+
+            cmd = [
+                "env", "-i", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", 'HOME="$HOME"', 'USER="$USER"',
+                "enroot", "start",
+                "--mount", f"{self.work_dir}:/data_workspace",
+                "--mount", f"{kernel_server_path.resolve()}:/envs/kernel_server.py",
+                str(self.container_sqsh_path.resolve()),
+                "/bin/bash", "-lc", bash,
+            ]
+
+            async with CONTAINER_LAUNCH_SEM:
+                launch_t0 = time.perf_counter()
+                # Redirect container output to a log file (see EnrootKernelServer
+                # for detailed rationale on why we avoid subprocess.PIPE here).
+                log_dir = self.work_dir / ".container_logs"
+                log_dir.mkdir(exist_ok=True)
+                self._container_log_path = log_dir / "container.log"
+                self._container_log_file = open(self._container_log_path, "w")  # noqa: SIM115
+                self._enroot_proc = subprocess.Popen(
+                    cmd, text=True, start_new_session=True,
+                    stdout=self._container_log_file, stderr=subprocess.STDOUT,
+                )
+                logger.log(
+                    _CONTAINER_LOG_LEVEL,
+                    "[%s] Container launch attempt #%d (work_dir=%s, token=%s)",
+                    self._enroot_label(), attempt, self.work_dir, startup_token[:8],
+                )
+
+                # Create HTTP client
+                self._http_client = httpx.AsyncClient(
+                    base_url=f"http://localhost:{self._container_port}",
+                    timeout=httpx.Timeout(self.execution_timeout + 10, connect=30.0),
+                )
+
+                # Wait for health check
+                try:
+                    await self._wait_for_health(expected_startup_token=startup_token)
+                    launch_ms = (time.perf_counter() - launch_t0) * 1000.0
+                    logger.log(
+                        _CONTAINER_LOG_LEVEL,
+                        "[%s] Container online after %.1fms (attempt #%d)",
+                        self._enroot_label(), launch_ms, attempt,
+                    )
+                    online = True
+                except Exception as e:
+                    launch_ms = (time.perf_counter() - launch_t0) * 1000.0
+                    diag = [f"attempt=#{attempt}", f"elapsed={launch_ms:.0f}ms", f"error={e!r}"]
+                    if self._enroot_proc is not None:
+                        rc = self._enroot_proc.poll()
+                        diag.append(f"process_alive={rc is None}")
+                        if rc is not None:
+                            diag.append(f"returncode={rc}")
+                    log_tail = self._read_container_log_tail()
+                    if log_tail:
+                        diag.append(f"log_tail={log_tail!r}")
+                    logger.warning("[%s] Container startup FAILED: %s", self._enroot_label(), ", ".join(diag))
+                    await self._cleanup_failed_startup()
+                    await asyncio.sleep(10)
+
+    def _read_container_log_tail(self, max_chars: int = 2000) -> str:
+        """Read the tail of the container log file for diagnostics."""
+        if self._container_log_path is None or not self._container_log_path.exists():
+            return ""
+        try:
+            if self._container_log_file and not self._container_log_file.closed:
+                self._container_log_file.flush()
+            text = self._container_log_path.read_text()
+            return text[-max_chars:] if len(text) > max_chars else text
+        except Exception:
+            return ""
+
+    def _close_container_log(self) -> None:
+        """Close the container log file handle."""
+        if self._container_log_file is not None:
+            try:
+                self._container_log_file.close()
+            except Exception:
+                pass
+            self._container_log_file = None
+
+    async def _cleanup_failed_startup(self) -> None:
+        """Best-effort cleanup for failed startup attempts before retrying."""
+        label = self._enroot_label()
+
+        if self._container_port is not None:
+            async with used_ports_lock:
+                _USED_PORTS.discard(self._container_port)
+            self._container_port = None
+
+        if self._http_client is not None:
+            try:
+                await self._http_client.aclose()
+            except Exception:
+                pass
+            self._http_client = None
+
+        if self._enroot_proc is not None:
+            _kill_process_group(self._enroot_proc, label=label)
+            self._enroot_proc = None
+
+        self._close_container_log()
+
+    async def _start_docker_container(self) -> None:
         """Start a Docker container with the kernel server."""
         self._docker_client = aiodocker.Docker()
         self._container_port = get_free_port()
@@ -150,21 +821,21 @@ class InterpreterEnvState:
                 "/app/kernel_env/bin/python",
                 "/envs/kernel_server.py",
                 "--work_dir",
-                "/workspace",
+                "/data_workspace",
                 "--language",
                 self.language.value,
             ],
             "HostConfig": {
-                "Binds": [f"{self.work_dir}:/workspace"],
+                "Binds": [f"{self.work_dir}:/data_workspace"],
                 "PortBindings": {f"{cfg.KERNEL_SERVER_PORT}/tcp": [{"HostPort": str(self._container_port)}]},
             },
-            "WorkingDir": "/workspace",
+            "WorkingDir": "/data_workspace",
             "Tty": True,
             "ExposedPorts": {f"{cfg.KERNEL_SERVER_PORT}/tcp": {}},
         }
 
         self._container = await self._docker_client.containers.run(config=cast(dict[str, Any], docker_config))
-        logger.info(f"Started container on port {self._container_port}")
+        logger.log(_CONTAINER_LOG_LEVEL, "Started docker container on port %s", self._container_port)
 
         # Create HTTP client
         self._http_client = httpx.AsyncClient(
@@ -175,20 +846,76 @@ class InterpreterEnvState:
         # Wait for health check
         await self._wait_for_health()
 
-    async def _wait_for_health(self) -> None:
+    async def _wait_for_health(self, expected_startup_token: str | None = None) -> None:
         """Wait for the kernel server to become healthy."""
         start_time = time.perf_counter()
+        poll_count = 0
+        last_status = "no_attempt"
+        # Short per-request timeout (see EnrootKernelServer._wait_for_health
+        # for rationale).
+        health_timeout = httpx.Timeout(5.0, connect=3.0)
+
         while time.perf_counter() - start_time < cfg.KERNEL_SERVER_STARTUP_TIMEOUT:
+            poll_count += 1
+            elapsed = time.perf_counter() - start_time
+
+            # Check if the enroot process has died
+            if self._enroot_proc is not None and self._enroot_proc.poll() is not None:
+                rc = self._enroot_proc.returncode
+                log_tail = self._read_container_log_tail(1000)
+                raise RuntimeError(
+                    f"Enroot process exited prematurely with returncode={rc} "
+                    f"after {elapsed:.1f}s. log: {log_tail!r}"
+                )
+
             try:
                 assert self._http_client is not None
-                response = await self._http_client.get("/health")
+                response = await self._http_client.get("/health", timeout=health_timeout)
                 if response.status_code == 200:
-                    logger.info("Kernel server is healthy")
-                    return
-            except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError):
-                pass
+                    if expected_startup_token is None:
+                        logger.log(
+                            _CONTAINER_LOG_LEVEL,
+                            "[%s] Kernel server healthy after %.1fs (%d polls)",
+                            self._enroot_label(), elapsed, poll_count,
+                        )
+                        return
+                    payload = response.json()
+                    if payload.get("startup_token") == expected_startup_token:
+                        logger.log(
+                            _CONTAINER_LOG_LEVEL,
+                            "[%s] Kernel server healthy (token matched) after %.1fs (%d polls)",
+                            self._enroot_label(), elapsed, poll_count,
+                        )
+                        return
+                    else:
+                        last_status = f"token_mismatch(got={payload.get('startup_token', '?')[:8]})"
+                else:
+                    last_status = f"http_{response.status_code}"
+            except httpx.ConnectError:
+                last_status = "connect_error"
+            except httpx.ReadError:
+                last_status = "read_error"
+            except httpx.TimeoutException:
+                last_status = "timeout"
+            except httpx.RemoteProtocolError:
+                last_status = "protocol_error"
+
+            # Log progress every 5s
+            if poll_count % 10 == 0:
+                proc_alive = self._enroot_proc.poll() is None if self._enroot_proc else False
+                logger.log(
+                    _CONTAINER_LOG_LEVEL,
+                    "[%s] Health poll #%d at %.1fs: last_status=%s, process_alive=%s",
+                    self._enroot_label(), poll_count, elapsed, last_status, proc_alive,
+                )
+
             await asyncio.sleep(0.5)
-        raise TimeoutError(f"Kernel server did not become healthy within {cfg.KERNEL_SERVER_STARTUP_TIMEOUT}s")
+
+        total_elapsed = time.perf_counter() - start_time
+        raise TimeoutError(
+            f"Kernel server did not become healthy within {cfg.KERNEL_SERVER_STARTUP_TIMEOUT}s "
+            f"({poll_count} polls, last_status={last_status}, elapsed={total_elapsed:.1f}s)"
+        )
 
     @tenacity.retry(
         retry=tenacity.retry_if_exception_type((httpx.ConnectError, httpx.ReadError)),
@@ -197,14 +924,38 @@ class InterpreterEnvState:
         reraise=True,
     )
     async def _execute_via_http(self, code: str, timeout: float | None = None) -> ExecutionResult:  # noqa: ASYNC109
-        """Execute code via HTTP to the containerized kernel server."""
+        """Execute code via HTTP to the containerized kernel server.
+
+        Handles httpx.TimeoutException (including ReadTimeout) by converting to
+        an error ExecutionResult, since the kernel server's asyncio.timeout may
+        not cancel the ZMQ recv promptly.
+        """
         assert self._http_client is not None
 
-        response = await self._http_client.post(
-            "/execute",
-            json={"code": code, "timeout": timeout},
-        )
-        response.raise_for_status()
+        try:
+            response = await self._http_client.post(
+                "/execute",
+                json={"code": code, "timeout": timeout},
+            )
+            response.raise_for_status()
+        except httpx.TimeoutException as e:
+            effective_timeout = timeout if timeout is not None else self.execution_timeout
+            logger.warning(
+                "[%s] HTTP %s during /execute (requested kernel timeout=%.1fs): %s",
+                self._enroot_label(), type(e).__name__, effective_timeout, e,
+            )
+            timeout_output = nbformat.v4.new_output(
+                output_type="error",
+                ename="TimeoutError",
+                evalue=f"Code execution timed out after {effective_timeout}s (HTTP layer)",
+                traceback=[f"TimeoutError: Code execution timed out after {effective_timeout}s (HTTP layer)"],
+            )
+            return ExecutionResult(
+                notebook_outputs=[timeout_output],
+                error_occurred=True,
+                execution_time=effective_timeout,
+            )
+
         data = response.json()
 
         # Convert serialized outputs back to NotebookNode
@@ -219,8 +970,14 @@ class InterpreterEnvState:
     async def _reset_via_http(self) -> None:
         """Reset the kernel via HTTP."""
         assert self._http_client is not None
-        response = await self._http_client.post("/reset")
-        response.raise_for_status()
+        try:
+            response = await self._http_client.post("/reset")
+            response.raise_for_status()
+        except httpx.TimeoutException as e:
+            logger.warning(
+                "HTTP %s during /reset: %s", type(e).__name__, e,
+            )
+            raise RuntimeError(f"Kernel reset timed out: {e}") from e
 
     async def close(self):
         """Save the notebook and close the interpreter or container."""
@@ -231,12 +988,22 @@ class InterpreterEnvState:
             self.save_dir.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(self.work_dir, self.save_dir)
 
-        if self.use_docker:
+        if self.use_ray and self.use_enroot:
+            if self.kernel_container is not None:
+                close_ref = self.kernel_container.close.remote()
+                await close_ref
+                self.kernel_container = None
+
+        elif self.use_docker or self.use_enroot:
             if self._container_port is not None:
-                _USED_PORTS.discard(self._container_port)
+                async with used_ports_lock:
+                    _USED_PORTS.discard(self._container_port)
 
             if self._http_client is not None:
-                await self._http_client.aclose()
+                try:
+                    await self._http_client.aclose()
+                except Exception:
+                    pass
                 self._http_client = None
 
             if self._container is not None:
@@ -250,6 +1017,13 @@ class InterpreterEnvState:
             if self._docker_client is not None:
                 await self._docker_client.close()
                 self._docker_client = None
+
+            if self._enroot_proc is not None:
+                _kill_process_group(self._enroot_proc, label=self._enroot_label())
+                self._enroot_proc = None
+
+            self._close_container_log()
+
         elif self.interpreter is not None:
             await self.interpreter.close()
 
@@ -342,11 +1116,30 @@ class InterpreterEnvState:
         Returns:
             Tuple of (ExecutionResult, actual_cell_index)
         """
-        if self.use_docker:
+        execute_start = time.perf_counter()
+        if self.use_ray and self.use_enroot:
+            rpc_wait_start = time.perf_counter()
+            result_ref = self.kernel_container._execute_via_http.remote(code, timeout)
+            result = await result_ref
+            _record_perf_metric(
+                "execute_path_ms.ray_enroot_rpc_wait",
+                (time.perf_counter() - rpc_wait_start) * 1000.0,
+            )
+        elif self.use_docker or self.use_enroot:
+            http_exec_start = time.perf_counter()
             result = await self._execute_via_http(code, timeout)
+            _record_perf_metric(
+                "execute_path_ms.http_kernel_execute",
+                (time.perf_counter() - http_exec_start) * 1000.0,
+            )
         else:
             assert self.interpreter is not None
+            local_exec_start = time.perf_counter()
             result = await self.interpreter.execute_code(code, timeout)
+            _record_perf_metric(
+                "execute_path_ms.local_interpreter_execute",
+                (time.perf_counter() - local_exec_start) * 1000.0,
+            )
 
         if cell_idx is None or cell_idx >= len(self.nb.cells):
             actual_idx = self._add_cell(code, result)
@@ -354,6 +1147,7 @@ class InterpreterEnvState:
             self._update_cell(cell_idx, code, result)
             actual_idx = cell_idx
 
+        _record_perf_metric("execute_and_add_cell_total_ms", (time.perf_counter() - execute_start) * 1000.0)
         return result, actual_idx
 
 
@@ -365,6 +1159,8 @@ class InterpreterEnvConfig(BaseModel):
     execution_config: ExecutionConfig = Field(default_factory=ExecutionConfig)
     max_steps: int = cfg.AGENT_MAX_STEPS
     use_docker: bool = cfg.USE_DOCKER
+    use_enroot: bool = False
+    container_sqsh_path: Path | None = None
     normalize_reward: bool = True
 
 
@@ -403,6 +1199,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.execution_timeout = self.execution_config.cell_execution_timeout
         self.max_steps = self.config.max_steps
 
+        logger.error(f"EXECUTION TIMEOUT SET TO {self.execution_timeout} SECONDS")
+
         self.input_data = input_data
         self.output_data: list[dict[str, str | int]] = []
         self.logger = logger
@@ -412,6 +1210,19 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.state: InterpreterEnvState
         # prompting_config is set during reset() after language resolution
         self.prompting_config: PromptingConfig
+        self._perf_sample_step = False
+
+    def _emit_perf_event(self, event: str, **fields: Any) -> None:
+        if not PERF_METRICS_ENABLED:
+            return
+        payload: dict[str, Any] = {
+            "component": "aviary_hypotest.interpreter_env",
+            "event": event,
+            "env_id": getattr(self, "_nemo_env_id", None),
+            "step_idx": self.step_count,
+        }
+        payload.update(fields)
+        _log_perf(payload)
 
     @property
     def language(self) -> NBLanguage:
@@ -455,6 +1266,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             | self.extra_envs,
             save_dir=self.save_dir,
             use_docker=self.config.use_docker,
+            use_enroot=self.config.use_enroot,
+            container_sqsh_path=self.config.container_sqsh_path
         )
         await self.state.start()
 
@@ -470,7 +1283,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             Tool.from_function(self.run_cell),
             Tool.from_function(self.reset_kernel),
             Tool.from_function(self.submit_answer),
-            Tool.from_function(self._filesystem_tool.list_dir),
+            Tool.from_function(self.list_dir),
         ]
 
         messages.append(
@@ -487,17 +1300,22 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             messages.append(self.get_env_state_msg())
 
         # Always show initial directory listing (with truncation protection)
-        messages.append(Message(content=self._filesystem_tool.list_dir()))
+        messages.append(Message(content=self.list_dir()))
 
         return messages, self.tools
 
     async def step(self, action: ToolRequestMessage) -> tuple[Messages, float, bool, bool]:
         """Execute a step in the environment."""
         self.step_count += 1
+        self._perf_sample_step = PERF_METRICS_ENABLED and random.random() < PERF_DETAIL_SAMPLE_RATE
+        step_start = time.perf_counter()
+        exec_tool_calls_start = time.perf_counter()
         obs = cast(
             Messages,
             await self.exec_tool_calls(action, concurrency=False, handle_tool_exc=True),
         )
+        exec_tool_calls_ms = (time.perf_counter() - exec_tool_calls_start) * 1000.0
+        _record_perf_metric("exec_tool_calls_ms", exec_tool_calls_ms)
 
         obs = [*obs]
         if self.include_env_state_msg:
@@ -512,6 +1330,20 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         self.state.actions.append(str(action))
         reward = self.state.score if self.state.done else 0.0
+        step_total_ms = (time.perf_counter() - step_start) * 1000.0
+        _record_perf_metric("env_step_ms", step_total_ms)
+        should_log_detail = self._perf_sample_step or step_total_ms >= PERF_SLOW_STEP_MS
+        if should_log_detail:
+            obs_payload_chars = sum(len(str(getattr(m, "content", ""))) for m in obs)
+            self._emit_perf_event(
+                "env_step_end",
+                duration_ms=round(step_total_ms, 3),
+                exec_tool_calls_ms=round(exec_tool_calls_ms, 3),
+                action_tool_calls_count=len(action.tool_calls),
+                obs_messages_count=len(obs),
+                obs_payload_chars=obs_payload_chars,
+                slow=step_total_ms >= PERF_SLOW_STEP_MS,
+            )
         return obs, reward, self.state.done, False
 
     # ========== Tools ==========
@@ -526,15 +1358,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         This method allows running code in a new cell (append) or re-running
         an existing cell with updated code.
 
-        Usage Examples:
-            run_cell("print('Hello, world!')")           # Run code in new cell
-            run_cell("print('Hello, world!')", idx=0)    # Run code in existing cell at index 0
-
         Error Recovery:
             When a cell fails with an error, you MUST fix it by calling run_cell
-            with the corrected code and the SAME idx as the failed cell:
-
-            run_cell("corrected_code", idx=3)  # Fix error in Cell #3
+            with the corrected code and the SAME idx as the failed cell.
 
             The cell number is shown in the output prefix (e.g., "[Cell #3]").
             Do NOT create a new cell to fix an error - always edit the failed cell.
@@ -549,6 +1375,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             Message with multimodal content if images present, otherwise string.
             The response includes the cell number (e.g., "[Cell #0] output...").
         """
+        start = time.perf_counter()
         remaining_seconds = self.get_remaining_time()
 
         if remaining_seconds <= self.execution_config.force_submit_threshold:
@@ -575,9 +1402,12 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 cell_idx = None
 
         # Execute code and update notebook atomically
+        exec_start = time.perf_counter()
         result, actual_cell_idx = await self.state.execute_and_add_cell(
             code, cell_idx=cell_idx, timeout=effective_timeout
         )
+        execute_and_add_cell_ms = (time.perf_counter() - exec_start) * 1000.0
+        _record_perf_metric("execute_and_add_cell_ms", execute_and_add_cell_ms)
 
         # Build response with cell number
         cell_info = f"[Cell #{actual_cell_idx}] "
@@ -592,14 +1422,27 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 images=cast(list[np.ndarray | str], image_urls),
             )
 
-        return cell_info + result.get_truncated_text()
+        result = cell_info + result.get_truncated_text()
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        _record_perf_metric("tool_call_ms.run_cell", duration_ms)
+        if self._perf_sample_step:
+            self._emit_perf_event(
+                "tool_call_end",
+                tool_name="run_cell",
+                duration_ms=round(duration_ms, 3),
+            )
+        return result
 
     async def reset_kernel(self) -> str:
         """Reset the kernel to a clean state.
 
         This clears all variables and execution state.
         """
-        if self.state.use_docker:
+        start = time.perf_counter()
+        if self.state.use_ray:
+            reset_ref = self.state.kernel_container._reset_via_http.remote()
+            await reset_ref
+        elif self.state.use_docker or self.state.use_enroot:
             await self.state._reset_via_http()
         else:
             assert self.state.interpreter is not None
@@ -611,6 +1454,14 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.state.notebook_runtime_errors = []
         self.state._execution_count = 0
 
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        _record_perf_metric("tool_call_ms.reset_kernel", duration_ms)
+        if self._perf_sample_step:
+            self._emit_perf_event(
+                "tool_call_end",
+                tool_name="reset_kernel",
+                duration_ms=round(duration_ms, 3),
+            )
         return "Kernel reset successfully."
 
     @property
@@ -674,7 +1525,10 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         Args:
             answer: Your final response to the research question
         """
+        start = time.perf_counter()
         if self.state.done:
+            duration_ms = (time.perf_counter() - start) * 1000.0
+            _record_perf_metric("tool_call_ms.submit_answer", duration_ms)
             return "Episode already finished."
 
         self.state.answer = answer
@@ -682,10 +1536,44 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         if self.rubric_model is None:
             self.logger.warning("No rubric_model configured, skipping scoring")
+            duration_ms = (time.perf_counter() - start) * 1000.0
+            _record_perf_metric("tool_call_ms.submit_answer", duration_ms)
             return answer
 
         correct = await self._score_solution(answer)
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        _record_perf_metric("tool_call_ms.submit_answer", duration_ms)
+        if self._perf_sample_step:
+            self._emit_perf_event(
+                "tool_call_end",
+                tool_name="submit_answer",
+                duration_ms=round(duration_ms, 3),
+            )
         return CORRECT_MSG if correct else INCORRECT_MSG
+
+    def list_dir(self) -> str:
+        """List contents of a directory with truncation protection.
+
+        Recursively lists files in a directory, with built-in protection against
+        overwhelming the context with too many files. Use this tool instead of
+        writing code to list directories to avoid context bloat.
+    
+        Args:
+            directory: Directory path to list (default: current working directory)
+            max_files: Maximum number of files to display (default: 20)
+            show_hidden: Whether to show hidden files starting with '.' (default: False)
+        """
+        start = time.perf_counter()
+        result = self._filesystem_tool.list_dir()
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        _record_perf_metric("tool_call_ms.list_dir", duration_ms)
+        if self._perf_sample_step:
+            self._emit_perf_event(
+                "tool_call_end",
+                tool_name="list_dir",
+                duration_ms=round(duration_ms, 3),
+            )
+        return result
 
     # ========== Time Management ==========
 

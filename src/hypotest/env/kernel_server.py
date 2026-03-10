@@ -9,12 +9,17 @@ as it gets copied into the Docker image and run independently.
 
 from __future__ import annotations
 
+import uuid
 import argparse
 import asyncio
+import json
 import logging
+import os
+import random
 import time
 from enum import StrEnum, auto
 from pathlib import Path
+from queue import Empty
 from typing import Any, assert_never
 
 import nbformat
@@ -25,7 +30,19 @@ from jupyter_client.manager import AsyncKernelManager
 from nbformat import NotebookNode
 from pydantic import BaseModel
 
+
+class _DeadlineExceeded(Exception):
+    """Raised when a cooperative deadline check expires."""
+
 logger = logging.getLogger(__name__)
+PERF_METRICS_ENABLED = os.getenv("NEMO_GYM_PERF_METRICS", "0") == "1"
+PERF_DETAIL_SAMPLE_RATE = float(os.getenv("NEMO_GYM_PERF_DETAIL_SAMPLE_RATE", "0.2"))
+PERF_SLOW_KERNEL_EXEC_MS = float(os.getenv("NEMO_GYM_PERF_SLOW_KERNEL_EXEC_MS", "5000"))
+PERF_LOG_LEVEL = getattr(logging, os.getenv("NEMO_GYM_PERF_LOG_LEVEL", "WARNING").upper(), logging.WARNING)
+
+
+def _log_perf(payload: dict[str, Any]) -> None:
+    logger.log(PERF_LOG_LEVEL, json.dumps(payload))
 
 
 # =============================================================================
@@ -152,6 +169,14 @@ class ResetResponse(BaseModel):
     success: bool
 
 
+class HealthResponse(BaseModel):
+    """Response model for /health endpoint."""
+
+    status: str
+    startup_token: str
+    kernel_ready: bool
+
+
 class KernelServer:
     """Manages a persistent Jupyter kernel and exposes it via HTTP."""
 
@@ -160,10 +185,12 @@ class KernelServer:
         work_dir: Path,
         language: NBLanguage,
         default_timeout: float = 600,
+        startup_token: str = "",
     ):
         self.work_dir = work_dir
         self.language = language
         self.default_timeout = default_timeout
+        self.startup_token = startup_token
 
         self._kernel_manager: AsyncKernelManager | None = None
         self._client: AsyncKernelClient | None = None
@@ -175,7 +202,13 @@ class KernelServer:
             return
 
         kernel_name = self.language.make_kernelspec()["name"]
-        self._kernel_manager = AsyncKernelManager(kernel_name=kernel_name)
+        kernel_runtime_dir = self.work_dir / ".jupyter_runtime"
+        kernel_runtime_dir.mkdir(exist_ok=True)
+
+        conn_uuid = uuid.uuid4()
+        kernel_connect_file = (kernel_runtime_dir / f"conn_{conn_uuid}.json").resolve()
+
+        self._kernel_manager = AsyncKernelManager(kernel_name=kernel_name, transport='ipc', connection_file=str(kernel_connect_file))
         await self._kernel_manager.start_kernel(cwd=str(self.work_dir))
 
         self._client = self._kernel_manager.client()
@@ -195,11 +228,15 @@ class KernelServer:
 
         effective_timeout = timeout if timeout is not None else self.default_timeout
         start_time = time.perf_counter()
+        should_sample = PERF_METRICS_ENABLED and random.random() < PERF_DETAIL_SAMPLE_RATE
+        timed_out = False
 
         try:
-            async with asyncio.timeout(effective_timeout):
-                result = await self._execute_code(code)
-        except TimeoutError:
+            result = await self._execute_code(
+                code, deadline=start_time + effective_timeout, log_detail=should_sample,
+            )
+        except _DeadlineExceeded:
+            timed_out = True
             timeout_output = MessageType.ERROR.to_notebook_output({
                 "ename": "TimeoutError",
                 "evalue": f"Code execution timed out after {effective_timeout} seconds",
@@ -222,26 +259,60 @@ class KernelServer:
                 execution_time=time.perf_counter() - start_time,
             )
 
+        total_ms = (time.perf_counter() - start_time) * 1000.0
+        if PERF_METRICS_ENABLED and (should_sample or total_ms >= PERF_SLOW_KERNEL_EXEC_MS):
+            _log_perf(
+                {
+                    "component": "aviary_hypotest.kernel_server",
+                    "event": "kernel_execute_end",
+                    "duration_ms": round(total_ms, 3),
+                    "timed_out": timed_out,
+                    "error_occurred": result.error_occurred,
+                    "notebook_outputs_count": len(result.notebook_outputs),
+                    "slow": total_ms >= PERF_SLOW_KERNEL_EXEC_MS,
+                }
+            )
+
         return result
 
-    async def _execute_code(self, code: str) -> ExecuteResponse:
-        """Internal method to execute code and collect outputs."""
+    async def _execute_code(self, code: str, deadline: float, log_detail: bool = False) -> ExecuteResponse:
+        """Internal method to execute code and collect outputs.
+
+        Uses cooperative deadline checking instead of asyncio.timeout, because
+        ZMQ socket operations may not respond to asyncio cancellation promptly.
+        Each get_iopub_msg call uses a short poll timeout so we can check the
+        deadline between messages.
+        """
         if not self._client:
             raise RuntimeError("Kernel client not initialized")
 
+        # How long each ZMQ poll waits before we re-check the deadline.
+        # Shorter = more responsive timeout, slightly more overhead.
+        _POLL_INTERVAL_S = 2.0
+
         start_time = time.perf_counter()
         msg_id = self._client.execute(code)
-        logger.debug(f"Executing code with message ID: {msg_id}")
 
         notebook_outputs: list[dict[str, Any]] = []
         error_occurred = False
+        iopub_msgs_count = 0
 
         while True:
-            msg = await self._client.get_iopub_msg()
-            logger.debug(f"Received message type: {msg['msg_type']}")
+            # Check deadline before each poll
+            if time.perf_counter() >= deadline:
+                raise _DeadlineExceeded
+
+            # Use a bounded poll so we never block longer than _POLL_INTERVAL_S.
+            # get_iopub_msg(timeout=T) raises queue.Empty if no message arrives
+            # within T seconds.
+            try:
+                msg = await self._client.get_iopub_msg(timeout=_POLL_INTERVAL_S)
+            except Empty:
+                continue
 
             if msg["parent_header"].get("msg_id") != msg_id:
                 continue
+            iopub_msgs_count += 1
 
             msg_type = MessageType.from_string(msg["msg_type"])
             if msg_type is None:
@@ -259,6 +330,17 @@ class KernelServer:
                     error_occurred = True
 
         execution_time = time.perf_counter() - start_time
+        if PERF_METRICS_ENABLED and log_detail:
+            _log_perf(
+                {
+                    "component": "aviary_hypotest.kernel_server",
+                    "event": "kernel_iopub_summary",
+                    "duration_ms": round(execution_time * 1000.0, 3),
+                    "kernel_iopub_msgs_count": iopub_msgs_count,
+                    "notebook_outputs_count": len(notebook_outputs),
+                    "error_occurred": error_occurred,
+                }
+            )
 
         return ExecuteResponse(
             notebook_outputs=notebook_outputs,
@@ -287,6 +369,7 @@ class KernelServer:
                 self._client = None
 
             await self._kernel_manager.shutdown_kernel(now=True)
+            await self._kernel_manager.cleanup_resources(restart=False)
             self._is_ready = False
             logger.info("Kernel shutdown complete")
 
@@ -304,8 +387,8 @@ def create_app(server: KernelServer) -> FastAPI:
         return await server.reset()
 
     @app.get("/health")
-    async def health() -> str:
-        return "OK"
+    async def health() -> HealthResponse:
+        return HealthResponse(status="OK", startup_token=server.startup_token, kernel_ready=server._is_ready)
 
     @app.post("/close")
     async def close() -> dict[str, bool]:
@@ -315,9 +398,9 @@ def create_app(server: KernelServer) -> FastAPI:
     return app
 
 
-async def run_server(work_dir: Path, language: NBLanguage, port: int = 8000) -> None:
+async def run_server(work_dir: Path, language: NBLanguage, port: int = 8000, startup_token: str = "") -> None:
     """Start the kernel server."""
-    server = KernelServer(work_dir, language)
+    server = KernelServer(work_dir, language, startup_token=startup_token)
     await server.start()
 
     app = create_app(server)
@@ -337,7 +420,8 @@ if __name__ == "__main__":
     parser.add_argument("--work_dir", type=Path, default=Path("/workspace"))
     parser.add_argument("--language", type=str, default="python", choices=["python", "r"])
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--startup-token", type=str, default="")
     args = parser.parse_args()
 
     language = NBLanguage.PYTHON if args.language == "python" else NBLanguage.R
-    asyncio.run(run_server(args.work_dir, language, args.port))
+    asyncio.run(run_server(args.work_dir, language, args.port, args.startup_token))
