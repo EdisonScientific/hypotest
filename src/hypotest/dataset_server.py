@@ -30,6 +30,7 @@ class HypotestDatasetConfig(BaseModel):
     )
 
     work_dir: Path | None = None
+    use_ray: bool = True
     use_docker: bool = False
     use_enroot: bool = True
     container_sqsh_path: str | None = None

@@ -1265,6 +1265,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             }
             | self.extra_envs,
             save_dir=self.save_dir,
+            use_ray=self.config.use_ray,
             use_docker=self.config.use_docker,
             use_enroot=self.config.use_enroot,
             container_sqsh_path=self.config.container_sqsh_path
