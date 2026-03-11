@@ -1160,6 +1160,7 @@ class InterpreterEnvConfig(BaseModel):
     max_steps: int = cfg.AGENT_MAX_STEPS
     use_docker: bool = cfg.USE_DOCKER
     use_enroot: bool = False
+    use_ray: bool = False
     container_sqsh_path: Path | None = None
     normalize_reward: bool = True
 
