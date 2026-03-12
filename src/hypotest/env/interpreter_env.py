@@ -1471,7 +1471,6 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             Message with multimodal content if images present, otherwise string.
             The response includes the cell number (e.g., "[Cell #0] output...").
         """
-        start = time.perf_counter()
         remaining_seconds = self.get_remaining_time()
 
         if remaining_seconds <= self.execution_config.force_submit_threshold:
@@ -1518,16 +1517,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 images=cast(list[np.ndarray | str], image_urls),
             )
 
-        result = cell_info + result.get_truncated_text()
-        duration_ms = (time.perf_counter() - start) * 1000.0
-        _record_perf_metric("tool_call_ms.run_cell", duration_ms)
-        if self._perf_sample_step:
-            self._emit_perf_event(
-                "tool_call_end",
-                tool_name="run_cell",
-                duration_ms=round(duration_ms, 3),
-            )
-        return result
+        return cell_info + result.get_truncated_text()
 
     async def reset_kernel(self) -> str:
         """Reset the kernel to a clean state.
