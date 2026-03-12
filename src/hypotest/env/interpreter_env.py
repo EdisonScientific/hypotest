@@ -1263,7 +1263,6 @@ class InterpreterEnvConfig(BaseModel):
     max_steps: int = cfg.AGENT_MAX_STEPS
     use_docker: bool = cfg.USE_DOCKER
     use_enroot: bool = False
-    use_ray: bool = False
     container_sqsh_path: Path | None = None
     normalize_reward: bool = True
 
@@ -1369,7 +1368,6 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             }
             | self.extra_envs,
             save_dir=self.save_dir,
-            use_ray=self.config.use_ray,
             use_docker=self.config.use_docker,
             use_enroot=self.config.use_enroot,
             container_sqsh_path=self.config.container_sqsh_path
@@ -1385,7 +1383,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         self._filesystem_tool = FilesystemTool(self.work_dir)
         self.tools = [
-            Tool.from_function(self.run_cell),
+            # Tool.from_function(self.run_cell),
+            Tool.from_function(self.stateful_python_code_exec),
             Tool.from_function(self.reset_kernel),
             Tool.from_function(self.submit_answer),
             Tool.from_function(self.list_dir),
@@ -1452,6 +1451,46 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         return obs, reward, self.state.done, False
 
     # ========== Tools ==========
+
+    async def stateful_python_code_exec(
+        self,
+        code: str,
+        idx: int | None = None,
+    ) -> Message | str | list[dict[str, Any]]:
+        """Run code in a Python Jupyter notebook cell and return the execution output.
+
+        This method allows running code in a new cell (append) or re-running
+        an existing cell with updated code.
+
+        Error Recovery:
+            When a cell fails with an error, you MUST fix it by calling run_cell
+            with the corrected code and the SAME idx as the failed cell.
+
+            The cell number is shown in the output prefix (e.g., "[Cell #3]").
+            Do NOT create a new cell to fix an error - always edit the failed cell.
+
+        Args:
+            code: Code to execute
+            idx: Cell index to run. If None or >= len(cells), appends a new cell.
+                If provided, updates and re-runs the existing cell at that index.
+                Use this to fix errors in existing cells.
+
+        Returns:
+            Message with multimodal content if images present, otherwise string.
+            The response includes the cell number (e.g., "[Cell #0] output...").
+        """
+        start = time.perf_counter()
+        result = await self.run_cell(code, idx=idx)
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        _record_perf_metric("tool_call_ms.stateful_python_code_exec", duration_ms)
+        if self._perf_sample_step:
+            self._emit_perf_event(
+                "tool_call_end",
+                tool_name="stateful_python_code_exec",
+                duration_ms=round(duration_ms, 3),
+            )
+        return result
+
 
     async def run_cell(
         self,

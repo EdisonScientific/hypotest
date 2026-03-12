@@ -23,8 +23,8 @@ import nbformat
 import numpy as np
 from aviary.core import Message, Tool
 
-from resources_servers.aviary_hypotest.env.utils import img_utils
-from resources_servers.aviary_hypotest.env.utils.notebook_utils import view_notebook
+from hypotest.env.utils import img_utils
+from hypotest.env.utils.notebook_utils import view_notebook
 
 # =============================================================================
 # CONSTANTS
