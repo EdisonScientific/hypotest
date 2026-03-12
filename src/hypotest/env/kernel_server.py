@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from enum import StrEnum, auto
 from pathlib import Path
@@ -145,6 +146,40 @@ class MessageType(StrEnum):
 # =============================================================================
 
 
+# ---------------------------------------------------------------------------
+# Lightweight regex safety check (defense-in-depth, standalone — no hypotest imports)
+# ---------------------------------------------------------------------------
+_KERNEL_SAFETY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # Process killing
+    (re.compile(r"\bos\s*\.\s*kill\s*\("), "restricted function"),
+    (re.compile(r"\bos\s*\.\s*killpg\s*\("), "restricted function"),
+    (re.compile(r"\bos\s*\.\s*system\s*\("), "restricted function"),
+    (re.compile(r"\bos\s*\.\s*popen\s*\("), "restricted function"),
+    (re.compile(r"\bos\s*\.\s*fork\s*\("), "restricted function"),
+    (re.compile(r"\bos\s*\.\s*exec\w*\s*\("), "restricted function"),
+    (re.compile(r"\bsubprocess\s*\.\s*(run|Popen|call|check_call|check_output)\s*\("), "restricted function"),
+    # Blocked modules
+    (re.compile(r"\bimport\s+ctypes\b"), "restricted module"),
+    (re.compile(r"\bimport\s+signal\b"), "restricted module"),
+    (re.compile(r"\bfrom\s+ctypes\b"), "restricted module"),
+    (re.compile(r"\bfrom\s+signal\b"), "restricted module"),
+    # Shell commands
+    (re.compile(r"\bkillall\b"), "restricted shell command"),
+    (re.compile(r"\bpkill\b"), "restricted shell command"),
+]
+
+
+def _kernel_check_code_safety(code: str) -> str | None:
+    """Lightweight regex safety check for the kernel server.
+
+    Returns None if safe, or a message if blocked.
+    """
+    for pattern, category in _KERNEL_SAFETY_PATTERNS:
+        if pattern.search(code):
+            return f"Code blocked: calls a {category}."
+    return None
+
+
 class ExecuteRequest(BaseModel):
     """Request model for /execute endpoint."""
 
@@ -225,6 +260,21 @@ class KernelServer:
         """Execute code and return the result."""
         if not self._client or not self._is_ready:
             raise RuntimeError("Kernel not ready")
+
+        # Defense-in-depth: lightweight regex safety check
+        block_reason = _kernel_check_code_safety(code)
+        if block_reason is not None:
+            logger.warning("Kernel safety block: %s code=%r", block_reason, code[:200])
+            error_output = MessageType.ERROR.to_notebook_output({
+                "ename": "SecurityError",
+                "evalue": block_reason,
+                "traceback": [f"SecurityError: {block_reason}"],
+            })
+            return ExecuteResponse(
+                notebook_outputs=[dict(error_output)] if error_output else [],
+                error_occurred=True,
+                execution_time=0.0,
+            )
 
         effective_timeout = timeout if timeout is not None else self.default_timeout
         start_time = time.perf_counter()
@@ -323,6 +373,9 @@ class KernelServer:
             if msg_type == MessageType.STATUS and content.get("execution_state") == "idle":
                 break
 
+            if msg_type == MessageType.ERROR:
+                logger.debug(f"Error Message:\n{content}")
+
             output = msg_type.to_notebook_output(content)
             if output:
                 notebook_outputs.append(dict(output))
@@ -417,7 +470,7 @@ if __name__ == "__main__":
     logger.setLevel(logging.DEBUG)
 
     parser = argparse.ArgumentParser(description="Kernel server for Docker-based execution")
-    parser.add_argument("--work_dir", type=Path, default=Path("/workspace"))
+    parser.add_argument("--work_dir", type=Path, default=Path("/"))
     parser.add_argument("--language", type=str, default="python", choices=["python", "r"])
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--startup-token", type=str, default="")

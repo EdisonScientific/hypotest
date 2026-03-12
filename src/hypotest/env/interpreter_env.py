@@ -63,6 +63,9 @@ used_ports_lock = asyncio.Lock()
 
 # container launch semaphore to limit concurrency
 CONTAINER_LAUNCH_SEM = asyncio.Semaphore(128)
+MAX_CONTAINER_LAUNCH_RETRIES = int(os.getenv("MAX_CONTAINER_LAUNCH_RETRIES", "5"))
+_RETRY_BASE_SLEEP = 1.0
+_RETRY_MAX_SLEEP = 16.0
 
 async def get_free_port() -> int:
     """Get a free port for the kernel server container."""
@@ -82,6 +85,10 @@ logger = logging.getLogger(__name__)
 # cannot reconfigure it, so use WARNING for all container diagnostics to
 # ensure they are visible in production logs.
 _CONTAINER_LOG_LEVEL = logging.WARNING
+
+
+class _PortCollisionError(Exception):
+    """Port already in use by another server — retry with a new port."""
 
 
 def _kill_process_group(proc: subprocess.Popen, label: str = "enroot", sigterm_timeout: float = 15) -> None:
@@ -212,7 +219,6 @@ def _record_perf_metric(metric_name: str, value_ms: float) -> None:
         _PERF_METRIC_SAMPLES.setdefault(metric_name, []).append(value_ms)
     _maybe_flush_perf_aggregates()
 
-
 class ProblemInstance(BaseModel):
     uuid: UUID
     hypothesis: str
@@ -221,7 +227,7 @@ class ProblemInstance(BaseModel):
     rubric: str
     max_score: int = Field(alias="max_points")
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
-    nb_primary_language: str
+    nb_primary_language: str = Field(default=str(NBLanguage.PYTHON))
 
 def _prep_workspace_dir(work_dir: str, workspace_path: str = "/data_workspace") -> None:
     wd = Path(work_dir)
@@ -259,22 +265,32 @@ class EnrootKernelServer:
         return f"enroot(port={port}, pid={pid})"
 
     async def initialize(self, work_dir: Path, language: NBLanguage) -> None:
-        _prep_workspace_dir(work_dir)
+        startup_token = str(uuid.uuid4())
+        node_workdir = f"/tmp/data_workspace.{startup_token.split('-')[0]}"
+
+        _prep_workspace_dir(work_dir, workspace_path=node_workdir)
 
         online = False
         attempt = 0
+        last_err: Exception | None = None
         while not online:
             attempt += 1
+            if attempt > MAX_CONTAINER_LAUNCH_RETRIES:
+                log_tail = self._read_container_log_tail(500)
+                raise RuntimeError(
+                    f"Container failed to start after {MAX_CONTAINER_LAUNCH_RETRIES} attempts "
+                    f"(last_error={last_err!r})"
+                    f"{f' log_tail={log_tail!r}' if log_tail else ''}"
+                )
             self._container_port = await get_free_port()
-            startup_token = str(uuid.uuid4())
-
+            
             bash = dedent(f"""\
                 set -euo pipefail
 
-                WORKDIR="$(mktemp -d /dev/shm/data_workspace.XXXXXX)"
+                WORKDIR="{node_workdir}"
                 trap 'rm -rf "$WORKDIR"' EXIT
 
-                mkdir -p /dev/shm/$WORKDIR
+                mkdir -p $WORKDIR
                 cp -a /data_workspace/. $WORKDIR/
 
                 cd $WORKDIR
@@ -335,27 +351,31 @@ class EnrootKernelServer:
                     self._proc_label(), attempt, work_dir, startup_token[:8],
                 )
 
-                # Create HTTP client
-                self._http_client = httpx.AsyncClient(
-                    base_url=f"http://localhost:{self._container_port}",
-                    timeout=httpx.Timeout(self.execution_timeout + 10, connect=30.0),
-                )
+            # Create HTTP client (outside semaphore — no need to hold the
+            # concurrency slot while waiting for the container to come up)
+            self._http_client = httpx.AsyncClient(
+                base_url=f"http://localhost:{self._container_port}",
+                timeout=httpx.Timeout(self.execution_timeout + 10, connect=30.0),
+            )
 
-                # Wait for health check
-                try:
-                    await self._wait_for_health(expected_startup_token=startup_token)
-                    launch_ms = (time.perf_counter() - launch_t0) * 1000.0
-                    logger.log(
-                        _CONTAINER_LOG_LEVEL,
-                        "[%s] Container online after %.1fms (attempt #%d)",
-                        self._proc_label(), launch_ms, attempt,
-                    )
-                    online = True
-                except Exception as e:
-                    launch_ms = (time.perf_counter() - launch_t0) * 1000.0
-                    self._log_container_failure(attempt, launch_ms, e)
-                    await self._cleanup_failed_startup()
-                    await asyncio.sleep(10)
+            # Wait for health check
+            try:
+                await self._wait_for_health(expected_startup_token=startup_token)
+                launch_ms = (time.perf_counter() - launch_t0) * 1000.0
+                logger.log(
+                    _CONTAINER_LOG_LEVEL,
+                    "[%s] Container online after %.1fms (attempt #%d)",
+                    self._proc_label(), launch_ms, attempt,
+                )
+                online = True
+            except Exception as e:
+                last_err = e
+                launch_ms = (time.perf_counter() - launch_t0) * 1000.0
+                self._log_container_failure(attempt, launch_ms, e)
+                await self._cleanup_failed_startup()
+                if not isinstance(e, _PortCollisionError):
+                    backoff = min(_RETRY_BASE_SLEEP * 2 ** (attempt - 1), _RETRY_MAX_SLEEP)
+                    await asyncio.sleep(backoff)
 
     def _log_container_failure(self, attempt: int, launch_ms: float, error: Exception) -> None:
         """Log detailed diagnostics when a container fails to start."""
@@ -374,12 +394,15 @@ class EnrootKernelServer:
             if rc is not None:
                 diag_parts.append(f"returncode={rc}")
 
-        # Read tail of the container log file for diagnostics
+        logger.warning("[%s] Container startup FAILED: %s", label, ", ".join(diag_parts))
+
+        # Log container output separately so tracebacks are readable
         log_tail = self._read_container_log_tail()
         if log_tail:
-            diag_parts.append(f"log_tail={log_tail!r}")
-
-        logger.warning("[%s] Container startup FAILED: %s", label, ", ".join(diag_parts))
+            logger.warning(
+                "[%s] Container log output (last %d chars):\n%s",
+                label, len(log_tail), log_tail,
+            )
 
     def _read_container_log_tail(self, max_chars: int = 2000) -> str:
         """Read the tail of the container log file for diagnostics."""
@@ -430,6 +453,7 @@ class EnrootKernelServer:
         start_time = time.perf_counter()
         poll_count = 0
         last_status = "no_attempt"
+        consecutive_token_mismatches = 0
         # Use a short per-request timeout for health checks so that a single
         # poll can never block longer than a few seconds.  Without this, the
         # client's default timeout (execution_timeout + 10 ≈ 190s) means one
@@ -471,16 +495,27 @@ class EnrootKernelServer:
                         return
                     else:
                         last_status = f"token_mismatch(got={payload.get('startup_token', '?')[:8]})"
+                        consecutive_token_mismatches += 1
+                        if consecutive_token_mismatches >= 3:
+                            raise _PortCollisionError(
+                                f"Port {self._container_port} appears to be owned by another server "
+                                f"({consecutive_token_mismatches} consecutive token mismatches)"
+                            )
                 else:
                     last_status = f"http_{response.status_code}"
+                    consecutive_token_mismatches = 0
             except httpx.ConnectError:
                 last_status = "connect_error"
+                consecutive_token_mismatches = 0
             except httpx.ReadError:
                 last_status = "read_error"
+                consecutive_token_mismatches = 0
             except httpx.TimeoutException:
                 last_status = "timeout"
+                consecutive_token_mismatches = 0
             except httpx.RemoteProtocolError:
                 last_status = "protocol_error"
+                consecutive_token_mismatches = 0
 
             # Log progress every 5s
             if poll_count % 10 == 0:
@@ -494,9 +529,16 @@ class EnrootKernelServer:
             await asyncio.sleep(0.5)
 
         total_elapsed = time.perf_counter() - start_time
+        if last_status.startswith("token_mismatch"):
+            raise _PortCollisionError(
+                f"Port {self._container_port} health-check timed out with token_mismatch "
+                f"({poll_count} polls, elapsed={total_elapsed:.1f}s)"
+            )
+        log_tail = self._read_container_log_tail(500)
         raise TimeoutError(
             f"Kernel server did not become healthy within {cfg.KERNEL_SERVER_STARTUP_TIMEOUT}s "
             f"({poll_count} polls, last_status={last_status}, elapsed={total_elapsed:.1f}s)"
+            f"{f' log_tail={log_tail!r}' if log_tail else ''}"
         )
 
     # @tenacity.retry(
@@ -687,8 +729,16 @@ class InterpreterEnvState:
 
         online = False
         attempt = 0
+        last_err: Exception | None = None
         while not online:
             attempt += 1
+            if attempt > MAX_CONTAINER_LAUNCH_RETRIES:
+                log_tail = self._read_container_log_tail(500)
+                raise RuntimeError(
+                    f"Container failed to start after {MAX_CONTAINER_LAUNCH_RETRIES} attempts "
+                    f"(last_error={last_err!r})"
+                    f"{f' log_tail={log_tail!r}' if log_tail else ''}"
+                )
             self._container_port = await get_free_port()
             startup_token = str(uuid.uuid4())
 
@@ -736,36 +786,44 @@ class InterpreterEnvState:
                     self._enroot_label(), attempt, self.work_dir, startup_token[:8],
                 )
 
-                # Create HTTP client
-                self._http_client = httpx.AsyncClient(
-                    base_url=f"http://localhost:{self._container_port}",
-                    timeout=httpx.Timeout(self.execution_timeout + 10, connect=30.0),
-                )
+            # Create HTTP client (outside semaphore — no need to hold the
+            # concurrency slot while waiting for the container to come up)
+            self._http_client = httpx.AsyncClient(
+                base_url=f"http://localhost:{self._container_port}",
+                timeout=httpx.Timeout(self.execution_timeout + 10, connect=30.0),
+            )
 
-                # Wait for health check
-                try:
-                    await self._wait_for_health(expected_startup_token=startup_token)
-                    launch_ms = (time.perf_counter() - launch_t0) * 1000.0
-                    logger.log(
-                        _CONTAINER_LOG_LEVEL,
-                        "[%s] Container online after %.1fms (attempt #%d)",
-                        self._enroot_label(), launch_ms, attempt,
+            # Wait for health check
+            try:
+                await self._wait_for_health(expected_startup_token=startup_token)
+                launch_ms = (time.perf_counter() - launch_t0) * 1000.0
+                logger.log(
+                    _CONTAINER_LOG_LEVEL,
+                    "[%s] Container online after %.1fms (attempt #%d)",
+                    self._enroot_label(), launch_ms, attempt,
+                )
+                online = True
+            except Exception as e:
+                last_err = e
+                launch_ms = (time.perf_counter() - launch_t0) * 1000.0
+                label = self._enroot_label()
+                diag = [f"attempt=#{attempt}", f"elapsed={launch_ms:.0f}ms", f"error={e!r}"]
+                if self._enroot_proc is not None:
+                    rc = self._enroot_proc.poll()
+                    diag.append(f"process_alive={rc is None}")
+                    if rc is not None:
+                        diag.append(f"returncode={rc}")
+                logger.warning("[%s] Container startup FAILED: %s", label, ", ".join(diag))
+                log_tail = self._read_container_log_tail()
+                if log_tail:
+                    logger.warning(
+                        "[%s] Container log output (last %d chars):\n%s",
+                        label, len(log_tail), log_tail,
                     )
-                    online = True
-                except Exception as e:
-                    launch_ms = (time.perf_counter() - launch_t0) * 1000.0
-                    diag = [f"attempt=#{attempt}", f"elapsed={launch_ms:.0f}ms", f"error={e!r}"]
-                    if self._enroot_proc is not None:
-                        rc = self._enroot_proc.poll()
-                        diag.append(f"process_alive={rc is None}")
-                        if rc is not None:
-                            diag.append(f"returncode={rc}")
-                    log_tail = self._read_container_log_tail()
-                    if log_tail:
-                        diag.append(f"log_tail={log_tail!r}")
-                    logger.warning("[%s] Container startup FAILED: %s", self._enroot_label(), ", ".join(diag))
-                    await self._cleanup_failed_startup()
-                    await asyncio.sleep(10)
+                await self._cleanup_failed_startup()
+                if not isinstance(e, _PortCollisionError):
+                    backoff = min(_RETRY_BASE_SLEEP * 2 ** (attempt - 1), _RETRY_MAX_SLEEP)
+                    await asyncio.sleep(backoff)
 
     def _read_container_log_tail(self, max_chars: int = 2000) -> str:
         """Read the tail of the container log file for diagnostics."""
@@ -813,7 +871,8 @@ class InterpreterEnvState:
     async def _start_docker_container(self) -> None:
         """Start a Docker container with the kernel server."""
         self._docker_client = aiodocker.Docker()
-        self._container_port = get_free_port()
+        self._container_port = await get_free_port()
+        startup_token = str(uuid.uuid4())
 
         docker_config = {
             "Image": cfg.NB_ENVIRONMENT_DOCKER_IMAGE,
@@ -824,6 +883,8 @@ class InterpreterEnvState:
                 "/data_workspace",
                 "--language",
                 self.language.value,
+                "--startup-token",
+                startup_token,
             ],
             "HostConfig": {
                 "Binds": [f"{self.work_dir}:/data_workspace"],
@@ -844,13 +905,14 @@ class InterpreterEnvState:
         )
 
         # Wait for health check
-        await self._wait_for_health()
+        await self._wait_for_health(expected_startup_token=startup_token)
 
     async def _wait_for_health(self, expected_startup_token: str | None = None) -> None:
         """Wait for the kernel server to become healthy."""
         start_time = time.perf_counter()
         poll_count = 0
         last_status = "no_attempt"
+        consecutive_token_mismatches = 0
         # Short per-request timeout (see EnrootKernelServer._wait_for_health
         # for rationale).
         health_timeout = httpx.Timeout(5.0, connect=3.0)
@@ -889,16 +951,27 @@ class InterpreterEnvState:
                         return
                     else:
                         last_status = f"token_mismatch(got={payload.get('startup_token', '?')[:8]})"
+                        consecutive_token_mismatches += 1
+                        if consecutive_token_mismatches >= 3:
+                            raise _PortCollisionError(
+                                f"Port {self._container_port} appears to be owned by another server "
+                                f"({consecutive_token_mismatches} consecutive token mismatches)"
+                            )
                 else:
                     last_status = f"http_{response.status_code}"
+                    consecutive_token_mismatches = 0
             except httpx.ConnectError:
                 last_status = "connect_error"
+                consecutive_token_mismatches = 0
             except httpx.ReadError:
                 last_status = "read_error"
+                consecutive_token_mismatches = 0
             except httpx.TimeoutException:
                 last_status = "timeout"
+                consecutive_token_mismatches = 0
             except httpx.RemoteProtocolError:
                 last_status = "protocol_error"
+                consecutive_token_mismatches = 0
 
             # Log progress every 5s
             if poll_count % 10 == 0:
@@ -912,9 +985,16 @@ class InterpreterEnvState:
             await asyncio.sleep(0.5)
 
         total_elapsed = time.perf_counter() - start_time
+        if last_status.startswith("token_mismatch"):
+            raise _PortCollisionError(
+                f"Port {self._container_port} health-check timed out with token_mismatch "
+                f"({poll_count} polls, elapsed={total_elapsed:.1f}s)"
+            )
+        log_tail = self._read_container_log_tail(500)
         raise TimeoutError(
             f"Kernel server did not become healthy within {cfg.KERNEL_SERVER_STARTUP_TIMEOUT}s "
             f"({poll_count} polls, last_status={last_status}, elapsed={total_elapsed:.1f}s)"
+            f"{f' log_tail={log_tail!r}' if log_tail else ''}"
         )
 
     @tenacity.retry(
@@ -1116,6 +1196,29 @@ class InterpreterEnvState:
         Returns:
             Tuple of (ExecutionResult, actual_cell_index)
         """
+        # Safety check: block dangerous code before execution
+        from .code_safety import check_code_safety
+        block_reason = check_code_safety(code, self.language)
+        if block_reason is not None:
+            logger.warning("Blocked code execution in execute_and_add_cell: %s", block_reason)
+            error_output = nbformat.v4.new_output(
+                output_type="error",
+                ename="SecurityError",
+                evalue=block_reason,
+                traceback=[f"SecurityError: {block_reason}"],
+            )
+            result = ExecutionResult(
+                notebook_outputs=[error_output],
+                error_occurred=True,
+                execution_time=0.0,
+            )
+            if cell_idx is None or cell_idx >= len(self.nb.cells):
+                actual_idx = self._add_cell(code, result)
+            else:
+                self._update_cell(cell_idx, code, result)
+                actual_idx = cell_idx
+            return result, actual_idx
+
         execute_start = time.perf_counter()
         if self.use_ray and self.use_enroot:
             rpc_wait_start = time.perf_counter()
@@ -1377,7 +1480,6 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             Message with multimodal content if images present, otherwise string.
             The response includes the cell number (e.g., "[Cell #0] output...").
         """
-        start = time.perf_counter()
         remaining_seconds = self.get_remaining_time()
 
         if remaining_seconds <= self.execution_config.force_submit_threshold:
@@ -1424,16 +1526,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 images=cast(list[np.ndarray | str], image_urls),
             )
 
-        result = cell_info + result.get_truncated_text()
-        duration_ms = (time.perf_counter() - start) * 1000.0
-        _record_perf_metric("tool_call_ms.run_cell", duration_ms)
-        if self._perf_sample_step:
-            self._emit_perf_event(
-                "tool_call_end",
-                tool_name="run_cell",
-                duration_ms=round(duration_ms, 3),
-            )
-        return result
+        return cell_info + result.get_truncated_text()
 
     async def reset_kernel(self) -> str:
         """Reset the kernel to a clean state.
