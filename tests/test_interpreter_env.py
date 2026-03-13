@@ -855,9 +855,9 @@ class TestRubricGrading:
     """Tests for rubric-based grading."""
 
     GRADING_PROBLEM = ProblemInstance(
-        uuid=UUID("12345678-1234-5678-1234-567812345678"),
+        id=UUID("12345678-1234-5678-1234-567812345678"),
         hypothesis="Numbers greater than 10 are large",
-        objective="Load data, compute statistics, determine if hypothesis holds",
+        protocol="Load data, compute statistics, determine if hypothesis holds",
         answer=True,
         rubric="""* 1 point: Data is loaded correctly
 * 1 point: Statistics are computed
