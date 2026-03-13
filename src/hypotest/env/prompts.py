@@ -13,7 +13,7 @@ After you have satisfactorily evaluated the hypothesis, call the submit_answer t
 </hypothesis>
 
 <objectives>
-{objective}
+{protocol}
 </objectives>
 """.strip()
 

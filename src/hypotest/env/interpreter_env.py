@@ -151,12 +151,13 @@ def _kill_process_group(proc: subprocess.Popen, label: str = "enroot", sigterm_t
 
 
 class ProblemInstance(BaseModel):
-    uuid: UUID
+    id: UUID
     hypothesis: str
-    objective: str
+    protocol: str
     accepted: bool = Field(alias="answer")
     rubric: str
     max_score: int = Field(alias="max_points")
+    input_data_path: str = ""
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
     nb_primary_language: str = Field(default=str(NBLanguage.PYTHON))
 
@@ -1293,7 +1294,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 content=HYPOTHESIS_TASK_DESC.format(
                     language=self.language.value.capitalize(),
                     hypothesis=self.problem.hypothesis,
-                    objective=self.problem.objective,
+                    protocol=self.problem.protocol,
                 )
             )
         )
@@ -1612,9 +1613,9 @@ async def main() -> None:
     print(f"Working directory: {work_dir}")
 
     problem = ProblemInstance(
-        uuid="",
+        id="",
         hypothesis="",
-        objective="",
+        protocol="",
         answer=False,
         rubric="",
         max_points=0,
