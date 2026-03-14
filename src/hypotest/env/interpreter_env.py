@@ -14,7 +14,10 @@ import logging
 import os
 import shutil
 import socket
+import statistics
+import threading
 import time
+import random
 from pathlib import Path
 from tempfile import mkdtemp
 from typing import TYPE_CHECKING, Any, cast
@@ -148,6 +151,72 @@ def _kill_process_group(proc: subprocess.Popen, label: str = "enroot", sigterm_t
     except subprocess.TimeoutExpired:
         logger.error("[%s] Process pid=%d still alive after SIGKILL — possible zombie", label, proc.pid)
 
+PERF_METRICS_ENABLED = os.getenv("NEMO_GYM_PERF_METRICS", "0") == "1"
+PERF_DETAIL_SAMPLE_RATE = float(os.getenv("NEMO_GYM_PERF_DETAIL_SAMPLE_RATE", "0.2"))
+PERF_SLOW_STEP_MS = float(os.getenv("NEMO_GYM_PERF_SLOW_STEP_MS", "5000"))
+PERF_AGGREGATE_INTERVAL_S = float(os.getenv("NEMO_GYM_PERF_AGGREGATE_INTERVAL_S", "30"))
+PERF_LOG_LEVEL = getattr(logging, os.getenv("NEMO_GYM_PERF_LOG_LEVEL", "WARNING").upper(), logging.WARNING)
+
+_PERF_METRIC_SAMPLES: dict[str, list[float]] = {}
+_PERF_LAST_FLUSH_TS = time.perf_counter()
+_PERF_LOCK = threading.Lock()
+
+
+def _log_perf(payload: dict[str, Any]) -> None:
+    logger.log(PERF_LOG_LEVEL, json.dumps(payload))
+
+
+def _percentile(sorted_values: list[float], pct: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    idx = (len(sorted_values) - 1) * pct
+    lo = int(idx)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = idx - lo
+    return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac
+
+
+def _maybe_flush_perf_aggregates() -> None:
+    global _PERF_LAST_FLUSH_TS, _PERF_METRIC_SAMPLES
+    now = time.perf_counter()
+    if now - _PERF_LAST_FLUSH_TS < PERF_AGGREGATE_INTERVAL_S:
+        return
+
+    with _PERF_LOCK:
+        now = time.perf_counter()
+        if now - _PERF_LAST_FLUSH_TS < PERF_AGGREGATE_INTERVAL_S:
+            return
+        snapshots = _PERF_METRIC_SAMPLES
+        _PERF_METRIC_SAMPLES = {}
+        _PERF_LAST_FLUSH_TS = now
+
+    for metric_name, values in snapshots.items():
+        if not values:
+            continue
+        ordered = sorted(values)
+        payload = {
+            "component": "aviary_hypotest.interpreter_env",
+            "event": "perf_aggregate",
+            "metric": metric_name,
+            "count": len(values),
+            "mean_ms": round(statistics.fmean(values), 3),
+            "p50_ms": round(_percentile(ordered, 0.50), 3),
+            "p90_ms": round(_percentile(ordered, 0.90), 3),
+            "p95_ms": round(_percentile(ordered, 0.95), 3),
+            "p99_ms": round(_percentile(ordered, 0.99), 3),
+            "max_ms": round(ordered[-1], 3),
+        }
+        _log_perf(payload)
+
+
+def _record_perf_metric(metric_name: str, value_ms: float) -> None:
+    if not PERF_METRICS_ENABLED:
+        return
+    with _PERF_LOCK:
+        _PERF_METRIC_SAMPLES.setdefault(metric_name, []).append(value_ms)
+    _maybe_flush_perf_aggregates()
 
 class ProblemInstance(BaseModel):
     id: UUID
@@ -259,9 +328,39 @@ class EnrootKernelServer:
             kernel_server_path = env_dir / "kernel_server.py"
             assert kernel_server_path.is_file(), f"kernel server must be a valid path, found {kernel_server_path}"
 
+            base = Path(f"/tmp/enroot_data/{startup_token}")
+
+            enroot_runtime = base / "runtime"
+            enroot_config = base / "config"
+            enroot_cache = base / "cache"
+            enroot_data = base / "data"
+            enroot_temp = base / "tmp"
+
+            for path in [
+                enroot_runtime,
+                enroot_config,
+                enroot_cache,
+                enroot_data,
+                enroot_temp,
+            ]:
+                path.mkdir(parents=True, exist_ok=True)
+                os.chmod(path, 0o700)
+
+            env = {}
+            env["ENROOT_RUNTIME_PATH"] = str(enroot_runtime)
+            env["ENROOT_CONFIG_PATH"] = str(enroot_config)
+            env["ENROOT_CACHE_PATH"] = str(enroot_cache)
+            env["ENROOT_DATA_PATH"] = str(enroot_data)
+            env["ENROOT_TEMP_PATH"] = str(enroot_temp)
+
             cmd = [
                 "env", "-i", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", 'HOME="$HOME"', 'USER="$USER"',
-                "enroot", "start",
+                f"ENROOT_RUNTIME_PATH={enroot_runtime}",
+                f"ENROOT_CONFIG_PATH={enroot_config}",
+                f"ENROOT_CACHE_PATH={enroot_cache}",
+                f"ENROOT_DATA_PATH={enroot_data}",
+                f"ENROOT_TEMP_PATH={enroot_temp}",
+                "enroot", "start", "--rw",
                 "--mount", f"{work_dir}:/data_workspace",
                 "--mount", f"{kernel_server_path.resolve()}:/envs/kernel_server.py",
                 str(self.container_sqsh_path.resolve()),
@@ -1157,14 +1256,30 @@ class InterpreterEnvState:
                 actual_idx = cell_idx
             return result, actual_idx
 
+        execute_start = time.perf_counter()
         if self.use_ray and self.use_enroot:
+            rpc_wait_start = time.perf_counter()
             result_ref = self.kernel_container._execute_via_http.remote(code, timeout)
             result = await result_ref
+            _record_perf_metric(
+                "execute_path_ms.ray_enroot_rpc_wait",
+                (time.perf_counter() - rpc_wait_start) * 1000.0,
+            )
         elif self.use_docker or self.use_enroot:
+            http_exec_start = time.perf_counter()
             result = await self._execute_via_http(code, timeout)
+            _record_perf_metric(
+                "execute_path_ms.http_kernel_execute",
+                (time.perf_counter() - http_exec_start) * 1000.0,
+            )
         else:
             assert self.interpreter is not None
+            local_exec_start = time.perf_counter()
             result = await self.interpreter.execute_code(code, timeout)
+            _record_perf_metric(
+                "execute_path_ms.local_interpreter_execute",
+                (time.perf_counter() - local_exec_start) * 1000.0,
+            )
 
         if cell_idx is None or cell_idx >= len(self.nb.cells):
             actual_idx = self._add_cell(code, result)
@@ -1172,6 +1287,7 @@ class InterpreterEnvState:
             self._update_cell(cell_idx, code, result)
             actual_idx = cell_idx
 
+        _record_perf_metric("execute_and_add_cell_total_ms", (time.perf_counter() - execute_start) * 1000.0)
         return result, actual_idx
 
 
@@ -1223,6 +1339,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.execution_timeout = self.execution_config.cell_execution_timeout
         self.max_steps = self.config.max_steps
 
+        logger.error(f"EXECUTION TIMEOUT SET TO {self.execution_timeout} SECONDS")
+
         self.input_data = input_data
         self.output_data: list[dict[str, str | int]] = []
         self.logger = logger
@@ -1232,6 +1350,19 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.state: InterpreterEnvState
         # prompting_config is set during reset() after language resolution
         self.prompting_config: PromptingConfig
+        self._perf_sample_step = False
+
+    def _emit_perf_event(self, event: str, **fields: Any) -> None:
+        if not PERF_METRICS_ENABLED:
+            return
+        payload: dict[str, Any] = {
+            "component": "aviary_hypotest.interpreter_env",
+            "event": event,
+            "env_id": getattr(self, "_nemo_env_id", None),
+            "step_idx": self.step_count,
+        }
+        payload.update(fields)
+        _log_perf(payload)
 
     @property
     def language(self) -> NBLanguage:
@@ -1289,7 +1420,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         self._filesystem_tool = FilesystemTool(self.work_dir)
         self.tools = [
-            Tool.from_function(self.run_cell),
+            # Tool.from_function(self.run_cell),
+            Tool.from_function(self.stateful_python_code_exec),
             Tool.from_function(self.reset_kernel),
             Tool.from_function(self.submit_answer),
             Tool.from_function(self.list_dir),
@@ -1316,10 +1448,15 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
     async def step(self, action: ToolRequestMessage) -> tuple[Messages, float, bool, bool]:
         """Execute a step in the environment."""
         self.step_count += 1
+        self._perf_sample_step = PERF_METRICS_ENABLED and random.random() < PERF_DETAIL_SAMPLE_RATE
+        step_start = time.perf_counter()
+        exec_tool_calls_start = time.perf_counter()
         obs = cast(
             Messages,
             await self.exec_tool_calls(action, concurrency=False, handle_tool_exc=True),
         )
+        exec_tool_calls_ms = (time.perf_counter() - exec_tool_calls_start) * 1000.0
+        _record_perf_metric("exec_tool_calls_ms", exec_tool_calls_ms)
 
         obs = [*obs]
         if self.include_env_state_msg:
@@ -1334,9 +1471,63 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         self.state.actions.append(str(action))
         reward = self.state.score if self.state.done else 0.0
+        step_total_ms = (time.perf_counter() - step_start) * 1000.0
+        _record_perf_metric("env_step_ms", step_total_ms)
+        should_log_detail = self._perf_sample_step or step_total_ms >= PERF_SLOW_STEP_MS
+        if should_log_detail:
+            obs_payload_chars = sum(len(str(getattr(m, "content", ""))) for m in obs)
+            self._emit_perf_event(
+                "env_step_end",
+                duration_ms=round(step_total_ms, 3),
+                exec_tool_calls_ms=round(exec_tool_calls_ms, 3),
+                action_tool_calls_count=len(action.tool_calls),
+                obs_messages_count=len(obs),
+                obs_payload_chars=obs_payload_chars,
+                slow=step_total_ms >= PERF_SLOW_STEP_MS,
+            )
         return obs, reward, self.state.done, False
 
     # ========== Tools ==========
+
+    async def stateful_python_code_exec(
+        self,
+        code: str,
+        idx: int | None = None,
+    ) -> Message | str | list[dict[str, Any]]:
+        """Run code in a Python Jupyter notebook cell and return the execution output.
+
+        This method allows running code in a new cell (append) or re-running
+        an existing cell with updated code.
+
+        Error Recovery:
+            When a cell fails with an error, you MUST fix it by calling stateful_python_code_exec
+            with the corrected code and the SAME idx as the failed cell.
+
+            The cell number is shown in the output prefix (e.g., "[Cell #3]").
+            Do NOT create a new cell to fix an error - always edit the failed cell.
+
+        Args:
+            code: Code to execute
+            idx: Cell index to run. If None or >= len(cells), appends a new cell.
+                If provided, updates and re-runs the existing cell at that index.
+                Use this to fix errors in existing cells.
+
+        Returns:
+            Message with multimodal content if images present, otherwise string.
+            The response includes the cell number (e.g., "[Cell #0] output...").
+        """
+        start = time.perf_counter()
+        result = await self.run_cell(code, idx=idx)
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        _record_perf_metric("tool_call_ms.stateful_python_code_exec", duration_ms)
+        if self._perf_sample_step:
+            self._emit_perf_event(
+                "tool_call_end",
+                tool_name="stateful_python_code_exec",
+                duration_ms=round(duration_ms, 3),
+            )
+        return result
+
 
     async def run_cell(
         self,
@@ -1391,9 +1582,12 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 cell_idx = None
 
         # Execute code and update notebook atomically
+        exec_start = time.perf_counter()
         result, actual_cell_idx = await self.state.execute_and_add_cell(
             code, cell_idx=cell_idx, timeout=effective_timeout
         )
+        execute_and_add_cell_ms = (time.perf_counter() - exec_start) * 1000.0
+        _record_perf_metric("execute_and_add_cell_ms", execute_and_add_cell_ms)
 
         # Build response with cell number
         cell_info = f"[Cell #{actual_cell_idx}] "
@@ -1415,6 +1609,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         This clears all variables and execution state.
         """
+        start = time.perf_counter()
         if self.state.use_ray:
             reset_ref = self.state.kernel_container._reset_via_http.remote()
             await reset_ref
@@ -1430,6 +1625,14 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.state.notebook_runtime_errors = []
         self.state._execution_count = 0
 
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        _record_perf_metric("tool_call_ms.reset_kernel", duration_ms)
+        if self._perf_sample_step:
+            self._emit_perf_event(
+                "tool_call_end",
+                tool_name="reset_kernel",
+                duration_ms=round(duration_ms, 3),
+            )
         return "Kernel reset successfully."
 
     @property
@@ -1493,7 +1696,10 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         Args:
             answer: Your final response to the research question
         """
+        start = time.perf_counter()
         if self.state.done:
+            duration_ms = (time.perf_counter() - start) * 1000.0
+            _record_perf_metric("tool_call_ms.submit_answer", duration_ms)
             return "Episode already finished."
 
         self.state.answer = answer
@@ -1501,9 +1707,19 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         if self.rubric_model is None:
             self.logger.warning("No rubric_model configured, skipping scoring")
+            duration_ms = (time.perf_counter() - start) * 1000.0
+            _record_perf_metric("tool_call_ms.submit_answer", duration_ms)
             return answer
 
         correct = await self._score_solution(answer)
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        _record_perf_metric("tool_call_ms.submit_answer", duration_ms)
+        if self._perf_sample_step:
+            self._emit_perf_event(
+                "tool_call_end",
+                tool_name="submit_answer",
+                duration_ms=round(duration_ms, 3),
+            )
         return CORRECT_MSG if correct else INCORRECT_MSG
 
     def list_dir(self) -> str:
@@ -1518,7 +1734,17 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             max_files: Maximum number of files to display (default: 20)
             show_hidden: Whether to show hidden files starting with '.' (default: False)
         """
-        return self._filesystem_tool.list_dir()
+        start = time.perf_counter()
+        result = self._filesystem_tool.list_dir()
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        _record_perf_metric("tool_call_ms.list_dir", duration_ms)
+        if self._perf_sample_step:
+            self._emit_perf_event(
+                "tool_call_end",
+                tool_name="list_dir",
+                duration_ms=round(duration_ms, 3),
+            )
+        return result
 
     # ========== Time Management ==========
 
