@@ -9,15 +9,12 @@ as it gets copied into the Docker image and run independently.
 
 from __future__ import annotations
 
-import uuid
 import argparse
 import asyncio
-import json
 import logging
-import os
-import random
 import re
 import time
+import uuid
 from enum import StrEnum, auto
 from pathlib import Path
 from queue import Empty
@@ -35,15 +32,8 @@ from pydantic import BaseModel
 class _DeadlineExceeded(Exception):
     """Raised when a cooperative deadline check expires."""
 
+
 logger = logging.getLogger(__name__)
-PERF_METRICS_ENABLED = os.getenv("NEMO_GYM_PERF_METRICS", "0") == "1"
-PERF_DETAIL_SAMPLE_RATE = float(os.getenv("NEMO_GYM_PERF_DETAIL_SAMPLE_RATE", "0.2"))
-PERF_SLOW_KERNEL_EXEC_MS = float(os.getenv("NEMO_GYM_PERF_SLOW_KERNEL_EXEC_MS", "5000"))
-PERF_LOG_LEVEL = getattr(logging, os.getenv("NEMO_GYM_PERF_LOG_LEVEL", "WARNING").upper(), logging.WARNING)
-
-
-def _log_perf(payload: dict[str, Any]) -> None:
-    logger.log(PERF_LOG_LEVEL, json.dumps(payload))
 
 
 # =============================================================================
@@ -243,7 +233,9 @@ class KernelServer:
         conn_uuid = uuid.uuid4()
         kernel_connect_file = (kernel_runtime_dir / f"conn_{conn_uuid}.json").resolve()
 
-        self._kernel_manager = AsyncKernelManager(kernel_name=kernel_name, transport='ipc', connection_file=str(kernel_connect_file))
+        self._kernel_manager = AsyncKernelManager(
+            kernel_name=kernel_name, transport="ipc", connection_file=str(kernel_connect_file)
+        )
         await self._kernel_manager.start_kernel(cwd=str(self.work_dir))
 
         self._client = self._kernel_manager.client()
@@ -278,15 +270,13 @@ class KernelServer:
 
         effective_timeout = timeout if timeout is not None else self.default_timeout
         start_time = time.perf_counter()
-        should_sample = PERF_METRICS_ENABLED and random.random() < PERF_DETAIL_SAMPLE_RATE
-        timed_out = False
 
         try:
             result = await self._execute_code(
-                code, deadline=start_time + effective_timeout, log_detail=should_sample,
+                code,
+                deadline=start_time + effective_timeout,
             )
         except _DeadlineExceeded:
-            timed_out = True
             timeout_output = MessageType.ERROR.to_notebook_output({
                 "ename": "TimeoutError",
                 "evalue": f"Code execution timed out after {effective_timeout} seconds",
@@ -309,23 +299,9 @@ class KernelServer:
                 execution_time=time.perf_counter() - start_time,
             )
 
-        total_ms = (time.perf_counter() - start_time) * 1000.0
-        if PERF_METRICS_ENABLED and (should_sample or total_ms >= PERF_SLOW_KERNEL_EXEC_MS):
-            _log_perf(
-                {
-                    "component": "aviary_hypotest.kernel_server",
-                    "event": "kernel_execute_end",
-                    "duration_ms": round(total_ms, 3),
-                    "timed_out": timed_out,
-                    "error_occurred": result.error_occurred,
-                    "notebook_outputs_count": len(result.notebook_outputs),
-                    "slow": total_ms >= PERF_SLOW_KERNEL_EXEC_MS,
-                }
-            )
-
         return result
 
-    async def _execute_code(self, code: str, deadline: float, log_detail: bool = False) -> ExecuteResponse:
+    async def _execute_code(self, code: str, deadline: float) -> ExecuteResponse:
         """Internal method to execute code and collect outputs.
 
         Uses cooperative deadline checking instead of asyncio.timeout, because
@@ -338,14 +314,13 @@ class KernelServer:
 
         # How long each ZMQ poll waits before we re-check the deadline.
         # Shorter = more responsive timeout, slightly more overhead.
-        _POLL_INTERVAL_S = 2.0
+        POLL_INTERVAL_S = 2.0
 
         start_time = time.perf_counter()
         msg_id = self._client.execute(code)
 
         notebook_outputs: list[dict[str, Any]] = []
         error_occurred = False
-        iopub_msgs_count = 0
 
         while True:
             # Check deadline before each poll
@@ -356,13 +331,12 @@ class KernelServer:
             # get_iopub_msg(timeout=T) raises queue.Empty if no message arrives
             # within T seconds.
             try:
-                msg = await self._client.get_iopub_msg(timeout=_POLL_INTERVAL_S)
+                msg = await self._client.get_iopub_msg(timeout=POLL_INTERVAL_S)
             except Empty:
                 continue
 
             if msg["parent_header"].get("msg_id") != msg_id:
                 continue
-            iopub_msgs_count += 1
 
             msg_type = MessageType.from_string(msg["msg_type"])
             if msg_type is None:
@@ -383,17 +357,6 @@ class KernelServer:
                     error_occurred = True
 
         execution_time = time.perf_counter() - start_time
-        if PERF_METRICS_ENABLED and log_detail:
-            _log_perf(
-                {
-                    "component": "aviary_hypotest.kernel_server",
-                    "event": "kernel_iopub_summary",
-                    "duration_ms": round(execution_time * 1000.0, 3),
-                    "kernel_iopub_msgs_count": iopub_msgs_count,
-                    "notebook_outputs_count": len(notebook_outputs),
-                    "error_occurred": error_occurred,
-                }
-            )
 
         return ExecuteResponse(
             notebook_outputs=notebook_outputs,
