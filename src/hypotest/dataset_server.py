@@ -99,7 +99,7 @@ DEFAULT_SERVER_PORT = 8405
 class ServerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    dataset: DatasetConfig
+    dataset: HypotestDatasetConfig
     api_key: str = Field(
         description="API key to access the server; passed either by value or as an environment variable."
     )

@@ -38,7 +38,7 @@ from aviary.core import (
 from aviary.env import Environment
 from lmi import LiteLLMModel
 from nbformat import NotebookNode
-from pydantic import BaseModel, Field, JsonValue
+from pydantic import BaseModel, Field, JsonValue, model_validator
 
 import subprocess
 from textwrap import dedent
@@ -159,6 +159,13 @@ class ProblemInstance(BaseModel):
     input_data_path: str = ""
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
     nb_primary_language: str = Field(default=str(NBLanguage.PYTHON))
+
+    @model_validator(mode="before")
+    @classmethod
+    def handle_language(cls, data: dict) -> dict:
+        if data['nb_primary_language'] is None:
+            data['nb_primary_language'] = str(NBLanguage.PYTHON)
+        return data
 
 def _prep_workspace_dir(work_dir: str, workspace_path: str = "/data_workspace") -> None:
     wd = Path(work_dir)
