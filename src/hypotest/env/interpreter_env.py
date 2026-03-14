@@ -1144,6 +1144,9 @@ class InterpreterEnvState:
         elif self.interpreter is not None:
             await self.interpreter.close()
 
+        if self.save_dir is None and self.work_dir.exists():
+            shutil.rmtree(self.work_dir, ignore_errors=True)
+
     def _add_cell(self, code: str, result: "ExecutionResult") -> int:
         """Add a new code cell to the notebook with execution results.
 
@@ -1351,6 +1354,13 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         # prompting_config is set during reset() after language resolution
         self.prompting_config: PromptingConfig
         self._perf_sample_step = False
+
+        if self.score_info_path.exists():
+            self.score_info_path.unlink()
+
+        nb_path = self.work_dir / "notebook.ipynb"
+        if nb_path.exists():
+            nb_path.unlink()
 
     def _emit_perf_event(self, event: str, **fields: Any) -> None:
         if not PERF_METRICS_ENABLED:

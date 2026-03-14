@@ -70,6 +70,8 @@ class HypotestDataset(TaskDataset[InterpreterEnv]):
         if not capsule_path.exists():
             capsule_path = self.config.capsule_dir / f"CapsuleData-{problem.id}"
         problem_dir = Path(self.config.work_dir) / run_id if self.config.work_dir else Path(mkdtemp())
+        if problem_dir.exists():
+            shutil.rmtree(problem_dir)
         problem_dir.mkdir(parents=True, exist_ok=True)
         shutil.copytree(capsule_path, problem_dir, dirs_exist_ok=True)
 
