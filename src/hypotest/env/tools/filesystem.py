@@ -343,6 +343,12 @@ def list_dir_tool(
     overwhelming the context with too many files. Use this tool instead of
     writing code to list directories to avoid context bloat.
 
+    Usage Examples:
+        list_dir()                      # List working directory
+        list_dir("data/")               # List specific folder
+        list_dir(max_files=50)          # Show more files
+        list_dir(show_hidden=True)      # Include hidden files
+
     Args:
         directory: Directory path to list (default: current working directory)
         max_files: Maximum number of files to display (default: 20)

@@ -727,6 +727,7 @@ class InterpreterEnvState:
         self._http_client: httpx.AsyncClient | None = None
         self._container_log_path: Path | None = None
         self._container_log_file: Any | None = None
+        self.kernel_container: EnrootKernelServer | None = None
 
         # Initialize notebook structure for state tracking
         self.nb: NotebookNode = nbformat.v4.new_notebook()
@@ -1407,6 +1408,10 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         This method allows running code in a new cell (append) or re-running
         an existing cell with updated code.
+
+        Usage Examples:
+            run_cell("print('Hello, world!')")           # Run code in new cell
+            run_cell("print('Hello, world!')", idx=0)    # Run code in existing cell at index 0
 
         Error Recovery:
             When a cell fails with an error, you MUST fix it by calling run_cell
