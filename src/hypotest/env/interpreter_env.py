@@ -1415,7 +1415,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         Error Recovery:
             When a cell fails with an error, you MUST fix it by calling run_cell
-            with the corrected code and the SAME idx as the failed cell.
+            with the corrected code and the SAME idx as the failed cell:
+
+            run_cell("corrected_code", idx=3)  # Fix error in Cell #3
 
             The cell number is shown in the output prefix (e.g., "[Cell #3]").
             Do NOT create a new cell to fix an error - always edit the failed cell.
