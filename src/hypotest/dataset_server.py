@@ -78,9 +78,7 @@ class HypotestDataset(TaskDataset[InterpreterEnv]):
         save_dir = Path(self.config.save_dir) / run_id if self.config.save_dir else None
 
         language = (
-            NBLanguage.PYTHON
-            if self.config.force_python
-            else NBLanguage.from_string(cast(str, problem.nb_primary_language).upper())
+            NBLanguage.PYTHON if self.config.force_python else NBLanguage.from_string(problem.nb_primary_language)
         )
 
         return InterpreterEnv(
@@ -137,7 +135,7 @@ async def launch_server():
         config = ServerConfig.model_validate(yaml.safe_load(args.config.read_text()))
     else:
         config = ServerConfig(
-            dataset=DatasetConfig(
+            dataset=HypotestDatasetConfig(
                 problem_jsonl=args.problem_jsonl,
                 capsule_dir=args.capsule_dir,
                 rubric_model=args.rubric_model,
@@ -156,12 +154,13 @@ async def launch_server():
                     ],
                 },
                 use_docker=args.use_docker,
+                execution_config={"cell_execution_timeout": 600},
             ),
             port=args.port,
             api_key=args.api_key,
         )
 
-    dataset = Dataset(config.dataset)
+    dataset = HypotestDataset(config.dataset)
     server = TaskDatasetServer(dataset, port=config.port, api_key=config.api_key)
 
     ip_address = socket.gethostbyname(socket.gethostname())

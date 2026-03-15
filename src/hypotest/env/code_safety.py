@@ -71,15 +71,30 @@ _DANGEROUS_CALLS: frozenset[str] = frozenset({
 
 # Dangerous attribute names used with getattr() evasion
 _DANGEROUS_ATTRS: frozenset[str] = frozenset({
-    "kill", "killpg", "system", "popen", "fork", "forkpty",
-    "execl", "execle", "execlp", "execlpe",
-    "execv", "execve", "execvp", "execvpe",
-    "_exit", "rmtree",
+    "kill",
+    "killpg",
+    "system",
+    "popen",
+    "fork",
+    "forkpty",
+    "execl",
+    "execle",
+    "execlp",
+    "execlpe",
+    "execv",
+    "execve",
+    "execvp",
+    "execvpe",
+    "_exit",
+    "rmtree",
 })
 
 # Modules whose import_module() calls should be checked
 _DANGEROUS_IMPORTLIB_TARGETS: frozenset[str] = _BLOCKED_MODULES | frozenset({
-    "os", "subprocess", "shutil", "multiprocessing",
+    "os",
+    "subprocess",
+    "shutil",
+    "multiprocessing",
 })
 
 
@@ -150,7 +165,7 @@ class _DangerousCodeVisitor(ast.NodeVisitor):
             return func.id
         return None
 
-    def visit_Call(self, node: ast.Call) -> None:
+    def visit_Call(self, node: ast.Call) -> None:  # noqa: PLR0912
         call_path = self._resolve_call_path(node)
 
         if call_path is not None:
@@ -181,13 +196,16 @@ class _DangerousCodeVisitor(ast.NodeVisitor):
                         return
 
             # Check getattr(os, 'kill') style
-            if call_path in ("getattr", "builtins.getattr") and len(node.args) >= 2:
+            if call_path in {"getattr", "builtins.getattr"} and len(node.args) >= 2:
                 attr_arg = node.args[1]
-                if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
-                    if attr_arg.value in _DANGEROUS_ATTRS:
-                        self._block(_MSG_DANGEROUS_CALL)
-                        self.generic_visit(node)
-                        return
+                if (
+                    isinstance(attr_arg, ast.Constant)
+                    and isinstance(attr_arg.value, str)
+                    and attr_arg.value in _DANGEROUS_ATTRS
+                ):
+                    self._block(_MSG_DANGEROUS_CALL)
+                    self.generic_visit(node)
+                    return
 
             # Check importlib.import_module('signal') style
             if call_path.endswith("import_module") and node.args:
@@ -209,9 +227,7 @@ class _DangerousCodeVisitor(ast.NodeVisitor):
 _MAGIC_SHELL_ESCAPE_LINE = re.compile(r"^\s*!(?P<cmd>.+)$", re.MULTILINE)
 
 # Dangerous IPython magics
-_MAGIC_DANGEROUS = re.compile(
-    r"^\s*%(run|system)\b|get_ipython\(\)\s*\.\s*system\s*\(", re.MULTILINE
-)
+_MAGIC_DANGEROUS = re.compile(r"^\s*%(run|system)\b|get_ipython\(\)\s*\.\s*system\s*\(", re.MULTILINE)
 
 
 def _check_jupyter_magics(code: str) -> str | None:
@@ -327,7 +343,7 @@ def _check_python(code: str) -> str | None:
         stripped_lines = []
         for line in code.splitlines():
             stripped = line.lstrip()
-            if stripped.startswith("!") or stripped.startswith("%"):
+            if stripped.startswith(("!", "%")):
                 stripped_lines.append("")  # blank out magic lines
             else:
                 stripped_lines.append(line)
@@ -346,7 +362,7 @@ def _check_python(code: str) -> str | None:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-def check_code_safety(code: str, language: "NBLanguage") -> str | None:
+def check_code_safety(code: str, language: NBLanguage) -> str | None:
     """Check if code is safe to execute.
 
     Args:

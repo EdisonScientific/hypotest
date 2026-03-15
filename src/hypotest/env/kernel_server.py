@@ -29,7 +29,7 @@ from nbformat import NotebookNode
 from pydantic import BaseModel
 
 
-class _DeadlineExceeded(Exception):
+class DeadlineExceededError(Exception):
     """Raised when a cooperative deadline check expires."""
 
 
@@ -276,7 +276,7 @@ class KernelServer:
                 code,
                 deadline=start_time + effective_timeout,
             )
-        except _DeadlineExceeded:
+        except DeadlineExceededError:
             timeout_output = MessageType.ERROR.to_notebook_output({
                 "ename": "TimeoutError",
                 "evalue": f"Code execution timed out after {effective_timeout} seconds",
@@ -325,7 +325,7 @@ class KernelServer:
         while True:
             # Check deadline before each poll
             if time.perf_counter() >= deadline:
-                raise _DeadlineExceeded
+                raise DeadlineExceededError
 
             # Use a bounded poll so we never block longer than _POLL_INTERVAL_S.
             # get_iopub_msg(timeout=T) raises queue.Empty if no message arrives

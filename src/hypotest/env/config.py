@@ -15,7 +15,9 @@ KERNEL_ENV_PATH = os.getenv("KERNEL_ENV_PATH", "/app/kernel_env")
 
 # Kernel server settings (for Docker-based execution)
 KERNEL_SERVER_PORT = 8000
-KERNEL_SERVER_STARTUP_TIMEOUT = float(os.getenv("KERNEL_SERVER_STARTUP_TIMEOUT", "120.0"))  # seconds to wait for health check
+KERNEL_SERVER_STARTUP_TIMEOUT = float(
+    os.getenv("KERNEL_SERVER_STARTUP_TIMEOUT", "120.0")
+)  # seconds to wait for health check
 
 MAX_FILES_TO_UPLOAD = int(os.getenv("MAX_FILES_TO_UPLOAD", "100"))
 

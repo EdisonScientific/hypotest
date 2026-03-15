@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from tempfile import mkdtemp
 from textwrap import dedent
@@ -27,7 +28,6 @@ import aiodocker
 import httpx
 import nbformat
 import numpy as np
-import ray
 import tenacity
 from aviary.core import (
     EnvStateMessage,
@@ -44,11 +44,18 @@ from nbformat import NotebookNode
 from pydantic import BaseModel, Field, JsonValue, model_validator
 
 from . import config as cfg
+from .code_safety import check_code_safety
 from .config import ExecutionConfig
 from .interpreter import ExecutionResult, Interpreter
 from .prompts import CORRECT_MSG, HYPOTHESIS_TASK_DESC, INCORRECT_MSG, RUBRIC_SCORE_PROMPT, PromptingConfig
 from .tools.filesystem import FilesystemTool
 from .utils import NBLanguage, view_notebook
+
+RAY_INSTALLED = True
+try:
+    import ray
+except ImportError:
+    RAY_INSTALLED = False
 
 if TYPE_CHECKING:
     from aiodocker.containers import DockerContainer
@@ -87,6 +94,112 @@ _CONTAINER_LOG_LEVEL = logging.WARNING
 
 class _PortCollisionError(Exception):
     """Port already in use by another server — retry with a new port."""
+
+
+async def _poll_kernel_health(  # noqa: PLR0912
+    http_client: httpx.AsyncClient,
+    enroot_proc: subprocess.Popen[str] | None,
+    container_port: int | None,
+    expected_startup_token: str | None,
+    read_log_tail: Callable[[int], str],
+    label: str,
+) -> None:
+    """Poll kernel server /health endpoint until ready, with token validation and timeout."""
+    start_time = time.perf_counter()
+    poll_count = 0
+    last_status = "no_attempt"
+    consecutive_token_mismatches = 0
+    # Use a short per-request timeout for health checks so that a single
+    # poll can never block longer than a few seconds.  Without this, the
+    # client's default timeout (execution_timeout + 10 ≈ 190s) means one
+    # health poll can exceed the entire KERNEL_SERVER_STARTUP_TIMEOUT,
+    # e.g. when a port collision causes us to connect to the wrong server.
+    health_timeout = httpx.Timeout(5.0, connect=3.0)
+
+    while time.perf_counter() - start_time < cfg.KERNEL_SERVER_STARTUP_TIMEOUT:
+        poll_count += 1
+        elapsed = time.perf_counter() - start_time
+
+        # Check if the enroot process has died before we even get an HTTP response
+        if enroot_proc is not None and enroot_proc.poll() is not None:
+            rc = enroot_proc.returncode
+            log_tail = read_log_tail(1000)
+            raise RuntimeError(
+                f"Enroot process exited prematurely with returncode={rc} after {elapsed:.1f}s. log: {log_tail!r}"
+            )
+
+        try:
+            response = await http_client.get("/health", timeout=health_timeout)
+            if response.status_code == 200:
+                if expected_startup_token is None:
+                    logger.log(
+                        _CONTAINER_LOG_LEVEL,
+                        "[%s] Kernel server healthy after %.1fs (%d polls)",
+                        label,
+                        elapsed,
+                        poll_count,
+                    )
+                    return
+                payload = response.json()
+                if payload.get("startup_token") == expected_startup_token:
+                    logger.log(
+                        _CONTAINER_LOG_LEVEL,
+                        "[%s] Kernel server healthy (token matched) after %.1fs (%d polls)",
+                        label,
+                        elapsed,
+                        poll_count,
+                    )
+                    return
+                last_status = f"token_mismatch(got={payload.get('startup_token', '?')[:8]})"
+                consecutive_token_mismatches += 1
+                if consecutive_token_mismatches >= 3:
+                    raise _PortCollisionError(
+                        f"Port {container_port} appears to be owned by another server "
+                        f"({consecutive_token_mismatches} consecutive token mismatches)"
+                    )
+            else:
+                last_status = f"http_{response.status_code}"
+                consecutive_token_mismatches = 0
+        except httpx.ConnectError:
+            last_status = "connect_error"
+            consecutive_token_mismatches = 0
+        except httpx.ReadError:
+            last_status = "read_error"
+            consecutive_token_mismatches = 0
+        except httpx.TimeoutException:
+            last_status = "timeout"
+            consecutive_token_mismatches = 0
+        except httpx.RemoteProtocolError:
+            last_status = "protocol_error"
+            consecutive_token_mismatches = 0
+
+        # Log progress every 5s
+        if poll_count % 10 == 0:
+            proc_alive = enroot_proc.poll() is None if enroot_proc else False
+            logger.log(
+                _CONTAINER_LOG_LEVEL,
+                "[%s] Health poll #%d at %.1fs: last_status=%s, process_alive=%s",
+                label,
+                poll_count,
+                elapsed,
+                last_status,
+                proc_alive,
+            )
+
+        await asyncio.sleep(0.5)
+
+    total_elapsed = time.perf_counter() - start_time
+    if last_status.startswith("token_mismatch"):
+        raise _PortCollisionError(
+            f"Port {container_port} health-check timed out with token_mismatch "
+            f"({poll_count} polls, elapsed={total_elapsed:.1f}s)"
+        )
+    log_tail = read_log_tail(500)
+    raise TimeoutError(
+        f"Kernel server did not become healthy within {cfg.KERNEL_SERVER_STARTUP_TIMEOUT}s "
+        f"({poll_count} polls, last_status={last_status}, elapsed={total_elapsed:.1f}s)"
+        f"{f' log_tail={log_tail!r}' if log_tail else ''}"
+    )
 
 
 def _kill_process_group(proc: subprocess.Popen, label: str = "enroot", sigterm_timeout: float = 15) -> None:
@@ -214,11 +327,102 @@ class EnrootKernelServer:
         pid = self._enroot_proc.pid if self._enroot_proc else "?"
         return f"enroot(port={port}, pid={pid})"
 
+    @staticmethod
+    def _build_kernel_bash_script(node_workdir: str, language: NBLanguage, port: int, startup_token: str) -> str:
+        """Build the bash script that sets up the workspace and launches the kernel server."""
+        return dedent(f"""\
+            set -euo pipefail
+
+            WORKDIR="{node_workdir}"
+            trap 'rm -rf "$WORKDIR"' EXIT
+
+            mkdir -p $WORKDIR
+            cp -a /data_workspace/. $WORKDIR/
+
+            cd $WORKDIR
+
+            mkdir -p "$WORKDIR/r_libs"
+            cat >"$WORKDIR/Rprofile" <<'EOF'
+            .local_lib <- Sys.getenv("R_LIBS_USER")
+            if (nzchar(.local_lib)) .libPaths(unique(c(.local_lib, .libPaths())))
+            EOF
+
+            mkdir -p $WORKDIR/r_libs
+            export R_LIBS_USER="$WORKDIR/r_libs"
+            export R_PROFILE_USER="$WORKDIR/Rprofile"
+
+            export PYTHONPATH="$WORKDIR/pydeps:${{PYTHONPATH}}"
+            export PIP_CONFIG_FILE=$WORKDIR/pip.conf
+            export target_platform=${{target_platform:-linux-64}}
+
+            source activate /app/kernel_env
+            exec /app/kernel_env/bin/python /envs/kernel_server.py \\
+                --work_dir $WORKDIR \\
+                --language {language.value} \\
+                --port {port} \\
+                --startup-token {startup_token}
+        """).strip()
+
+    @staticmethod
+    def _setup_enroot_env(startup_token: str) -> dict[str, str]:
+        """Create enroot runtime directories and return env dict."""
+        base = Path(f"/tmp/enroot_data/{startup_token}")  # noqa: S108
+        subdirs = ["runtime", "config", "cache", "data", "tmp"]
+        env_keys = [
+            "ENROOT_RUNTIME_PATH",
+            "ENROOT_CONFIG_PATH",
+            "ENROOT_CACHE_PATH",
+            "ENROOT_DATA_PATH",
+            "ENROOT_TEMP_PATH",
+        ]
+        env: dict[str, str] = {}
+        for subdir, key in zip(subdirs, env_keys, strict=True):
+            p = base / subdir
+            p.mkdir(parents=True, exist_ok=True)
+            os.chmod(p, 0o700)
+            env[key] = str(p)
+        return env
+
+    @staticmethod
+    def _build_enroot_cmd(
+        work_dir: Path,
+        kernel_server_path: Path,
+        bash: str,
+        enroot_env: dict[str, str],
+        container_sqsh_path: Path,
+    ) -> list[str]:
+        """Assemble the full ``enroot start`` command."""
+        env_args = [f"{k}={v}" for k, v in enroot_env.items()]
+        return [
+            "env",
+            "-i",
+            "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+            'HOME="$HOME"',
+            'USER="$USER"',
+            *env_args,
+            "enroot",
+            "start",
+            "--rw",
+            "--mount",
+            f"{work_dir}:/data_workspace",
+            "--mount",
+            f"{kernel_server_path.resolve()}:/envs/kernel_server.py",
+            str(container_sqsh_path.resolve()),
+            "/bin/bash",
+            "-lc",
+            bash,
+        ]
+
     async def initialize(self, work_dir: Path, language: NBLanguage) -> None:
         startup_token = str(uuid.uuid4())
         node_workdir = f"/tmp/data_workspace.{startup_token.split('-', maxsplit=1)[0]}"
 
-        _prep_workspace_dir(work_dir, workspace_path=node_workdir)
+        _prep_workspace_dir(str(work_dir), workspace_path=node_workdir)
+
+        kernel_server_path = Path(__file__).parent / "kernel_server.py"
+        assert kernel_server_path.is_file(), f"kernel server must be a valid path, found {kernel_server_path}"
+
+        enroot_env = self._setup_enroot_env(startup_token)
 
         online = False
         attempt = 0
@@ -234,91 +438,8 @@ class EnrootKernelServer:
                 )
             self._container_port = await get_free_port()
 
-            bash = dedent(f"""\
-                set -euo pipefail
-
-                WORKDIR="{node_workdir}"
-                trap 'rm -rf "$WORKDIR"' EXIT
-
-                mkdir -p $WORKDIR
-                cp -a /data_workspace/. $WORKDIR/
-
-                cd $WORKDIR
-
-                mkdir -p "$WORKDIR/r_libs"
-                cat >"$WORKDIR/Rprofile" <<'EOF'
-                .local_lib <- Sys.getenv("R_LIBS_USER")
-                if (nzchar(.local_lib)) .libPaths(unique(c(.local_lib, .libPaths())))
-                EOF
-
-                mkdir -p $WORKDIR/r_libs
-                export R_LIBS_USER="$WORKDIR/r_libs"
-                export R_PROFILE_USER="$WORKDIR/Rprofile"
-
-                export PYTHONPATH="$WORKDIR/pydeps:${{PYTHONPATH}}"
-                export PIP_CONFIG_FILE=$WORKDIR/pip.conf
-                export target_platform=${{target_platform:-linux-64}}
-
-                source activate /app/kernel_env
-                exec /app/kernel_env/bin/python /envs/kernel_server.py \\
-                    --work_dir $WORKDIR \\
-                    --language {language.value} \\
-                    --port {self._container_port} \\
-                    --startup-token {startup_token}
-            """).strip()
-
-            env_dir = Path(__file__).parent
-            kernel_server_path = env_dir / "kernel_server.py"
-            assert kernel_server_path.is_file(), f"kernel server must be a valid path, found {kernel_server_path}"
-
-            base = Path(f"/tmp/enroot_data/{startup_token}")
-
-            enroot_runtime = base / "runtime"
-            enroot_config = base / "config"
-            enroot_cache = base / "cache"
-            enroot_data = base / "data"
-            enroot_temp = base / "tmp"
-
-            for path in [
-                enroot_runtime,
-                enroot_config,
-                enroot_cache,
-                enroot_data,
-                enroot_temp,
-            ]:
-                path.mkdir(parents=True, exist_ok=True)
-                os.chmod(path, 0o700)
-
-            env = {}
-            env["ENROOT_RUNTIME_PATH"] = str(enroot_runtime)
-            env["ENROOT_CONFIG_PATH"] = str(enroot_config)
-            env["ENROOT_CACHE_PATH"] = str(enroot_cache)
-            env["ENROOT_DATA_PATH"] = str(enroot_data)
-            env["ENROOT_TEMP_PATH"] = str(enroot_temp)
-
-            cmd = [
-                "env",
-                "-i",
-                "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
-                'HOME="$HOME"',
-                'USER="$USER"',
-                f"ENROOT_RUNTIME_PATH={enroot_runtime}",
-                f"ENROOT_CONFIG_PATH={enroot_config}",
-                f"ENROOT_CACHE_PATH={enroot_cache}",
-                f"ENROOT_DATA_PATH={enroot_data}",
-                f"ENROOT_TEMP_PATH={enroot_temp}",
-                "enroot",
-                "start",
-                "--rw",
-                "--mount",
-                f"{work_dir}:/data_workspace",
-                "--mount",
-                f"{kernel_server_path.resolve()}:/envs/kernel_server.py",
-                str(self.container_sqsh_path.resolve()),
-                "/bin/bash",
-                "-lc",
-                bash,
-            ]
+            bash = self._build_kernel_bash_script(node_workdir, language, self._container_port, startup_token)
+            cmd = self._build_enroot_cmd(work_dir, kernel_server_path, bash, enroot_env, self.container_sqsh_path)
 
             async with CONTAINER_LAUNCH_SEM:
                 launch_t0 = time.perf_counter()
@@ -446,109 +567,16 @@ class EnrootKernelServer:
 
     async def _wait_for_health(self, expected_startup_token: str | None = None) -> None:
         """Wait for the kernel server to become healthy."""
-        start_time = time.perf_counter()
-        poll_count = 0
-        last_status = "no_attempt"
-        consecutive_token_mismatches = 0
-        # Use a short per-request timeout for health checks so that a single
-        # poll can never block longer than a few seconds.  Without this, the
-        # client's default timeout (execution_timeout + 10 ≈ 190s) means one
-        # health poll can exceed the entire KERNEL_SERVER_STARTUP_TIMEOUT,
-        # e.g. when a port collision causes us to connect to the wrong server.
-        health_timeout = httpx.Timeout(5.0, connect=3.0)
-
-        while time.perf_counter() - start_time < cfg.KERNEL_SERVER_STARTUP_TIMEOUT:
-            poll_count += 1
-            elapsed = time.perf_counter() - start_time
-
-            # Check if the enroot process has died before we even get an HTTP response
-            if self._enroot_proc is not None and self._enroot_proc.poll() is not None:
-                rc = self._enroot_proc.returncode
-                log_tail = self._read_container_log_tail(1000)
-                raise RuntimeError(
-                    f"Enroot process exited prematurely with returncode={rc} after {elapsed:.1f}s. log: {log_tail!r}"
-                )
-
-            try:
-                assert self._http_client is not None
-                response = await self._http_client.get("/health", timeout=health_timeout)
-                if response.status_code == 200:
-                    if expected_startup_token is None:
-                        logger.log(
-                            _CONTAINER_LOG_LEVEL,
-                            "[%s] Kernel server healthy after %.1fs (%d polls)",
-                            self._proc_label(),
-                            elapsed,
-                            poll_count,
-                        )
-                        return
-                    payload = response.json()
-                    if payload.get("startup_token") == expected_startup_token:
-                        logger.log(
-                            _CONTAINER_LOG_LEVEL,
-                            "[%s] Kernel server healthy (token matched) after %.1fs (%d polls)",
-                            self._proc_label(),
-                            elapsed,
-                            poll_count,
-                        )
-                        return
-                    last_status = f"token_mismatch(got={payload.get('startup_token', '?')[:8]})"
-                    consecutive_token_mismatches += 1
-                    if consecutive_token_mismatches >= 3:
-                        raise _PortCollisionError(
-                            f"Port {self._container_port} appears to be owned by another server "
-                            f"({consecutive_token_mismatches} consecutive token mismatches)"
-                        )
-                else:
-                    last_status = f"http_{response.status_code}"
-                    consecutive_token_mismatches = 0
-            except httpx.ConnectError:
-                last_status = "connect_error"
-                consecutive_token_mismatches = 0
-            except httpx.ReadError:
-                last_status = "read_error"
-                consecutive_token_mismatches = 0
-            except httpx.TimeoutException:
-                last_status = "timeout"
-                consecutive_token_mismatches = 0
-            except httpx.RemoteProtocolError:
-                last_status = "protocol_error"
-                consecutive_token_mismatches = 0
-
-            # Log progress every 5s
-            if poll_count % 10 == 0:
-                proc_alive = self._enroot_proc.poll() is None if self._enroot_proc else False
-                logger.log(
-                    _CONTAINER_LOG_LEVEL,
-                    "[%s] Health poll #%d at %.1fs: last_status=%s, process_alive=%s",
-                    self._proc_label(),
-                    poll_count,
-                    elapsed,
-                    last_status,
-                    proc_alive,
-                )
-
-            await asyncio.sleep(0.5)
-
-        total_elapsed = time.perf_counter() - start_time
-        if last_status.startswith("token_mismatch"):
-            raise _PortCollisionError(
-                f"Port {self._container_port} health-check timed out with token_mismatch "
-                f"({poll_count} polls, elapsed={total_elapsed:.1f}s)"
-            )
-        log_tail = self._read_container_log_tail(500)
-        raise TimeoutError(
-            f"Kernel server did not become healthy within {cfg.KERNEL_SERVER_STARTUP_TIMEOUT}s "
-            f"({poll_count} polls, last_status={last_status}, elapsed={total_elapsed:.1f}s)"
-            f"{f' log_tail={log_tail!r}' if log_tail else ''}"
+        assert self._http_client is not None
+        await _poll_kernel_health(
+            http_client=self._http_client,
+            enroot_proc=self._enroot_proc,
+            container_port=self._container_port,
+            expected_startup_token=expected_startup_token,
+            read_log_tail=self._read_container_log_tail,
+            label=self._proc_label(),
         )
 
-    # @tenacity.retry(
-    #     retry=tenacity.retry_if_exception_type((httpx.ConnectError, httpx.ReadError)),
-    #     stop=tenacity.stop_after_attempt(3),
-    #     wait=tenacity.wait_exponential(multiplier=1, min=1, max=10),
-    #     reraise=True,
-    # )
     async def _execute_via_http(self, code: str, timeout: float | None = None) -> ExecutionResult:  # noqa: ASYNC109
         """Execute code via HTTP to the containerized kernel server.
 
@@ -675,7 +703,7 @@ class InterpreterEnvState:
         self.use_enroot = use_enroot
         self.container_sqsh_path = container_sqsh_path
         self.save_dir = save_dir
-        self.use_ray = use_ray
+        self.use_ray = use_ray if RAY_INSTALLED else False
 
         # Local interpreter (only used when use_docker=False)
         self.interpreter: Interpreter | None = None
@@ -732,7 +760,7 @@ class InterpreterEnvState:
         return f"enroot-state(port={port}, pid={pid})"
 
     async def _start_enroot_container(self) -> None:
-        _prep_workspace_dir(self.work_dir)
+        _prep_workspace_dir(str(self.work_dir))
 
         online = False
         attempt = 0
@@ -762,9 +790,9 @@ class InterpreterEnvState:
                     --startup-token {startup_token}
             """).strip()
 
-            env_dir = Path(__file__).parent
-            kernel_server_path = env_dir / "kernel_server.py"
+            kernel_server_path = Path(__file__).parent / "kernel_server.py"
             assert kernel_server_path.is_file(), f"kernel server must be a valid path, found {kernel_server_path}"
+            assert self.container_sqsh_path is not None, "container_sqsh_path must be set when using enroot container"
 
             cmd = [
                 "env",
@@ -788,9 +816,8 @@ class InterpreterEnvState:
                 launch_t0 = time.perf_counter()
                 # Redirect container output to a log file (see EnrootKernelServer
                 # for detailed rationale on why we avoid subprocess.PIPE here).
-                log_dir = self.work_dir / ".container_logs"
-                log_dir.mkdir(exist_ok=True)
-                self._container_log_path = log_dir / "container.log"
+                (self.work_dir / ".container_logs").mkdir(exist_ok=True)
+                self._container_log_path = self.work_dir / ".container_logs" / "container.log"
                 self._container_log_file = open(self._container_log_path, "w", encoding="utf-8")  # noqa: SIM115
                 self._enroot_proc = subprocess.Popen(
                     cmd,
@@ -830,26 +857,30 @@ class InterpreterEnvState:
             except Exception as e:
                 last_err = e
                 launch_ms = (time.perf_counter() - launch_t0) * 1000.0
-                label = self._enroot_label()
-                diag = [f"attempt=#{attempt}", f"elapsed={launch_ms:.0f}ms", f"error={e!r}"]
-                if self._enroot_proc is not None:
-                    rc = self._enroot_proc.poll()
-                    diag.append(f"process_alive={rc is None}")
-                    if rc is not None:
-                        diag.append(f"returncode={rc}")
-                logger.warning("[%s] Container startup FAILED: %s", label, ", ".join(diag))
-                log_tail = self._read_container_log_tail()
-                if log_tail:
-                    logger.warning(
-                        "[%s] Container log output (last %d chars):\n%s",
-                        label,
-                        len(log_tail),
-                        log_tail,
-                    )
+                self._log_enroot_container_failure(attempt, launch_ms, e)
                 await self._cleanup_failed_startup()
                 if not isinstance(e, _PortCollisionError):
                     backoff = min(_RETRY_BASE_SLEEP * 2 ** (attempt - 1), _RETRY_MAX_SLEEP)
                     await asyncio.sleep(backoff)
+
+    def _log_enroot_container_failure(self, attempt: int, launch_ms: float, error: Exception) -> None:
+        """Log detailed diagnostics when a container fails to start."""
+        label = self._enroot_label()
+        diag = [f"attempt=#{attempt}", f"elapsed={launch_ms:.0f}ms", f"error={error!r}"]
+        if self._enroot_proc is not None:
+            rc = self._enroot_proc.poll()
+            diag.append(f"process_alive={rc is None}")
+            if rc is not None:
+                diag.append(f"returncode={rc}")
+        logger.warning("[%s] Container startup FAILED: %s", label, ", ".join(diag))
+        log_tail = self._read_container_log_tail()
+        if log_tail:
+            logger.warning(
+                "[%s] Container log output (last %d chars):\n%s",
+                label,
+                len(log_tail),
+                log_tail,
+            )
 
     def _read_container_log_tail(self, max_chars: int = 2000) -> str:
         """Read the tail of the container log file for diagnostics."""
@@ -931,98 +962,14 @@ class InterpreterEnvState:
 
     async def _wait_for_health(self, expected_startup_token: str | None = None) -> None:
         """Wait for the kernel server to become healthy."""
-        start_time = time.perf_counter()
-        poll_count = 0
-        last_status = "no_attempt"
-        consecutive_token_mismatches = 0
-        # Short per-request timeout (see EnrootKernelServer._wait_for_health
-        # for rationale).
-        health_timeout = httpx.Timeout(5.0, connect=3.0)
-
-        while time.perf_counter() - start_time < cfg.KERNEL_SERVER_STARTUP_TIMEOUT:
-            poll_count += 1
-            elapsed = time.perf_counter() - start_time
-
-            # Check if the enroot process has died
-            if self._enroot_proc is not None and self._enroot_proc.poll() is not None:
-                rc = self._enroot_proc.returncode
-                log_tail = self._read_container_log_tail(1000)
-                raise RuntimeError(
-                    f"Enroot process exited prematurely with returncode={rc} after {elapsed:.1f}s. log: {log_tail!r}"
-                )
-
-            try:
-                assert self._http_client is not None
-                response = await self._http_client.get("/health", timeout=health_timeout)
-                if response.status_code == 200:
-                    if expected_startup_token is None:
-                        logger.log(
-                            _CONTAINER_LOG_LEVEL,
-                            "[%s] Kernel server healthy after %.1fs (%d polls)",
-                            self._enroot_label(),
-                            elapsed,
-                            poll_count,
-                        )
-                        return
-                    payload = response.json()
-                    if payload.get("startup_token") == expected_startup_token:
-                        logger.log(
-                            _CONTAINER_LOG_LEVEL,
-                            "[%s] Kernel server healthy (token matched) after %.1fs (%d polls)",
-                            self._enroot_label(),
-                            elapsed,
-                            poll_count,
-                        )
-                        return
-                    last_status = f"token_mismatch(got={payload.get('startup_token', '?')[:8]})"
-                    consecutive_token_mismatches += 1
-                    if consecutive_token_mismatches >= 3:
-                        raise _PortCollisionError(
-                            f"Port {self._container_port} appears to be owned by another server "
-                            f"({consecutive_token_mismatches} consecutive token mismatches)"
-                        )
-                else:
-                    last_status = f"http_{response.status_code}"
-                    consecutive_token_mismatches = 0
-            except httpx.ConnectError:
-                last_status = "connect_error"
-                consecutive_token_mismatches = 0
-            except httpx.ReadError:
-                last_status = "read_error"
-                consecutive_token_mismatches = 0
-            except httpx.TimeoutException:
-                last_status = "timeout"
-                consecutive_token_mismatches = 0
-            except httpx.RemoteProtocolError:
-                last_status = "protocol_error"
-                consecutive_token_mismatches = 0
-
-            # Log progress every 5s
-            if poll_count % 10 == 0:
-                proc_alive = self._enroot_proc.poll() is None if self._enroot_proc else False
-                logger.log(
-                    _CONTAINER_LOG_LEVEL,
-                    "[%s] Health poll #%d at %.1fs: last_status=%s, process_alive=%s",
-                    self._enroot_label(),
-                    poll_count,
-                    elapsed,
-                    last_status,
-                    proc_alive,
-                )
-
-            await asyncio.sleep(0.5)
-
-        total_elapsed = time.perf_counter() - start_time
-        if last_status.startswith("token_mismatch"):
-            raise _PortCollisionError(
-                f"Port {self._container_port} health-check timed out with token_mismatch "
-                f"({poll_count} polls, elapsed={total_elapsed:.1f}s)"
-            )
-        log_tail = self._read_container_log_tail(500)
-        raise TimeoutError(
-            f"Kernel server did not become healthy within {cfg.KERNEL_SERVER_STARTUP_TIMEOUT}s "
-            f"({poll_count} polls, last_status={last_status}, elapsed={total_elapsed:.1f}s)"
-            f"{f' log_tail={log_tail!r}' if log_tail else ''}"
+        assert self._http_client is not None
+        await _poll_kernel_health(
+            http_client=self._http_client,
+            enroot_proc=self._enroot_proc,
+            container_port=self._container_port,
+            expected_startup_token=expected_startup_token,
+            read_log_tail=self._read_container_log_tail,
+            label=self._enroot_label(),
         )
 
     @tenacity.retry(
@@ -1230,9 +1177,6 @@ class InterpreterEnvState:
         Returns:
             Tuple of (ExecutionResult, actual_cell_index)
         """
-        # Safety check: block dangerous code before execution
-        from .code_safety import check_code_safety
-
         block_reason = check_code_safety(code, self.language)
         if block_reason is not None:
             logger.warning("Blocked code execution in execute_and_add_cell: %s", block_reason)
@@ -1279,6 +1223,7 @@ class InterpreterEnvConfig(BaseModel):
     prompting_config: PromptingConfig = Field(default_factory=PromptingConfig)
     execution_config: ExecutionConfig = Field(default_factory=ExecutionConfig)
     max_steps: int = cfg.AGENT_MAX_STEPS
+    use_ray: bool = False
     use_docker: bool = cfg.USE_DOCKER
     use_enroot: bool = False
     container_sqsh_path: Path | None = None
@@ -1396,7 +1341,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             Tool.from_function(self.run_cell),
             Tool.from_function(self.reset_kernel),
             Tool.from_function(self.submit_answer),
-            Tool.from_function(self.list_dir),
+            Tool.from_function(self._filesystem_tool.list_dir),
         ]
 
         messages.append(
@@ -1413,7 +1358,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             messages.append(self.get_env_state_msg())
 
         # Always show initial directory listing (with truncation protection)
-        messages.append(Message(content=self.list_dir()))
+        messages.append(Message(content=self._filesystem_tool.list_dir()))
 
         return messages, self.tools
 
@@ -1609,20 +1554,6 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         correct = await self._score_solution(answer)
         return CORRECT_MSG if correct else INCORRECT_MSG
-
-    def list_dir(self) -> str:
-        """List contents of a directory with truncation protection.
-
-        Recursively lists files in a directory, with built-in protection against
-        overwhelming the context with too many files. Use this tool instead of
-        writing code to list directories to avoid context bloat.
-
-        Args:
-            directory: Directory path to list (default: current working directory)
-            max_files: Maximum number of files to display (default: 20)
-            show_hidden: Whether to show hidden files starting with '.' (default: False)
-        """
-        return self._filesystem_tool.list_dir()
 
     # ========== Time Management ==========
 

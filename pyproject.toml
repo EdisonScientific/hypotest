@@ -64,6 +64,9 @@ dev = [
     "types-tqdm",
     "vcrpy>=8",  # Pin for dropping unused requests support
 ]
+ray = [
+    "ray",
+]
 
 [tool.codespell]
 check-filenames = true
