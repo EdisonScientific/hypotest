@@ -98,7 +98,7 @@ class _PortCollisionError(Exception):
 
 async def _poll_kernel_health(  # noqa: PLR0912
     http_client: httpx.AsyncClient,
-    enroot_proc: subprocess.Popen[str] | None,
+    enroot_proc: asyncio.subprocess.Process | None,
     container_port: int | None,
     expected_startup_token: str | None,
     read_log_tail: Callable[[int], str],
@@ -121,7 +121,7 @@ async def _poll_kernel_health(  # noqa: PLR0912
         elapsed = time.perf_counter() - start_time
 
         # Check if the enroot process has died before we even get an HTTP response
-        if enroot_proc is not None and enroot_proc.poll() is not None:
+        if enroot_proc is not None and enroot_proc.returncode is not None:
             rc = enroot_proc.returncode
             log_tail = read_log_tail(1000)
             raise RuntimeError(
@@ -175,7 +175,7 @@ async def _poll_kernel_health(  # noqa: PLR0912
 
         # Log progress every 5s
         if poll_count % 10 == 0:
-            proc_alive = enroot_proc.poll() is None if enroot_proc else False
+            proc_alive = enroot_proc.returncode is None if enroot_proc else False
             logger.log(
                 _CONTAINER_LOG_LEVEL,
                 "[%s] Health poll #%d at %.1fs: last_status=%s, process_alive=%s",
@@ -202,12 +202,12 @@ async def _poll_kernel_health(  # noqa: PLR0912
     )
 
 
-def _kill_process_group(proc: subprocess.Popen, label: str = "enroot", sigterm_timeout: float = 15) -> None:
+async def _kill_process_group(proc: asyncio.subprocess.Process, label: str = "enroot", sigterm_timeout: float = 15) -> None:
     """Safely terminate a process group, escalating from SIGTERM to SIGKILL.
 
     Handles all edge cases: already-dead process, missing process group, etc.
     """
-    if proc.poll() is not None:
+    if proc.returncode is not None:
         logger.log(
             _CONTAINER_LOG_LEVEL,
             "[%s] Process pid=%d already exited with returncode=%d",
@@ -233,8 +233,7 @@ def _kill_process_group(proc: subprocess.Popen, label: str = "enroot", sigterm_t
         return
 
     try:
-        # proc.wait(timeout=sigterm_timeout)
-        proc.communicate(timeout=sigterm_timeout)
+        await asyncio.wait_for(proc.communicate(), timeout=sigterm_timeout)
         logger.log(
             _CONTAINER_LOG_LEVEL,
             "[%s] Process pid=%d exited after SIGTERM with returncode=%d",
@@ -243,7 +242,7 @@ def _kill_process_group(proc: subprocess.Popen, label: str = "enroot", sigterm_t
             proc.returncode,
         )
         return
-    except subprocess.TimeoutExpired:
+    except asyncio.TimeoutError:
         logger.warning(
             "[%s] Process pid=%d did not exit within %.1fs of SIGTERM, sending SIGKILL",
             label,
@@ -259,8 +258,7 @@ def _kill_process_group(proc: subprocess.Popen, label: str = "enroot", sigterm_t
         return
 
     try:
-        # proc.wait(timeout=5)
-        proc.communicate(timeout=5)
+        await asyncio.wait_for(proc.communicate(), timeout=5)
         logger.log(
             _CONTAINER_LOG_LEVEL,
             "[%s] Process pid=%d exited after SIGKILL with returncode=%d",
@@ -268,7 +266,7 @@ def _kill_process_group(proc: subprocess.Popen, label: str = "enroot", sigterm_t
             proc.pid,
             proc.returncode,
         )
-    except subprocess.TimeoutExpired:
+    except asyncio.TimeoutError:
         logger.exception("[%s] Process pid=%d still alive after SIGKILL — possible zombie", label, proc.pid)
 
 
@@ -316,7 +314,7 @@ class EnrootKernelServer:
         self.container_sqsh_path = container_sqsh_path
         self.execution_timeout = execution_timeout
         self.safe_execute = safe_execute
-        self._enroot_proc: subprocess.Popen[str] | None = None
+        self._enroot_proc: asyncio.subprocess.Process | None = None
         self._http_client: httpx.AsyncClient | None = None
         self._container_port: int | None = None
         self._container_log_path: Path | None = None
@@ -453,9 +451,8 @@ class EnrootKernelServer:
                 log_dir.mkdir(exist_ok=True)
                 self._container_log_path = log_dir / "container.log"
                 self._container_log_file = open(self._container_log_path, "w", encoding="utf-8")  # noqa: SIM115
-                self._enroot_proc = subprocess.Popen(
-                    cmd,
-                    text=True,
+                self._enroot_proc = await asyncio.create_subprocess_exec(
+                    *cmd,
                     start_new_session=True,
                     stdout=self._container_log_file,
                     stderr=subprocess.STDOUT,
@@ -509,7 +506,7 @@ class EnrootKernelServer:
         ]
 
         if proc is not None:
-            rc = proc.poll()
+            rc = proc.returncode
             diag_parts.append(f"process_alive={rc is None}")
             if rc is not None:
                 diag_parts.append(f"returncode={rc}")
@@ -561,7 +558,7 @@ class EnrootKernelServer:
             self._http_client = None
 
         if self._enroot_proc is not None:
-            _kill_process_group(self._enroot_proc, label=label)
+            await _kill_process_group(self._enroot_proc, label=label)
             self._enroot_proc = None
 
         self._close_container_log()
@@ -664,7 +661,7 @@ class EnrootKernelServer:
             self._http_client = None
 
         if self._enroot_proc is not None:
-            _kill_process_group(self._enroot_proc, label=label)
+            await _kill_process_group(self._enroot_proc, label=label)
             self._enroot_proc = None
 
         self._close_container_log()
@@ -722,7 +719,7 @@ class InterpreterEnvState:
         # Docker/Enroot container state (only used when use_docker=True or use_enroot=True)
         self._docker_client: aiodocker.Docker | None = None
         self._container: DockerContainer | None = None
-        self._enroot_proc = None
+        self._enroot_proc: asyncio.subprocess.Process | None = None
         self._container_port: int | None = None
         self._http_client: httpx.AsyncClient | None = None
         self._container_log_path: Path | None = None
@@ -823,9 +820,8 @@ class InterpreterEnvState:
                 (self.work_dir / ".container_logs").mkdir(exist_ok=True)
                 self._container_log_path = self.work_dir / ".container_logs" / "container.log"
                 self._container_log_file = open(self._container_log_path, "w", encoding="utf-8")  # noqa: SIM115
-                self._enroot_proc = subprocess.Popen(
-                    cmd,
-                    text=True,
+                self._enroot_proc = await asyncio.create_subprocess_exec(
+                    *cmd,
                     start_new_session=True,
                     stdout=self._container_log_file,
                     stderr=subprocess.STDOUT,
@@ -872,7 +868,7 @@ class InterpreterEnvState:
         label = self._enroot_label()
         diag = [f"attempt=#{attempt}", f"elapsed={launch_ms:.0f}ms", f"error={error!r}"]
         if self._enroot_proc is not None:
-            rc = self._enroot_proc.poll()
+            rc = self._enroot_proc.returncode
             diag.append(f"process_alive={rc is None}")
             if rc is not None:
                 diag.append(f"returncode={rc}")
@@ -920,7 +916,7 @@ class InterpreterEnvState:
             self._http_client = None
 
         if self._enroot_proc is not None:
-            _kill_process_group(self._enroot_proc, label=label)
+            await _kill_process_group(self._enroot_proc, label=label)
             self._enroot_proc = None
 
         self._close_container_log()
@@ -1085,7 +1081,7 @@ class InterpreterEnvState:
                 self._docker_client = None
 
             if self._enroot_proc is not None:
-                _kill_process_group(self._enroot_proc, label=self._enroot_label())
+                await _kill_process_group(self._enroot_proc, label=self._enroot_label())
                 self._enroot_proc = None
 
             self._close_container_log()
