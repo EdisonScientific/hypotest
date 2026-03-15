@@ -211,11 +211,13 @@ class KernelServer:
         language: NBLanguage,
         default_timeout: float = 600,
         startup_token: str = "",
+        safe_execute: bool = True,
     ):
         self.work_dir = work_dir
         self.language = language
         self.default_timeout = default_timeout
         self.startup_token = startup_token
+        self.safe_execute = safe_execute
 
         self._kernel_manager: AsyncKernelManager | None = None
         self._client: AsyncKernelClient | None = None
@@ -253,20 +255,21 @@ class KernelServer:
         if not self._client or not self._is_ready:
             raise RuntimeError("Kernel not ready")
 
-        # Defense-in-depth: lightweight regex safety check
-        block_reason = _kernel_check_code_safety(code)
-        if block_reason is not None:
-            logger.warning("Kernel safety block: %s code=%r", block_reason, code[:200])
-            error_output = MessageType.ERROR.to_notebook_output({
-                "ename": "SecurityError",
-                "evalue": block_reason,
-                "traceback": [f"SecurityError: {block_reason}"],
-            })
-            return ExecuteResponse(
-                notebook_outputs=[dict(error_output)] if error_output else [],
-                error_occurred=True,
-                execution_time=0.0,
-            )
+        if self.safe_execute:
+            # Defense-in-depth: lightweight regex safety check
+            block_reason = _kernel_check_code_safety(code)
+            if block_reason is not None:
+                logger.warning("Kernel safety block: %s code=%r", block_reason, code[:200])
+                error_output = MessageType.ERROR.to_notebook_output({
+                    "ename": "SecurityError",
+                    "evalue": block_reason,
+                    "traceback": [f"SecurityError: {block_reason}"],
+                })
+                return ExecuteResponse(
+                    notebook_outputs=[dict(error_output)] if error_output else [],
+                    error_occurred=True,
+                    execution_time=0.0,
+                )
 
         effective_timeout = timeout if timeout is not None else self.default_timeout
         start_time = time.perf_counter()
@@ -437,6 +440,7 @@ if __name__ == "__main__":
     parser.add_argument("--language", type=str, default="python", choices=["python", "r"])
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--startup-token", type=str, default="")
+    parser.add_argument("--safe-execute", action='store_true')
     args = parser.parse_args()
 
     language = NBLanguage.PYTHON if args.language == "python" else NBLanguage.R

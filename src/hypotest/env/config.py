@@ -58,6 +58,9 @@ class ExecutionConfig(BaseModel):
     force_submit_threshold: int = 10 * 60
     cell_execution_timeout: int = 15 * 60
 
+    # safety
+    safe_execute: bool = True
+
     # Capabilities
     has_gpu: bool = False
 

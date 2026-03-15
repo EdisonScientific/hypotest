@@ -312,9 +312,10 @@ def _prep_workspace_dir(work_dir: str, workspace_path: str = "/data_workspace") 
     },
 )
 class EnrootKernelServer:
-    def __init__(self, container_sqsh_path: Path, execution_timeout: float):
+    def __init__(self, container_sqsh_path: Path, execution_timeout: float, safe_execute: bool = True):
         self.container_sqsh_path = container_sqsh_path
         self.execution_timeout = execution_timeout
+        self.safe_execute = safe_execute
         self._enroot_proc: subprocess.Popen[str] | None = None
         self._http_client: httpx.AsyncClient | None = None
         self._container_port: int | None = None
@@ -328,7 +329,7 @@ class EnrootKernelServer:
         return f"enroot(port={port}, pid={pid})"
 
     @staticmethod
-    def _build_kernel_bash_script(node_workdir: str, language: NBLanguage, port: int, startup_token: str) -> str:
+    def _build_kernel_bash_script(node_workdir: str, language: NBLanguage, port: int, startup_token: str, safe_execute: bool = True) -> str:
         """Build the bash script that sets up the workspace and launches the kernel server."""
         return dedent(f"""\
             set -euo pipefail
@@ -360,7 +361,7 @@ class EnrootKernelServer:
                 --work_dir $WORKDIR \\
                 --language {language.value} \\
                 --port {port} \\
-                --startup-token {startup_token}
+                --startup-token {startup_token} {'--safe-execute' if safe_execute else ''}
         """).strip()
 
     @staticmethod
@@ -438,7 +439,7 @@ class EnrootKernelServer:
                 )
             self._container_port = await get_free_port()
 
-            bash = self._build_kernel_bash_script(node_workdir, language, self._container_port, startup_token)
+            bash = self._build_kernel_bash_script(node_workdir, language, self._container_port, startup_token, safe_execute=self.safe_execute)
             cmd = self._build_enroot_cmd(work_dir, kernel_server_path, bash, enroot_env, self.container_sqsh_path)
 
             async with CONTAINER_LAUNCH_SEM:
@@ -682,6 +683,7 @@ class InterpreterEnvState:
         work_dir: Path,
         language: NBLanguage,
         execution_timeout: int = 600,
+        safe_execute: bool = True,
         use_host_env_vars: bool = False,
         extra_envs: dict[str, str] | None = None,
         use_docker: bool = cfg.USE_DOCKER,
@@ -693,6 +695,7 @@ class InterpreterEnvState:
         self.work_dir = work_dir
         self.language = language
         self.execution_timeout = execution_timeout
+        self.safe_execute = safe_execute
         self.total_reward = 0.0
         self.use_host_env_vars = use_host_env_vars
         self.extra_envs = extra_envs or {}
@@ -750,7 +753,7 @@ class InterpreterEnvState:
             await self.interpreter.start()
 
     async def _start_ray_enroot_container(self) -> None:
-        self.kernel_container = EnrootKernelServer.remote(self.container_sqsh_path, self.execution_timeout)
+        self.kernel_container = EnrootKernelServer.remote(self.container_sqsh_path, self.execution_timeout, safe_execute=self.safe_execute)
         init_ref = self.kernel_container.initialize.remote(self.work_dir, self.language)
         await init_ref
 
@@ -787,7 +790,7 @@ class InterpreterEnvState:
                     --work_dir /data_workspace \\
                     --language {self.language.value} \\
                     --port {self._container_port} \\
-                    --startup-token {startup_token}
+                    --startup-token {startup_token} {'--safe-execute' if self.safe_execute else ''}
             """).strip()
 
             kernel_server_path = Path(__file__).parent / "kernel_server.py"
@@ -927,18 +930,22 @@ class InterpreterEnvState:
         self._container_port = await get_free_port()
         startup_token = str(uuid.uuid4())
 
+        cmd_list = [
+            "/app/kernel_env/bin/python",
+            "/envs/kernel_server.py",
+            "--work_dir",
+            "/data_workspace",
+            "--language",
+            self.language.value,
+            "--startup-token",
+            startup_token,
+        ]
+        if self.safe_execute:
+            cmd_list += ['--safe-execute']
+
         docker_config = {
             "Image": cfg.NB_ENVIRONMENT_DOCKER_IMAGE,
-            "Cmd": [
-                "/app/kernel_env/bin/python",
-                "/envs/kernel_server.py",
-                "--work_dir",
-                "/data_workspace",
-                "--language",
-                self.language.value,
-                "--startup-token",
-                startup_token,
-            ],
+            "Cmd": cmd_list,
             "HostConfig": {
                 "Binds": [f"{self.work_dir}:/data_workspace"],
                 "PortBindings": {f"{cfg.KERNEL_SERVER_PORT}/tcp": [{"HostPort": str(self._container_port)}]},
@@ -1177,26 +1184,29 @@ class InterpreterEnvState:
         Returns:
             Tuple of (ExecutionResult, actual_cell_index)
         """
-        block_reason = check_code_safety(code, self.language)
-        if block_reason is not None:
-            logger.warning("Blocked code execution in execute_and_add_cell: %s", block_reason)
-            error_output = nbformat.v4.new_output(
-                output_type="error",
-                ename="SecurityError",
-                evalue=block_reason,
-                traceback=[f"SecurityError: {block_reason}"],
-            )
-            result = ExecutionResult(
-                notebook_outputs=[error_output],
-                error_occurred=True,
-                execution_time=0.0,
-            )
-            if cell_idx is None or cell_idx >= len(self.nb.cells):
-                actual_idx = self._add_cell(code, result)
-            else:
-                self._update_cell(cell_idx, code, result)
-                actual_idx = cell_idx
-            return result, actual_idx
+        if self.safe_execute:
+            block_reason = check_code_safety(code, self.language)
+            if block_reason is not None:
+                logger.warning("Blocked code execution in execute_and_add_cell: %s", block_reason)
+                error_output = nbformat.v4.new_output(
+                    output_type="error",
+                    ename="SecurityError",
+                    evalue=block_reason,
+                    traceback=[f"SecurityError: {block_reason}"],
+                )
+                result = ExecutionResult(
+                    notebook_outputs=[error_output],
+                    error_occurred=True,
+                    execution_time=0.0,
+                )
+                if cell_idx is None or cell_idx >= len(self.nb.cells):
+                    actual_idx = self._add_cell(code, result)
+                else:
+                    self._update_cell(cell_idx, code, result)
+                    actual_idx = cell_idx
+                return result, actual_idx
+        else:
+            logger.warning("WARNING: You are running code sandbox with unsafe execution, this may result in destructive commands being run on the system")
 
         if self.use_ray and self.use_enroot:
             result_ref = self.kernel_container._execute_via_http.remote(code, timeout)
@@ -1312,6 +1322,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             work_dir=self.work_dir,
             language=self.language,
             execution_timeout=self.execution_timeout,
+            safe_execute=self.execution_config.safe_execute,
             use_host_env_vars=self.use_host_env_vars,
             extra_envs={
                 # Point to kernel environment's site-packages
