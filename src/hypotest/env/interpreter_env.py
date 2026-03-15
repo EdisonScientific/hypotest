@@ -286,7 +286,7 @@ class ProblemInstance(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def handle_language(cls, data: dict) -> dict:
-        if data["nb_primary_language"] is None:
+        if data.get("nb_primary_language", None) is None:
             data["nb_primary_language"] = str(NBLanguage.PYTHON)
         return data
 
