@@ -1207,7 +1207,7 @@ class InterpreterEnvState:
                     actual_idx = cell_idx
                 return result, actual_idx
         else:
-            logger.warning("WARNING: You are running code sandbox with unsafe execution, this may result in destructive commands being run on the system")
+            logger.warning("Running code sandbox without safety filter, may result in destructive code running on the node")
 
         if self.use_ray and self.use_enroot:
             result_ref = self.kernel_container._execute_via_http.remote(code, timeout)
