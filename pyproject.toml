@@ -33,6 +33,7 @@ dependencies = [
     "pillow",
     "pydantic",
     "tenacity>=8.0",
+    "ray",
 ]
 description = "hypotest package"
 keywords = []
