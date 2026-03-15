@@ -1480,7 +1480,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         This clears all variables and execution state.
         """
-        if self.state.use_ray:
+        if self.state.use_ray and self.state.kernel_container is not None:
             reset_ref = self.state.kernel_container._reset_via_http.remote()
             await reset_ref
         elif self.state.use_docker or self.state.use_enroot:
