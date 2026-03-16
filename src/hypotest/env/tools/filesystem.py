@@ -354,6 +354,14 @@ def list_dir_tool(
         max_files: Maximum number of files to display (default: 20)
         show_hidden: Whether to show hidden files starting with '.' (default: False)
     """
+    # LLM can sometimes generate string instead of int; fallback to default when typecast fails.
+    try:
+        max_files = int(max_files)
+    except ValueError:
+        max_files = 20
+
+    show_hidden = bool(show_hidden)
+    
     try:
         dir_path = Path(directory).resolve()
         if not dir_path.exists() or not dir_path.is_dir():
