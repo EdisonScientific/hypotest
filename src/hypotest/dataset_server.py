@@ -17,6 +17,7 @@ from datasets import load_dataset
 from lmi import LiteLLMModel
 from pydantic import BaseModel, ConfigDict, DirectoryPath, Field, FilePath, field_validator, model_validator
 
+from hypotest.env.config import ExecutionConfig
 from hypotest.env.interpreter_env import InterpreterEnv, InterpreterEnvConfig, ProblemInstance
 from hypotest.env.kernel_server import NBLanguage
 
@@ -42,7 +43,7 @@ class DatasetConfig(BaseModel):
     normalize_reward: bool = True
     save_dir: Path | None = None
 
-    execution_config: dict[str, Any]
+    execution_config: ExecutionConfig = Field(default_factory=ExecutionConfig)
 
     @model_validator(mode="after")
     def validate_dataset_source(self) -> Self:
