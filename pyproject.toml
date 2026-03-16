@@ -34,6 +34,7 @@ dependencies = [
     "numpy",
     "pillow",
     "pydantic",
+    "ray",
     "tenacity>=8.0",
 ]
 description = "hypotest package"
@@ -65,6 +66,9 @@ dev = [
     "types-PyYAML",
     "types-tqdm",
     "vcrpy>=8",  # Pin for dropping unused requests support
+]
+ray = [
+    "ray",
 ]
 
 [tool.codespell]

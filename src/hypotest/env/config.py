@@ -12,10 +12,13 @@ REQUIRED_PATH_ENV_VARS = os.getenv("REQUIRED_PATH_ENV_VARS", "PATH,PYTHONPATH,CU
 )
 NB_ENVIRONMENT_DOCKER_IMAGE = os.getenv("NB_ENVIRONMENT_DOCKER_IMAGE", "interpreter-env:latest")
 KERNEL_ENV_PATH = os.getenv("KERNEL_ENV_PATH", "/app/kernel_env")
+CONTAINER_WORKSPACE_PREFIX = os.getenv("CONTAINER_WORKSPACE_PREFIX", "/tmp/data_workspace")  # noqa: S108
 
 # Kernel server settings (for Docker-based execution)
 KERNEL_SERVER_PORT = 8000
-KERNEL_SERVER_STARTUP_TIMEOUT = 30.0  # seconds to wait for health check
+KERNEL_SERVER_STARTUP_TIMEOUT = float(
+    os.getenv("KERNEL_SERVER_STARTUP_TIMEOUT", "30.0")
+)  # seconds to wait for health check
 
 MAX_FILES_TO_UPLOAD = int(os.getenv("MAX_FILES_TO_UPLOAD", "100"))
 
@@ -55,6 +58,9 @@ class ExecutionConfig(BaseModel):
     warn_submit_threshold: int = 20 * 60
     force_submit_threshold: int = 10 * 60
     cell_execution_timeout: int = 15 * 60
+
+    # safety
+    safe_execute: bool = os.getenv("SAFE_EXECUTE_SANDBOX", "").lower() == "true"
 
     # Capabilities
     has_gpu: bool = False

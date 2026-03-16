@@ -17,6 +17,7 @@ from datasets import load_dataset
 from lmi import LiteLLMModel
 from pydantic import BaseModel, ConfigDict, DirectoryPath, Field, FilePath, field_validator, model_validator
 
+from hypotest.env.config import ExecutionConfig
 from hypotest.env.interpreter_env import InterpreterEnv, InterpreterEnvConfig, ProblemInstance
 from hypotest.env.kernel_server import NBLanguage
 
@@ -34,10 +35,15 @@ class DatasetConfig(BaseModel):
     )
 
     work_dir: Path | None = None
-    use_docker: bool = True
+    use_ray: bool = True
+    use_docker: bool = False
+    use_enroot: bool = True
+    container_sqsh_path: str | None = None
     force_python: bool = True
     normalize_reward: bool = True
     save_dir: Path | None = None
+
+    execution_config: ExecutionConfig = Field(default_factory=ExecutionConfig)
 
     @model_validator(mode="after")
     def validate_dataset_source(self) -> Self:
@@ -83,16 +89,17 @@ class Dataset(TaskDataset[InterpreterEnv]):
         if not capsule_path.exists():
             capsule_path = self.config.capsule_dir / f"CapsuleData-{problem.id}"
         problem_dir = Path(self.config.work_dir) / run_id if self.config.work_dir else Path(mkdtemp())
+        if problem_dir.exists():
+            shutil.rmtree(problem_dir)
         problem_dir.mkdir(parents=True, exist_ok=True)
         shutil.copytree(capsule_path, problem_dir, dirs_exist_ok=True)
 
         save_dir = Path(self.config.save_dir) / run_id if self.config.save_dir else None
 
         language = (
-            NBLanguage.PYTHON
-            if self.config.force_python
-            else NBLanguage.from_string(cast(str, problem.metadata.get("nb_primary_language", "python")).upper())
+            NBLanguage.PYTHON if self.config.force_python else NBLanguage.from_string(problem.nb_primary_language)
         )
+        language = language if language is not None else NBLanguage.PYTHON  # default auto language to python
 
         return InterpreterEnv(
             problem=problem,
@@ -104,6 +111,10 @@ class Dataset(TaskDataset[InterpreterEnv]):
 
     def __len__(self) -> int:
         return len(self.problems)
+
+
+HypotestDataset = Dataset
+HypotestDatasetConfig = DatasetConfig
 
 
 DEFAULT_SERVER_PORT = 8405
@@ -169,6 +180,7 @@ async def launch_server():
                     ],
                 },
                 use_docker=args.use_docker,
+                execution_config={"cell_execution_timeout": 600},
             ),
             port=args.port,
             api_key=args.api_key,
