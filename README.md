@@ -7,7 +7,17 @@ uv venv
 uv sync
 ```
 
-Place your problem JSONL file and capsule data directory somewhere accessible on your filesystem. You'll reference these paths in the server config.
+The dataset is available on HuggingFace: [`EdisonScientific/bixbench_hypothesis`](https://huggingface.co/datasets/EdisonScientific/bixbench_hypothesis).
+
+You'll also need the capsule data directory accessible on your filesystem.
+
+## Downloading Capsule Data
+
+The task capsule data is hosted on a public HuggingFace bucket:
+
+```bash
+hf sync hf://buckets/EdisonScientific/bixbench-hypothesis-capsules /path/to/capsules/
+```
 
 ## Running the Dataset Server
 
@@ -15,11 +25,21 @@ Create a `server.yaml` config file:
 
 ```yaml
 dataset:
-  problem_jsonl: /path/to/tasks.jsonl
+  hf_dataset: EdisonScientific/bixbench_hypothesis
   capsule_dir: /path/to/capsules/
   save_dir: /path/to/outputs/ # optional, for saving rollout artifacts
 
 api_key: YOUR_API_KEY # or env var name like HYPOTEST_SERVER_API_KEY
+```
+
+Alternatively, you can point to a local JSONL file instead of the HuggingFace dataset:
+
+```yaml
+dataset:
+  problem_jsonl: /path/to/tasks.jsonl
+  capsule_dir: /path/to/capsules/
+
+api_key: YOUR_API_KEY
 ```
 
 Start the server:
