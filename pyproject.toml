@@ -23,9 +23,11 @@ classifiers = [
 ]
 dependencies = [
     "aiodocker",
+    "datasets",
     "fhaviary[server,notebook]>=0.31.0",  # Pin for Message.is_multimodal fix
     "fhlmi",
     "httpx>=0.27",
+    "huggingface_hub>=1.7.1",
     "jupyter-client",
     "ldp",
     "nbformat",
@@ -111,6 +113,10 @@ warn_redundant_casts = true
 warn_unreachable = true
 warn_unused_configs = true
 warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+ignore_missing_imports = true
+module = "datasets"
 
 [tool.pylint]
 
