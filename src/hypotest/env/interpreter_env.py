@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from tempfile import mkdtemp
 from textwrap import dedent
@@ -71,6 +71,8 @@ MAX_CONTAINER_LAUNCH_RETRIES = int(os.getenv("MAX_CONTAINER_LAUNCH_RETRIES", "5"
 _RETRY_BASE_SLEEP = 1.0
 _RETRY_MAX_SLEEP = 16.0
 
+WARNED_UNSAFE_EXECUTION = False
+
 
 async def get_free_port() -> int:
     """Get a free port for the kernel server container."""
@@ -101,7 +103,7 @@ async def _poll_kernel_health(  # noqa: PLR0912
     enroot_proc: asyncio.subprocess.Process | None,
     container_port: int | None,
     expected_startup_token: str | None,
-    read_log_tail: Callable[[int], str],
+    read_log_tail: Callable[[int], Awaitable[str]],
     label: str,
 ) -> None:
     """Poll kernel server /health endpoint until ready, with token validation and timeout."""
@@ -123,7 +125,7 @@ async def _poll_kernel_health(  # noqa: PLR0912
         # Check if the enroot process has died before we even get an HTTP response
         if enroot_proc is not None and enroot_proc.returncode is not None:
             rc = enroot_proc.returncode
-            log_tail = read_log_tail(1000)
+            log_tail = await read_log_tail(1000)
             raise RuntimeError(
                 f"Enroot process exited prematurely with returncode={rc} after {elapsed:.1f}s. log: {log_tail!r}"
             )
@@ -194,7 +196,7 @@ async def _poll_kernel_health(  # noqa: PLR0912
             f"Port {container_port} health-check timed out with token_mismatch "
             f"({poll_count} polls, elapsed={total_elapsed:.1f}s)"
         )
-    log_tail = read_log_tail(500)
+    log_tail = await read_log_tail(500)
     raise TimeoutError(
         f"Kernel server did not become healthy within {cfg.KERNEL_SERVER_STARTUP_TIMEOUT}s "
         f"({poll_count} polls, last_status={last_status}, elapsed={total_elapsed:.1f}s)"
@@ -429,7 +431,7 @@ class EnrootKernelServer:
         while not online:
             attempt += 1
             if attempt > MAX_CONTAINER_LAUNCH_RETRIES:
-                log_tail = self._read_container_log_tail(500)
+                log_tail = await self._read_container_log_tail(500)
                 raise RuntimeError(
                     f"Container failed to start after {MAX_CONTAINER_LAUNCH_RETRIES} attempts "
                     f"(last_error={last_err!r})"
@@ -450,7 +452,9 @@ class EnrootKernelServer:
                 log_dir = work_dir / ".container_logs"
                 log_dir.mkdir(exist_ok=True)
                 self._container_log_path = log_dir / "container.log"
-                self._container_log_file = open(self._container_log_path, "w", encoding="utf-8")  # noqa: SIM115
+                self._container_log_file = await asyncio.to_thread(
+                    open, self._container_log_path, "w", encoding="utf-8"
+                )
                 self._enroot_proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     start_new_session=True,
@@ -488,13 +492,13 @@ class EnrootKernelServer:
             except Exception as e:
                 last_err = e
                 launch_ms = (time.perf_counter() - launch_t0) * 1000.0
-                self._log_container_failure(attempt, launch_ms, e)
+                await self._log_container_failure(attempt, launch_ms, e)
                 await self._cleanup_failed_startup()
                 if not isinstance(e, _PortCollisionError):
                     backoff = min(_RETRY_BASE_SLEEP * 2 ** (attempt - 1), _RETRY_MAX_SLEEP)
                     await asyncio.sleep(backoff)
 
-    def _log_container_failure(self, attempt: int, launch_ms: float, error: Exception) -> None:
+    async def _log_container_failure(self, attempt: int, launch_ms: float, error: Exception) -> None:
         """Log detailed diagnostics when a container fails to start."""
         label = self._proc_label()
         proc = self._enroot_proc
@@ -514,7 +518,7 @@ class EnrootKernelServer:
         logger.warning("[%s] Container startup FAILED: %s", label, ", ".join(diag_parts))
 
         # Log container output separately so tracebacks are readable
-        log_tail = self._read_container_log_tail()
+        log_tail = await self._read_container_log_tail()
         if log_tail:
             logger.warning(
                 "[%s] Container log output (last %d chars):\n%s",
@@ -523,25 +527,32 @@ class EnrootKernelServer:
                 log_tail,
             )
 
-    def _read_container_log_tail(self, max_chars: int = 2000) -> str:
+    async def _read_container_log_tail(self, max_chars: int = 2000) -> str:
         """Read the tail of the container log file for diagnostics."""
-        if self._container_log_path is None or not self._container_log_path.exists():
-            return ""
-        try:
-            # Flush so any buffered output is written to disk
-            if self._container_log_file and not self._container_log_file.closed:
-                self._container_log_file.flush()
-            text = self._container_log_path.read_text()
-            return text[-max_chars:] if len(text) > max_chars else text
-        except Exception:
-            return ""
+        def _read() -> str:
+            if self._container_log_path is None or not self._container_log_path.exists():
+                return ""
+            try:
+                if self._container_log_file and not self._container_log_file.closed:
+                    self._container_log_file.flush()
+                text = self._container_log_path.read_text()
+                return text[-max_chars:] if len(text) > max_chars else text
+            except Exception:
+                return ""
 
-    def _close_container_log(self) -> None:
+        return await asyncio.to_thread(_read)
+
+    async def _close_container_log(self) -> None:
         """Close the container log file handle."""
         if self._container_log_file is not None:
-            with contextlib.suppress(Exception):
-                self._container_log_file.close()
+            f = self._container_log_file
             self._container_log_file = None
+
+            def _do_close() -> None:
+                with contextlib.suppress(Exception):
+                    f.close()
+
+            await asyncio.to_thread(_do_close)
 
     async def _cleanup_failed_startup(self) -> None:
         """Best-effort cleanup for failed startup attempts before retrying."""
@@ -561,7 +572,7 @@ class EnrootKernelServer:
             await _kill_process_group(self._enroot_proc, label=label)
             self._enroot_proc = None
 
-        self._close_container_log()
+        await self._close_container_log()
 
     async def _wait_for_health(self, expected_startup_token: str | None = None) -> None:
         """Wait for the kernel server to become healthy."""
@@ -664,7 +675,7 @@ class EnrootKernelServer:
             await _kill_process_group(self._enroot_proc, label=label)
             self._enroot_proc = None
 
-        self._close_container_log()
+        await self._close_container_log()
         logger.log(_CONTAINER_LOG_LEVEL, "[%s] EnrootKernelServer closed", label)
 
 
@@ -751,8 +762,8 @@ class InterpreterEnvState:
             await self.interpreter.start()
 
     async def _start_ray_enroot_container(self) -> None:
-        self.kernel_container = EnrootKernelServer.remote(self.container_sqsh_path, self.execution_timeout, safe_execute=self.safe_execute)
-        init_ref = self.kernel_container.initialize.remote(self.work_dir, self.language)
+        self.kernel_container = EnrootKernelServer.remote(self.container_sqsh_path, self.execution_timeout, safe_execute=self.safe_execute)  # type: ignore[attr-defined]
+        init_ref = self.kernel_container.initialize.remote(self.work_dir, self.language)  # type: ignore[union-attr]
         await init_ref
 
     def _enroot_label(self) -> str:
@@ -769,7 +780,7 @@ class InterpreterEnvState:
         while not online:
             attempt += 1
             if attempt > MAX_CONTAINER_LAUNCH_RETRIES:
-                log_tail = self._read_container_log_tail(500)
+                log_tail = await self._read_container_log_tail(500)
                 raise RuntimeError(
                     f"Container failed to start after {MAX_CONTAINER_LAUNCH_RETRIES} attempts "
                     f"(last_error={last_err!r})"
@@ -819,7 +830,9 @@ class InterpreterEnvState:
                 # for detailed rationale on why we avoid subprocess.PIPE here).
                 (self.work_dir / ".container_logs").mkdir(exist_ok=True)
                 self._container_log_path = self.work_dir / ".container_logs" / "container.log"
-                self._container_log_file = open(self._container_log_path, "w", encoding="utf-8")  # noqa: SIM115
+                self._container_log_file = await asyncio.to_thread(
+                    open, self._container_log_path, "w", encoding="utf-8"
+                )
                 self._enroot_proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     start_new_session=True,
@@ -857,13 +870,13 @@ class InterpreterEnvState:
             except Exception as e:
                 last_err = e
                 launch_ms = (time.perf_counter() - launch_t0) * 1000.0
-                self._log_enroot_container_failure(attempt, launch_ms, e)
+                await self._log_enroot_container_failure(attempt, launch_ms, e)
                 await self._cleanup_failed_startup()
                 if not isinstance(e, _PortCollisionError):
                     backoff = min(_RETRY_BASE_SLEEP * 2 ** (attempt - 1), _RETRY_MAX_SLEEP)
                     await asyncio.sleep(backoff)
 
-    def _log_enroot_container_failure(self, attempt: int, launch_ms: float, error: Exception) -> None:
+    async def _log_enroot_container_failure(self, attempt: int, launch_ms: float, error: Exception) -> None:
         """Log detailed diagnostics when a container fails to start."""
         label = self._enroot_label()
         diag = [f"attempt=#{attempt}", f"elapsed={launch_ms:.0f}ms", f"error={error!r}"]
@@ -873,7 +886,7 @@ class InterpreterEnvState:
             if rc is not None:
                 diag.append(f"returncode={rc}")
         logger.warning("[%s] Container startup FAILED: %s", label, ", ".join(diag))
-        log_tail = self._read_container_log_tail()
+        log_tail = await self._read_container_log_tail()
         if log_tail:
             logger.warning(
                 "[%s] Container log output (last %d chars):\n%s",
@@ -882,24 +895,32 @@ class InterpreterEnvState:
                 log_tail,
             )
 
-    def _read_container_log_tail(self, max_chars: int = 2000) -> str:
+    async def _read_container_log_tail(self, max_chars: int = 2000) -> str:
         """Read the tail of the container log file for diagnostics."""
-        if self._container_log_path is None or not self._container_log_path.exists():
-            return ""
-        try:
-            if self._container_log_file and not self._container_log_file.closed:
-                self._container_log_file.flush()
-            text = self._container_log_path.read_text()
-            return text[-max_chars:] if len(text) > max_chars else text
-        except Exception:
-            return ""
+        def _read() -> str:
+            if self._container_log_path is None or not self._container_log_path.exists():
+                return ""
+            try:
+                if self._container_log_file and not self._container_log_file.closed:
+                    self._container_log_file.flush()
+                text = self._container_log_path.read_text()
+                return text[-max_chars:] if len(text) > max_chars else text
+            except Exception:
+                return ""
 
-    def _close_container_log(self) -> None:
+        return await asyncio.to_thread(_read)
+
+    async def _close_container_log(self) -> None:
         """Close the container log file handle."""
         if self._container_log_file is not None:
-            with contextlib.suppress(Exception):
-                self._container_log_file.close()
+            f = self._container_log_file
             self._container_log_file = None
+
+            def _do_close() -> None:
+                with contextlib.suppress(Exception):
+                    f.close()
+
+            await asyncio.to_thread(_do_close)
 
     async def _cleanup_failed_startup(self) -> None:
         """Best-effort cleanup for failed startup attempts before retrying."""
@@ -919,7 +940,7 @@ class InterpreterEnvState:
             await _kill_process_group(self._enroot_proc, label=label)
             self._enroot_proc = None
 
-        self._close_container_log()
+        await self._close_container_log()
 
     async def _start_docker_container(self) -> None:
         """Start a Docker container with the kernel server."""
@@ -1054,7 +1075,7 @@ class InterpreterEnvState:
 
         if self.use_ray and self.use_enroot:
             if self.kernel_container is not None:
-                close_ref = self.kernel_container.close.remote()
+                close_ref = self.kernel_container.close.remote()  # type: ignore[attr-defined]
                 await close_ref
                 self.kernel_container = None
 
@@ -1084,7 +1105,7 @@ class InterpreterEnvState:
                 await _kill_process_group(self._enroot_proc, label=self._enroot_label())
                 self._enroot_proc = None
 
-            self._close_container_log()
+            await self._close_container_log()
 
         elif self.interpreter is not None:
             await self.interpreter.close()
@@ -1181,6 +1202,7 @@ class InterpreterEnvState:
         Returns:
             Tuple of (ExecutionResult, actual_cell_index)
         """
+        global WARNED_UNSAFE_EXECUTION
         if self.safe_execute:
             block_reason = check_code_safety(code, self.language)
             if block_reason is not None:
@@ -1202,11 +1224,12 @@ class InterpreterEnvState:
                     self._update_cell(cell_idx, code, result)
                     actual_idx = cell_idx
                 return result, actual_idx
-        else:
+        elif not WARNED_UNSAFE_EXECUTION:
             logger.warning("Running code sandbox without safety filter, may result in destructive code running on the node")
+            WARNED_UNSAFE_EXECUTION = True
 
         if self.use_ray and self.use_enroot:
-            result_ref = self.kernel_container._execute_via_http.remote(code, timeout)
+            result_ref = self.kernel_container._execute_via_http.remote(code, timeout)  # type: ignore[union-attr]
             result = await result_ref
         elif self.use_docker or self.use_enroot:
             result = await self._execute_via_http(code, timeout)
@@ -1479,7 +1502,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         This clears all variables and execution state.
         """
         if self.state.use_ray and self.state.kernel_container is not None:
-            reset_ref = self.state.kernel_container._reset_via_http.remote()
+            reset_ref = self.state.kernel_container._reset_via_http.remote()  # type: ignore[attr-defined]
             await reset_ref
         elif self.state.use_docker or self.state.use_enroot:
             await self.state._reset_via_http()

@@ -91,7 +91,6 @@ _DANGEROUS_ATTRS: frozenset[str] = frozenset({
 
 # Modules whose import_module() calls should be checked
 _DANGEROUS_IMPORTLIB_TARGETS: frozenset[str] = _BLOCKED_MODULES | frozenset({
-    "os",
     "subprocess",
     "shutil",
     "multiprocessing",

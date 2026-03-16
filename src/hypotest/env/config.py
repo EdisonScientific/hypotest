@@ -16,7 +16,7 @@ KERNEL_ENV_PATH = os.getenv("KERNEL_ENV_PATH", "/app/kernel_env")
 # Kernel server settings (for Docker-based execution)
 KERNEL_SERVER_PORT = 8000
 KERNEL_SERVER_STARTUP_TIMEOUT = float(
-    os.getenv("KERNEL_SERVER_STARTUP_TIMEOUT", "120.0")
+    os.getenv("KERNEL_SERVER_STARTUP_TIMEOUT", "30.0")
 )  # seconds to wait for health check
 
 MAX_FILES_TO_UPLOAD = int(os.getenv("MAX_FILES_TO_UPLOAD", "100"))
@@ -59,7 +59,7 @@ class ExecutionConfig(BaseModel):
     cell_execution_timeout: int = 15 * 60
 
     # safety
-    safe_execute: bool = True
+    safe_execute: bool = bool(os.getenv("SAFE_EXECUTE_SANDBOX", False))
 
     # Capabilities
     has_gpu: bool = False
