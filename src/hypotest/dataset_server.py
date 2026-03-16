@@ -12,6 +12,8 @@ from uuid import UUID
 
 import yaml
 from aviary.core import TaskDataset, TaskDatasetServer
+from datasets import Dataset as HFDataset
+from datasets import load_dataset
 from lmi import LiteLLMModel
 from pydantic import BaseModel, ConfigDict, DirectoryPath, Field, FilePath, field_validator, model_validator
 
@@ -22,8 +24,10 @@ from hypotest.env.kernel_server import NBLanguage
 class HypotestDatasetConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    problem_jsonl: FilePath
+    problem_jsonl: FilePath | None = None
     capsule_dir: DirectoryPath
+    hf_dataset: str | None = None
+
     rubric_model: str = "openai/gpt-5"
     rubric_model_config: dict[str, str | list[Any]] = Field(
         default_factory=lambda: cast(dict[str, str | list[Any]], {"reasoning_effort": "medium"})
@@ -41,20 +45,34 @@ class HypotestDatasetConfig(BaseModel):
     execution_config: dict[str, Any]
 
     @model_validator(mode="after")
+    def validate_dataset_source(self) -> Self:
+        if not self.problem_jsonl and not self.hf_dataset:
+            raise ValueError("Either problem_jsonl or hf_dataset must be provided")
+        return self
+
+    @model_validator(mode="after")
     def make_dirs(self) -> Self:
         for d in (self.work_dir, self.save_dir):
             if d:
                 d.mkdir(parents=True, exist_ok=True)
         return self
 
+    def load_problems(self) -> list[ProblemInstance]:
+        if self.hf_dataset:
+            return self._load_from_hf()
+        assert self.problem_jsonl is not None
+        return [ProblemInstance.model_validate_json(line) for line in self.problem_jsonl.read_text().splitlines()]
+
+    def _load_from_hf(self) -> list[ProblemInstance]:
+        ds: HFDataset = load_dataset(self.hf_dataset, split="train")
+        return [ProblemInstance.model_validate(row) for row in ds]
+
 
 class HypotestDataset(TaskDataset[InterpreterEnv]):
     def __init__(self, config: HypotestDatasetConfig):
         self.config = config
 
-        self.problems = [
-            ProblemInstance.model_validate_json(line) for line in self.config.problem_jsonl.read_text().splitlines()
-        ]
+        self.problems = self.config.load_problems()
 
         self.rubric_model = LiteLLMModel(name=self.config.rubric_model, config=self.config.rubric_model_config)
 
@@ -122,6 +140,7 @@ async def launch_server():
     parser.add_argument("--port", type=int, default=DEFAULT_SERVER_PORT)
     parser.add_argument("--api-key", type=str, default=os.getenv("HYPOTEST_API_KEY"))
     parser.add_argument("--problem-jsonl", type=FilePath)
+    parser.add_argument("--hf-dataset", type=str)
     parser.add_argument("--capsule-dir", type=DirectoryPath)
     parser.add_argument("--rubric-model", type=str)
     parser.add_argument("--reasoning-effort", type=str, default="medium")
@@ -137,6 +156,7 @@ async def launch_server():
         config = ServerConfig(
             dataset=HypotestDatasetConfig(
                 problem_jsonl=args.problem_jsonl,
+                hf_dataset=args.hf_dataset,
                 capsule_dir=args.capsule_dir,
                 rubric_model=args.rubric_model,
                 rubric_model_config={
