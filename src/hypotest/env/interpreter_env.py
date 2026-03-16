@@ -71,7 +71,7 @@ MAX_CONTAINER_LAUNCH_RETRIES = int(os.getenv("MAX_CONTAINER_LAUNCH_RETRIES", "5"
 _RETRY_BASE_SLEEP = 1.0
 _RETRY_MAX_SLEEP = 16.0
 
-WARNED_UNSAFE_EXECUTION = False
+_warned_unsafe_execution: set[str] = set()
 
 
 async def get_free_port() -> int:
@@ -204,7 +204,9 @@ async def _poll_kernel_health(  # noqa: PLR0912
     )
 
 
-async def _kill_process_group(proc: asyncio.subprocess.Process, label: str = "enroot", sigterm_timeout: float = 15) -> None:
+async def _kill_process_group(
+    proc: asyncio.subprocess.Process, label: str = "enroot", sigterm_timeout: float = 15
+) -> None:
     """Safely terminate a process group, escalating from SIGTERM to SIGKILL.
 
     Handles all edge cases: already-dead process, missing process group, etc.
@@ -236,6 +238,14 @@ async def _kill_process_group(proc: asyncio.subprocess.Process, label: str = "en
 
     try:
         await asyncio.wait_for(proc.communicate(), timeout=sigterm_timeout)
+    except TimeoutError:
+        logger.warning(
+            "[%s] Process pid=%d did not exit within %.1fs of SIGTERM, sending SIGKILL",
+            label,
+            proc.pid,
+            sigterm_timeout,
+        )
+    else:
         logger.log(
             _CONTAINER_LOG_LEVEL,
             "[%s] Process pid=%d exited after SIGTERM with returncode=%d",
@@ -244,13 +254,6 @@ async def _kill_process_group(proc: asyncio.subprocess.Process, label: str = "en
             proc.returncode,
         )
         return
-    except asyncio.TimeoutError:
-        logger.warning(
-            "[%s] Process pid=%d did not exit within %.1fs of SIGTERM, sending SIGKILL",
-            label,
-            proc.pid,
-            sigterm_timeout,
-        )
 
     # SIGKILL the whole group
     try:
@@ -268,7 +271,7 @@ async def _kill_process_group(proc: asyncio.subprocess.Process, label: str = "en
             proc.pid,
             proc.returncode,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.exception("[%s] Process pid=%d still alive after SIGKILL — possible zombie", label, proc.pid)
 
 
@@ -286,7 +289,7 @@ class ProblemInstance(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def handle_language(cls, data: dict) -> dict:
-        if data.get("nb_primary_language", None) is None:
+        if data.get("nb_primary_language") is None:
             data["nb_primary_language"] = str(NBLanguage.PYTHON)
         return data
 
@@ -329,7 +332,9 @@ class EnrootKernelServer:
         return f"enroot(port={port}, pid={pid})"
 
     @staticmethod
-    def _build_kernel_bash_script(node_workdir: str, language: NBLanguage, port: int, startup_token: str, safe_execute: bool = True) -> str:
+    def _build_kernel_bash_script(
+        node_workdir: str, language: NBLanguage, port: int, startup_token: str, safe_execute: bool = True
+    ) -> str:
         """Build the bash script that sets up the workspace and launches the kernel server."""
         return dedent(f"""\
             set -euo pipefail
@@ -361,7 +366,7 @@ class EnrootKernelServer:
                 --work_dir $WORKDIR \\
                 --language {language.value} \\
                 --port {port} \\
-                --startup-token {startup_token} {'--safe-execute' if safe_execute else ''}
+                --startup-token {startup_token} {"--safe-execute" if safe_execute else ""}
         """).strip()
 
     @staticmethod
@@ -416,7 +421,7 @@ class EnrootKernelServer:
 
     async def initialize(self, work_dir: Path, language: NBLanguage) -> None:
         startup_token = str(uuid.uuid4())
-        node_workdir = f"/tmp/data_workspace.{startup_token.split('-', maxsplit=1)[0]}"
+        node_workdir = f"{cfg.CONTAINER_WORKSPACE_PREFIX}.{startup_token.split('-', maxsplit=1)[0]}"
 
         _prep_workspace_dir(str(work_dir), workspace_path=node_workdir)
 
@@ -439,7 +444,9 @@ class EnrootKernelServer:
                 )
             self._container_port = await get_free_port()
 
-            bash = self._build_kernel_bash_script(node_workdir, language, self._container_port, startup_token, safe_execute=self.safe_execute)
+            bash = self._build_kernel_bash_script(
+                node_workdir, language, self._container_port, startup_token, safe_execute=self.safe_execute
+            )
             cmd = self._build_enroot_cmd(work_dir, kernel_server_path, bash, enroot_env, self.container_sqsh_path)
 
             async with CONTAINER_LAUNCH_SEM:
@@ -529,6 +536,7 @@ class EnrootKernelServer:
 
     async def _read_container_log_tail(self, max_chars: int = 2000) -> str:
         """Read the tail of the container log file for diagnostics."""
+
         def _read() -> str:
             if self._container_log_path is None or not self._container_log_path.exists():
                 return ""
@@ -762,7 +770,9 @@ class InterpreterEnvState:
             await self.interpreter.start()
 
     async def _start_ray_enroot_container(self) -> None:
-        self.kernel_container = EnrootKernelServer.remote(self.container_sqsh_path, self.execution_timeout, safe_execute=self.safe_execute)  # type: ignore[attr-defined]
+        self.kernel_container = EnrootKernelServer.remote(  # type: ignore[attr-defined]
+            self.container_sqsh_path, self.execution_timeout, safe_execute=self.safe_execute
+        )
         init_ref = self.kernel_container.initialize.remote(self.work_dir, self.language)  # type: ignore[union-attr]
         await init_ref
 
@@ -799,7 +809,7 @@ class InterpreterEnvState:
                     --work_dir /data_workspace \\
                     --language {self.language.value} \\
                     --port {self._container_port} \\
-                    --startup-token {startup_token} {'--safe-execute' if self.safe_execute else ''}
+                    --startup-token {startup_token} {"--safe-execute" if self.safe_execute else ""}
             """).strip()
 
             kernel_server_path = Path(__file__).parent / "kernel_server.py"
@@ -897,6 +907,7 @@ class InterpreterEnvState:
 
     async def _read_container_log_tail(self, max_chars: int = 2000) -> str:
         """Read the tail of the container log file for diagnostics."""
+
         def _read() -> str:
             if self._container_log_path is None or not self._container_log_path.exists():
                 return ""
@@ -959,7 +970,7 @@ class InterpreterEnvState:
             startup_token,
         ]
         if self.safe_execute:
-            cmd_list += ['--safe-execute']
+            cmd_list += ["--safe-execute"]
 
         docker_config = {
             "Image": cfg.NB_ENVIRONMENT_DOCKER_IMAGE,
@@ -1202,7 +1213,6 @@ class InterpreterEnvState:
         Returns:
             Tuple of (ExecutionResult, actual_cell_index)
         """
-        global WARNED_UNSAFE_EXECUTION
         if self.safe_execute:
             block_reason = check_code_safety(code, self.language)
             if block_reason is not None:
@@ -1224,9 +1234,11 @@ class InterpreterEnvState:
                     self._update_cell(cell_idx, code, result)
                     actual_idx = cell_idx
                 return result, actual_idx
-        elif not WARNED_UNSAFE_EXECUTION:
-            logger.warning("Running code sandbox without safety filter, may result in destructive code running on the node")
-            WARNED_UNSAFE_EXECUTION = True
+        elif "unsafe_execution" not in _warned_unsafe_execution:
+            logger.warning(
+                "Running code sandbox without safety filter, may result in destructive code running on the node"
+            )
+            _warned_unsafe_execution.add("unsafe_execution")
 
         if self.use_ray and self.use_enroot:
             result_ref = self.kernel_container._execute_via_http.remote(code, timeout)  # type: ignore[union-attr]

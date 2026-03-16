@@ -440,7 +440,7 @@ if __name__ == "__main__":
     parser.add_argument("--language", type=str, default="python", choices=["python", "r"])
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--startup-token", type=str, default="")
-    parser.add_argument("--safe-execute", action='store_true')
+    parser.add_argument("--safe-execute", action="store_true")
     args = parser.parse_args()
 
     language = NBLanguage.PYTHON if args.language == "python" else NBLanguage.R

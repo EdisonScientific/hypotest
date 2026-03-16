@@ -361,7 +361,7 @@ def list_dir_tool(
         max_files = 20
 
     show_hidden = bool(show_hidden)
-    
+
     try:
         dir_path = Path(directory).resolve()
         if not dir_path.exists() or not dir_path.is_dir():

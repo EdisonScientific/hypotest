@@ -34,8 +34,8 @@ dependencies = [
     "numpy",
     "pillow",
     "pydantic",
-    "tenacity>=8.0",
     "ray",
+    "tenacity>=8.0",
 ]
 description = "hypotest package"
 keywords = []

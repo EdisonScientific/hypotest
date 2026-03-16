@@ -10,12 +10,10 @@ from __future__ import annotations
 import ast
 import logging
 import re
-from typing import TYPE_CHECKING
+
+from .kernel_server import NBLanguage
 
 logger = logging.getLogger(__name__)
-
-if TYPE_CHECKING:
-    from .kernel_server import NBLanguage
 
 
 # ---------------------------------------------------------------------------
@@ -371,8 +369,6 @@ def check_code_safety(code: str, language: NBLanguage) -> str | None:
     Returns:
         None if the code is safe, or a category-level error message if blocked.
     """
-    from .kernel_server import NBLanguage
-
     # Bash-level patterns apply to both languages
     bash_result = _check_bash_patterns(code)
     if bash_result is not None:

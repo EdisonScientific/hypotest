@@ -21,7 +21,7 @@ from hypotest.env.interpreter_env import InterpreterEnv, InterpreterEnvConfig, P
 from hypotest.env.kernel_server import NBLanguage
 
 
-class HypotestDatasetConfig(BaseModel):
+class DatasetConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     problem_jsonl: FilePath | None = None
@@ -68,8 +68,8 @@ class HypotestDatasetConfig(BaseModel):
         return [ProblemInstance.model_validate(row) for row in ds]
 
 
-class HypotestDataset(TaskDataset[InterpreterEnv]):
-    def __init__(self, config: HypotestDatasetConfig):
+class Dataset(TaskDataset[InterpreterEnv]):
+    def __init__(self, config: DatasetConfig):
         self.config = config
 
         self.problems = self.config.load_problems()
@@ -98,6 +98,7 @@ class HypotestDataset(TaskDataset[InterpreterEnv]):
         language = (
             NBLanguage.PYTHON if self.config.force_python else NBLanguage.from_string(problem.nb_primary_language)
         )
+        language = language if language is not None else NBLanguage.PYTHON  # default auto language to python
 
         return InterpreterEnv(
             problem=problem,
@@ -111,13 +112,17 @@ class HypotestDataset(TaskDataset[InterpreterEnv]):
         return len(self.problems)
 
 
+HypotestDataset = Dataset
+HypotestDatasetConfig = DatasetConfig
+
+
 DEFAULT_SERVER_PORT = 8405
 
 
 class ServerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    dataset: HypotestDatasetConfig
+    dataset: DatasetConfig
     api_key: str = Field(
         description="API key to access the server; passed either by value or as an environment variable."
     )
@@ -154,7 +159,7 @@ async def launch_server():
         config = ServerConfig.model_validate(yaml.safe_load(args.config.read_text()))
     else:
         config = ServerConfig(
-            dataset=HypotestDatasetConfig(
+            dataset=DatasetConfig(
                 problem_jsonl=args.problem_jsonl,
                 hf_dataset=args.hf_dataset,
                 capsule_dir=args.capsule_dir,
@@ -180,7 +185,7 @@ async def launch_server():
             api_key=args.api_key,
         )
 
-    dataset = HypotestDataset(config.dataset)
+    dataset = Dataset(config.dataset)
     server = TaskDatasetServer(dataset, port=config.port, api_key=config.api_key)
 
     ip_address = socket.gethostbyname(socket.gethostname())
