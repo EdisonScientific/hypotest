@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import os
+import logging
 import random
 import shutil
 import socket
@@ -20,6 +21,8 @@ from pydantic import BaseModel, ConfigDict, DirectoryPath, Field, FilePath, fiel
 from hypotest.env.config import ExecutionConfig
 from hypotest.env.interpreter_env import InterpreterEnv, InterpreterEnvConfig, ProblemInstance
 from hypotest.env.kernel_server import NBLanguage
+
+logger = logging.getLogger(__name__)
 
 
 class DatasetConfig(BaseModel):
@@ -78,20 +81,58 @@ class Dataset(TaskDataset[InterpreterEnv]):
         self.rubric_model = LiteLLMModel(name=self.config.rubric_model, config=self.config.rubric_model_config)
 
         self.problem_counter: Counter[UUID] = Counter()
+        logger.error('=' * 100)
+
+    def _max_existing_problem_iter(self, problem_id: UUID) -> int:
+        max_existing_iter = -1
+        prefix = f"{problem_id}-iter"
+        for root in (self.config.work_dir, self.config.save_dir):
+            if root is None or not root.exists():
+                continue
+            for candidate in root.glob(f"{problem_id}-iter*"):
+                suffix = candidate.name.removeprefix(prefix)
+                if suffix.isdigit():
+                    max_existing_iter = max(max_existing_iter, int(suffix))
+        return max_existing_iter
+
+    def _reserve_run_id(self, problem: ProblemInstance) -> str:
+        problem_count = self.problem_counter[problem.id]
+        max_existing_iter = self._max_existing_problem_iter(problem.id)
+        if max_existing_iter >= problem_count:
+            logger.warning(
+                "Found existing workspace/save data for problem %s up to iter%d; bumping counter from %d to %d",
+                problem.id,
+                max_existing_iter,
+                problem_count,
+                max_existing_iter + 1,
+            )
+            problem_count = max_existing_iter + 1
+
+        while True:
+            run_id = f"{problem.id}-iter{problem_count}"
+            problem_dir = Path(self.config.work_dir) / run_id if self.config.work_dir else None
+            save_dir = Path(self.config.save_dir) / run_id if self.config.save_dir else None
+            if (problem_dir is None or not problem_dir.exists()) and (save_dir is None or not save_dir.exists()):
+                self.problem_counter[problem.id] = problem_count + 1
+                return run_id
+
+            problem_count += 1
+            logger.warning("run_id collision for problem %s; retrying with iter%d", problem.id, problem_count)
 
     def get_new_env_by_idx(self, idx: int) -> InterpreterEnv:
         problem = self.problems[idx]
-        problem_count = self.problem_counter[problem.id]
-        self.problem_counter[problem.id] += 1
-        run_id = f"{problem.id}-iter{problem_count}"
+        run_id = self._reserve_run_id(problem)
 
         capsule_path = self.config.capsule_dir / problem.input_data_path
         if not capsule_path.exists():
             capsule_path = self.config.capsule_dir / f"CapsuleData-{problem.id}"
-        problem_dir = Path(self.config.work_dir) / run_id if self.config.work_dir else Path(mkdtemp())
-        if problem_dir.exists():
-            shutil.rmtree(problem_dir)
-        problem_dir.mkdir(parents=True, exist_ok=True)
+            if not capsule_path.exists():
+                capsule_path = self.config.capsule_dir / f"capsule_{problem.id}"
+        if self.config.work_dir:
+            problem_dir = Path(self.config.work_dir) / run_id
+            problem_dir.mkdir(parents=True, exist_ok=False)
+        else:
+            problem_dir = Path(mkdtemp())
         shutil.copytree(capsule_path, problem_dir, dirs_exist_ok=True)
 
         save_dir = Path(self.config.save_dir) / run_id if self.config.save_dir else None

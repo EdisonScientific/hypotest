@@ -48,7 +48,7 @@ from .code_safety import check_code_safety
 from .config import ExecutionConfig
 from .interpreter import ExecutionResult, Interpreter
 from .prompts import CORRECT_MSG, HYPOTHESIS_TASK_DESC, INCORRECT_MSG, RUBRIC_SCORE_PROMPT, PromptingConfig
-from .tools.filesystem import FilesystemTool
+from .tools.filesystem import FilesystemTool, list_dir_tool
 from .utils import NBLanguage, view_notebook
 
 RAY_INSTALLED = True
@@ -70,8 +70,40 @@ CONTAINER_LAUNCH_SEM = asyncio.Semaphore(128)
 MAX_CONTAINER_LAUNCH_RETRIES = int(os.getenv("MAX_CONTAINER_LAUNCH_RETRIES", "5"))
 _RETRY_BASE_SLEEP = 1.0
 _RETRY_MAX_SLEEP = 16.0
+MAX_RAY_RESULT_WAIT_RETRIES = int(os.getenv("MAX_RAY_RESULT_WAIT_RETRIES", "3"))
+_RAY_RESULT_WAIT_TIMEOUT_GRACE = float(os.getenv("RAY_RESULT_WAIT_TIMEOUT_GRACE", "30"))
+_LIST_DIR_RAY_TIMEOUT = float(os.getenv("LIST_DIR_RAY_TIMEOUT", "30"))
 
 _warned_unsafe_execution: set[str] = set()
+_BACKGROUND_CLEANUP_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _make_cleanup_path(path: Path) -> Path:
+    return path.with_name(f".cleanup-{path.name}-{uuid.uuid4().hex}")
+
+
+def _detach_dir_for_cleanup(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+
+    cleanup_path = _make_cleanup_path(path)
+    while cleanup_path.exists():
+        cleanup_path = _make_cleanup_path(path)
+
+    path.replace(cleanup_path)
+    return cleanup_path
+
+
+def _schedule_dir_cleanup(path: Path) -> None:
+    async def _cleanup() -> None:
+        try:
+            await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)
+        except Exception:
+            logger.warning("Background cleanup failed for %s", path, exc_info=True)
+
+    task = asyncio.create_task(_cleanup())
+    _BACKGROUND_CLEANUP_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_CLEANUP_TASKS.discard)
 
 
 async def get_free_port() -> int:
@@ -310,6 +342,7 @@ def _prep_workspace_dir(work_dir: str, workspace_path: str = "/data_workspace") 
 
 @ray.remote(
     scheduling_strategy="SPREAD",
+    max_concurrency=1,
     runtime_env={
         "py_executable": sys.executable,
     },
@@ -324,12 +357,38 @@ class EnrootKernelServer:
         self._container_port: int | None = None
         self._container_log_path: Path | None = None
         self._container_log_file: Any | None = None
+        self._node_workdir: Path | None = None
 
     def _proc_label(self) -> str:
         """Short label for log messages identifying this container."""
         port = self._container_port or "?"
         pid = self._enroot_proc.pid if self._enroot_proc else "?"
         return f"enroot(port={port}, pid={pid})"
+
+    def _require_node_workdir(self) -> Path:
+        if self._node_workdir is None:
+            raise RuntimeError("Node-local workspace is not initialized")
+        return self._node_workdir
+
+    def _normalize_node_workspace_path(self, directory: str) -> Path:
+        workspace_root = self._require_node_workdir().resolve()
+        requested = Path(directory)
+        workspace_alias = Path("/data_workspace")
+
+        if requested.is_absolute():
+            if requested == workspace_alias or workspace_alias in requested.parents:
+                candidate = workspace_root / requested.relative_to(workspace_alias)
+            elif requested == workspace_root or workspace_root in requested.parents:
+                candidate = requested
+            else:
+                raise ValueError("Path must stay within the workspace root")
+        else:
+            candidate = workspace_root / requested
+
+        candidate = candidate.resolve()
+        if candidate != workspace_root and workspace_root not in candidate.parents:
+            raise ValueError("Path must stay within the workspace root")
+        return candidate
 
     @staticmethod
     def _build_kernel_bash_script(
@@ -392,6 +451,7 @@ class EnrootKernelServer:
     @staticmethod
     def _build_enroot_cmd(
         work_dir: Path,
+        node_workdir: Path,
         kernel_server_path: Path,
         bash: str,
         enroot_env: dict[str, str],
@@ -412,6 +472,8 @@ class EnrootKernelServer:
             "--mount",
             f"{work_dir}:/data_workspace",
             "--mount",
+            f"{node_workdir.resolve()}:{node_workdir}",
+            "--mount",
             f"{kernel_server_path.resolve()}:/envs/kernel_server.py",
             str(container_sqsh_path.resolve()),
             "/bin/bash",
@@ -421,9 +483,11 @@ class EnrootKernelServer:
 
     async def initialize(self, work_dir: Path, language: NBLanguage) -> None:
         startup_token = str(uuid.uuid4())
-        node_workdir = f"{cfg.CONTAINER_WORKSPACE_PREFIX}.{startup_token.split('-', maxsplit=1)[0]}"
+        node_workdir = Path(f"{cfg.CONTAINER_WORKSPACE_PREFIX}.{startup_token.split('-', maxsplit=1)[0]}")
+        self._node_workdir = node_workdir
 
-        _prep_workspace_dir(str(work_dir), workspace_path=node_workdir)
+        _prep_workspace_dir(str(work_dir), workspace_path=str(node_workdir))
+        logger.warning("[ray-enroot] prepared node-local workspace %s for host work_dir=%s", node_workdir, work_dir)
 
         kernel_server_path = Path(__file__).parent / "kernel_server.py"
         assert kernel_server_path.is_file(), f"kernel server must be a valid path, found {kernel_server_path}"
@@ -444,10 +508,18 @@ class EnrootKernelServer:
                 )
             self._container_port = await get_free_port()
 
+            await asyncio.to_thread(node_workdir.mkdir, parents=True, exist_ok=True)
             bash = self._build_kernel_bash_script(
-                node_workdir, language, self._container_port, startup_token, safe_execute=self.safe_execute
+                str(node_workdir), language, self._container_port, startup_token, safe_execute=self.safe_execute
             )
-            cmd = self._build_enroot_cmd(work_dir, kernel_server_path, bash, enroot_env, self.container_sqsh_path)
+            cmd = self._build_enroot_cmd(
+                work_dir,
+                node_workdir,
+                kernel_server_path,
+                bash,
+                enroot_env,
+                self.container_sqsh_path,
+            )
 
             async with CONTAINER_LAUNCH_SEM:
                 launch_t0 = time.perf_counter()
@@ -582,6 +654,9 @@ class EnrootKernelServer:
 
         await self._close_container_log()
 
+        if self._node_workdir is not None:
+            await asyncio.to_thread(shutil.rmtree, self._node_workdir, ignore_errors=True)
+
     async def _wait_for_health(self, expected_startup_token: str | None = None) -> None:
         """Wait for the kernel server to become healthy."""
         assert self._http_client is not None
@@ -594,7 +669,7 @@ class EnrootKernelServer:
             label=self._proc_label(),
         )
 
-    async def _execute_via_http(self, code: str, timeout: float | None = None) -> ExecutionResult:  # noqa: ASYNC109
+    async def _execute_via_http(self, code: str, timeout: float | None = None, req_uuid: str = "") -> ExecutionResult:  # noqa: ASYNC109
         """Execute code via HTTP to the containerized kernel server.
 
         Handles httpx.TimeoutException (including ReadTimeout) by converting to
@@ -605,12 +680,14 @@ class EnrootKernelServer:
         assert self._http_client is not None
 
         try:
+            logger.error(f"req {req_uuid} starting execute query")
             response = await self._http_client.post(
                 "/execute",
                 json={"code": code, "timeout": timeout},
             )
             response.raise_for_status()
         except httpx.TimeoutException as e:
+            logger.error(f"req {req_uuid} hitting timeout")
             effective_timeout = timeout if timeout is not None else self.execution_timeout
             logger.warning(
                 "[%s] HTTP %s during /execute (requested kernel timeout=%.1fs): %s",
@@ -631,11 +708,14 @@ class EnrootKernelServer:
                 execution_time=effective_timeout,
             )
 
+        logger.error(f"req {req_uuid} getting response data")
         data = response.json()
 
         # Convert serialized outputs back to NotebookNode
+        logger.error(f"req {req_uuid} parsing data into nb outputs")
         notebook_outputs = [nbformat.from_dict(o) for o in data["notebook_outputs"]]
 
+        logger.error(f"req {req_uuid} building execution results")
         return ExecutionResult(
             notebook_outputs=notebook_outputs,
             error_occurred=data["error_occurred"],
@@ -656,6 +736,51 @@ class EnrootKernelServer:
                 e,
             )
             raise RuntimeError(f"Kernel reset timed out: {e}") from e
+
+    async def _list_dir_on_node(
+        self,
+        directory: str = ".",
+        max_files: int = 20,
+        show_hidden: bool = False,
+        req_uuid: str = "",
+    ) -> str:
+        """List contents of a directory with truncation protection.
+
+        Recursively lists files in a directory, with built-in protection against
+        overwhelming the context with too many files. Use this tool instead of
+        writing code to list directories to avoid context bloat.
+
+        Usage Examples:
+            list_dir()                      # List working directory
+            list_dir("data/")               # List specific folder
+            list_dir(max_files=50)          # Show more files
+            list_dir(show_hidden=True)      # Include hidden files
+
+        Args:
+            directory: Directory path to list (default: current working directory)
+            max_files: Maximum number of files to display (default: 20)
+            show_hidden: Whether to show hidden files starting with '.' (default: False)
+        """
+        if req_uuid:
+            logger.error(f"req {req_uuid} listing node directory {directory}")
+
+        try:
+            normalized = self._normalize_node_workspace_path(directory)
+        except ValueError:
+            return f"Path must stay within the workspace root: {directory}"
+        except Exception as e:
+            return f"Error listing directory: {e!s}"
+
+        result = await asyncio.to_thread(
+            list_dir_tool,
+            str(normalized),
+            max_files=max_files,
+            show_hidden=show_hidden,
+        )
+
+        if req_uuid:
+            logger.error(f"req {req_uuid} finished listing node directory {directory}")
+        return result
 
     async def close(self):
         label = self._proc_label()
@@ -684,6 +809,11 @@ class EnrootKernelServer:
             self._enroot_proc = None
 
         await self._close_container_log()
+
+        if self._node_workdir is not None:
+            await asyncio.to_thread(shutil.rmtree, self._node_workdir, ignore_errors=True)
+            self._node_workdir = None
+
         logger.log(_CONTAINER_LOG_LEVEL, "[%s] EnrootKernelServer closed", label)
 
 
@@ -770,11 +900,69 @@ class InterpreterEnvState:
             await self.interpreter.start()
 
     async def _start_ray_enroot_container(self) -> None:
+        logger.warning("[ray-enroot] creating actor for work_dir=%s", self.work_dir)
         self.kernel_container = EnrootKernelServer.remote(  # type: ignore[attr-defined]
             self.container_sqsh_path, self.execution_timeout, safe_execute=self.safe_execute
         )
+        logger.warning("[ray-enroot] actor created, calling initialize for work_dir=%s", self.work_dir)
         init_ref = self.kernel_container.initialize.remote(self.work_dir, self.language)  # type: ignore[union-attr]
-        await init_ref
+        await self._await_ray_ref(
+            init_ref,
+            timeout=cfg.KERNEL_SERVER_STARTUP_TIMEOUT,
+            req_uuid=f"init:{self.work_dir.name}",
+            operation="initialize",
+            max_retries=1,
+        )
+        logger.warning("[ray-enroot] initialize complete for work_dir=%s", self.work_dir)
+
+    async def _await_ray_ref(
+        self,
+        ref: Awaitable[Any],
+        *,
+        timeout: float | None,
+        req_uuid: str,
+        operation: str,
+        max_retries: int = MAX_RAY_RESULT_WAIT_RETRIES,
+    ) -> Any:
+        effective_timeout = timeout if timeout is not None else self.execution_timeout
+        wait_timeout = effective_timeout + _RAY_RESULT_WAIT_TIMEOUT_GRACE
+        last_timeout: TimeoutError | None = None
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                return await asyncio.wait_for(asyncio.shield(ref), timeout=wait_timeout)
+            except TimeoutError as exc:
+                last_timeout = exc
+                if attempt >= max_retries:
+                    logger.error(
+                        "[ray-enroot] req %s exhausted waits for %s on work_dir=%s "
+                        "(attempts=%d, timeout_per_attempt=%.1fs)",
+                        req_uuid,
+                        operation,
+                        self.work_dir,
+                        max_retries,
+                        wait_timeout,
+                    )
+                    break
+
+                backoff = min(_RETRY_BASE_SLEEP * 2 ** (attempt - 1), _RETRY_MAX_SLEEP)
+                logger.warning(
+                    "[ray-enroot] req %s timed out waiting for %s on work_dir=%s "
+                    "(attempt #%d/%d, timeout=%.1fs); retrying in %.1fs",
+                    req_uuid,
+                    operation,
+                    self.work_dir,
+                    attempt,
+                    max_retries,
+                    wait_timeout,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+
+        raise TimeoutError(
+            f"Timed out waiting for ray {operation} after {max_retries} attempts "
+            f"(req={req_uuid}, timeout_per_attempt={wait_timeout:.1f}s)"
+        ) from last_timeout
 
     def _enroot_label(self) -> str:
         port = self._container_port or "?"
@@ -1079,11 +1267,6 @@ class InterpreterEnvState:
         """Save the notebook and close the interpreter or container."""
         nbformat.write(self.nb, self.work_dir / "notebook.ipynb")
 
-        if self.save_dir is not None:
-            shutil.rmtree(self.save_dir, ignore_errors=True)
-            self.save_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(self.work_dir, self.save_dir)
-
         if self.use_ray and self.use_enroot:
             if self.kernel_container is not None:
                 close_ref = self.kernel_container.close.remote()  # type: ignore[attr-defined]
@@ -1121,8 +1304,30 @@ class InterpreterEnvState:
         elif self.interpreter is not None:
             await self.interpreter.close()
 
-        if self.save_dir is None and self.work_dir.exists():
-            shutil.rmtree(self.work_dir, ignore_errors=True)
+        if self.save_dir is not None and self.work_dir.exists():
+            self.save_dir.parent.mkdir(parents=True, exist_ok=True)
+            if self.save_dir.exists():
+                try:
+                    cleanup_path = _detach_dir_for_cleanup(self.save_dir)
+                except Exception as e:
+                    logger.warning("Failed to detach existing save_dir %s for cleanup: %s", self.save_dir, e)
+                else:
+                    if cleanup_path is not None:
+                        logger.warning("Detached existing save_dir %s to %s for background cleanup", self.save_dir, cleanup_path)
+                        _schedule_dir_cleanup(cleanup_path)
+            try:
+                self.work_dir.replace(self.save_dir)
+            except Exception as e:
+                logger.warning("Failed to move work_dir %s to save_dir %s: %s", self.work_dir, self.save_dir, e)
+        elif self.work_dir.exists():
+            try:
+                cleanup_path = _detach_dir_for_cleanup(self.work_dir)
+            except Exception as e:
+                logger.warning("Failed to detach workspace %s for background cleanup: %s", self.work_dir, e)
+            else:
+                if cleanup_path is not None:
+                    logger.warning("Detached workspace %s to %s for background cleanup", self.work_dir, cleanup_path)
+                    _schedule_dir_cleanup(cleanup_path)
 
     def _add_cell(self, code: str, result: "ExecutionResult") -> int:
         """Add a new code cell to the notebook with execution results.
@@ -1202,6 +1407,7 @@ class InterpreterEnvState:
         code: str,
         cell_idx: int | None = None,
         timeout: float | None = None,  # noqa: ASYNC109
+        req_uuid: str = "",
     ) -> tuple[ExecutionResult, int]:
         """Execute code and atomically update notebook.
 
@@ -1214,6 +1420,7 @@ class InterpreterEnvState:
             Tuple of (ExecutionResult, actual_cell_index)
         """
         if self.safe_execute:
+            logger.error(f"debug: req {req_uuid} starting safety check")
             block_reason = check_code_safety(code, self.language)
             if block_reason is not None:
                 logger.warning("Blocked code execution in execute_and_add_cell: %s", block_reason)
@@ -1241,19 +1448,32 @@ class InterpreterEnvState:
             _warned_unsafe_execution.add("unsafe_execution")
 
         if self.use_ray and self.use_enroot:
-            result_ref = self.kernel_container._execute_via_http.remote(code, timeout)  # type: ignore[union-attr]
-            result = await result_ref
+            logger.error(f"req {req_uuid} running ray execute_via_http")
+            result_ref = self.kernel_container._execute_via_http.remote(code, timeout, req_uuid=req_uuid)  # type: ignore[union-attr]
+            try:
+                result = await self._await_ray_ref(
+                    result_ref,
+                    timeout=timeout,
+                    req_uuid=req_uuid,
+                    operation="_execute_via_http",
+                )
+            except Exception:
+                logger.exception("req %s failed waiting for ray execute_via_http", req_uuid)
+                raise
+            logger.error(f"req {req_uuid} received result")
         elif self.use_docker or self.use_enroot:
             result = await self._execute_via_http(code, timeout)
         else:
             assert self.interpreter is not None
             result = await self.interpreter.execute_code(code, timeout)
 
+        logger.error(f"req {req_uuid} adding/updating cell")
         if cell_idx is None or cell_idx >= len(self.nb.cells):
             actual_idx = self._add_cell(code, result)
         else:
             self._update_cell(cell_idx, code, result)
             actual_idx = cell_idx
+        logger.error(f"req {req_uuid} finishing code exec")
 
         return result, actual_idx
 
@@ -1335,6 +1555,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
     async def reset(self) -> tuple[Messages, list[Tool]]:
         """Reset the environment and prepare for execution."""
+        reset_id = getattr(self, "_nemo_env_id", "?")[:8]
+        logger.warning("[reset:%s] building state for work_dir=%s", reset_id, self.work_dir)
+
         # Format environment capabilities with job_timeout
         env_capabilities = self.execution_config.environment_capabilities_prompt.format(
             job_timeout=self.execution_config.job_timeout
@@ -1370,7 +1593,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             use_enroot=self.config.use_enroot,
             container_sqsh_path=self.config.container_sqsh_path,
         )
+        logger.warning("[reset:%s] starting container", reset_id)
         await self.state.start()
+        logger.warning("[reset:%s] container started, building tools", reset_id)
 
         # Record start time for timeout tracking
         self.start_time = time.perf_counter()
@@ -1384,7 +1609,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             Tool.from_function(self.run_cell),
             Tool.from_function(self.reset_kernel),
             Tool.from_function(self.submit_answer),
-            Tool.from_function(self._filesystem_tool.list_dir),
+            Tool.from_function(self.list_dir),
         ]
 
         messages.append(
@@ -1401,8 +1626,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             messages.append(self.get_env_state_msg())
 
         # Always show initial directory listing (with truncation protection)
-        messages.append(Message(content=self._filesystem_tool.list_dir()))
+        messages.append(Message(content=await self.list_dir()))
 
+        logger.warning("[reset:%s] reset fully complete", reset_id)
         return messages, self.tools
 
     async def step(self, action: ToolRequestMessage) -> tuple[Messages, float, bool, bool]:
@@ -1429,6 +1655,53 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         return obs, reward, self.state.done, False
 
     # ========== Tools ==========
+
+    async def list_dir(
+        self,
+        directory: str = ".",
+        max_files: int = 20,
+        show_hidden: bool = False,
+    ) -> str:
+        """List contents of a directory with truncation protection.
+
+        Recursively lists files in a directory, with built-in protection against
+        overwhelming the context with too many files. Use this tool instead of
+        writing code to list directories to avoid context bloat.
+
+        Usage Examples:
+            list_dir()                      # List working directory
+            list_dir("data/")               # List specific folder
+            list_dir(max_files=50)          # Show more files
+            list_dir(show_hidden=True)      # Include hidden files
+
+        Args:
+            directory: Directory path to list (default: current working directory)
+            max_files: Maximum number of files to display (default: 20)
+            show_hidden: Whether to show hidden files starting with '.' (default: False)
+        """
+        if self.state.use_ray and self.state.use_enroot:
+            if self.state.kernel_container is None:
+                return "Error listing directory: node-local workspace is unavailable"
+
+            list_dir_uuid = str(uuid.uuid4())
+            logger.error(f"req {list_dir_uuid} calling list_dir_on_node")
+            list_ref = self.state.kernel_container._list_dir_on_node.remote(  # type: ignore[attr-defined]
+                directory=directory,
+                max_files=max_files,
+                show_hidden=show_hidden,
+                req_uuid=list_dir_uuid,
+            )
+            result = await self.state._await_ray_ref(
+                list_ref,
+                timeout=_LIST_DIR_RAY_TIMEOUT,
+                req_uuid=list_dir_uuid,
+                operation="list_dir",
+                max_retries=2,
+            )
+            logger.error(f"req {list_dir_uuid} finished list_dir_on_node")
+            return cast(str, result)
+
+        return self._filesystem_tool.list_dir(directory, max_files, show_hidden)
 
     async def run_cell(
         self,
@@ -1463,8 +1736,11 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             Message with multimodal content if images present, otherwise string.
             The response includes the cell number (e.g., "[Cell #0] output...").
         """
+        run_cell_uuid = str(uuid.uuid4())
+        logger.error(f"debug: req {run_cell_uuid} querying remaining time")
         remaining_seconds = self.get_remaining_time()
 
+        logger.error(f"debug: req {run_cell_uuid} checking time limit")
         if remaining_seconds <= self.execution_config.force_submit_threshold:
             self.logger.warning(
                 f"Refusing cell execution with {remaining_seconds:.1f}s remaining "
@@ -1489,23 +1765,27 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 cell_idx = None
 
         # Execute code and update notebook atomically
+        logger.error(f"debug: req {run_cell_uuid} starting executing code")
         result, actual_cell_idx = await self.state.execute_and_add_cell(
-            code, cell_idx=cell_idx, timeout=effective_timeout
+            code, cell_idx=cell_idx, timeout=effective_timeout, req_uuid=run_cell_uuid,
         )
 
         # Build response with cell number
         cell_info = f"[Cell #{actual_cell_idx}] "
 
+        logger.error(f"req {run_cell_uuid} handling images")
         if result.has_images():
             # Format images as data URLs for Message
             image_urls = [f"data:{mime_type};base64,{base64_data}" for mime_type, base64_data in result.get_images()]
 
+            logger.error(f"req {run_cell_uuid} building image message")
             return Message.create_message(
                 role="tool",
                 text=cell_info + result.get_truncated_text(),
                 images=cast(list[np.ndarray | str], image_urls),
             )
 
+        logger.error(f"req {run_cell_uuid} finishing run_cell")
         return cell_info + result.get_truncated_text()
 
     async def reset_kernel(self) -> str:
@@ -1513,7 +1793,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         This clears all variables and execution state.
         """
+        reset_kernel_uuid = str(uuid.uuid4())
         if self.state.use_ray and self.state.kernel_container is not None:
+            logger.error(f"req {reset_kernel_uuid} resetting kernel")
             reset_ref = self.state.kernel_container._reset_via_http.remote()  # type: ignore[attr-defined]
             await reset_ref
         elif self.state.use_docker or self.state.use_enroot:
@@ -1527,6 +1809,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.state.nb.metadata.kernelspec = self.state.language.make_kernelspec()
         self.state.notebook_runtime_errors = []
         self.state._execution_count = 0
+        logger.error(f"req {reset_kernel_uuid} reset finished")
 
         return "Kernel reset successfully."
 
@@ -1591,6 +1874,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         Args:
             answer: Your final response to the research question
         """
+        submit_answer_uuid = str(uuid.uuid4())
         if self.state.done:
             return "Episode already finished."
 
@@ -1601,7 +1885,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             self.logger.warning("No rubric_model configured, skipping scoring")
             return answer
 
+        logger.error(f"req {submit_answer_uuid} calling score_solution")
         correct = await self._score_solution(answer)
+        logger.error(f"req {submit_answer_uuid} finished scoring")
         return CORRECT_MSG if correct else INCORRECT_MSG
 
     # ========== Time Management ==========
