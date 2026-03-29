@@ -44,6 +44,7 @@ class DatasetConfig(BaseModel):
     container_sqsh_path: str | None = None
     force_python: bool = True
     normalize_reward: bool = True
+    enable_faithfulness_gate: bool = False
     save_dir: Path | None = None
 
     execution_config: ExecutionConfig = Field(default_factory=ExecutionConfig)

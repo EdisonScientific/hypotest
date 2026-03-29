@@ -165,6 +165,35 @@ Be scientifically rigorous. Reason through each criterion in the rubric and prov
 At the very end, provide an integer score based on the rubric, enclosed in <score>...</score> tags.
 """.strip()
 
+FAITHFULNESS_GATE_PROMPT = """
+You are evaluating whether a proposed conclusion is faithfully supported by the notebook outputs.
+
+Here is the hypothesis being evaluated: {hypothesis!r}.
+
+Here is the notebook containing all executed code and outputs:
+<notebook>
+{notebook}
+</notebook>
+
+Here is the proposed conclusion:
+<proposed-solution>
+{proposed_solution}
+</proposed-solution>
+
+{additional_criteria}
+
+Your task: Determine whether the proposed conclusion is **directly supported** by the notebook's executed code and outputs. A conclusion FAILS the faithfulness check if ANY of the following are true:
+
+1. It claims specific statistical results (p-values, effect sizes, correlations, test statistics) that do not appear in the notebook outputs
+2. It states definitive conclusions about the hypothesis when the notebook shows errors, incomplete analysis, or no relevant computations
+3. It fabricates or invents data, results, or findings not present in the notebook
+4. It overstates the strength or certainty of findings beyond what the notebook outputs actually show
+
+A conclusion PASSES if it accurately reflects what the notebook produced, even if the analysis is incomplete — as long as the conclusion honestly represents the state of the work.
+
+Reason step by step, then provide your verdict as either <verdict>PASS</verdict> or <verdict>FAIL</verdict>.
+""".strip()
+
 
 class PromptingConfig(BaseModel):
     """Configuration for prompting the LLM.

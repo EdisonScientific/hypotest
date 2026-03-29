@@ -29,6 +29,7 @@ dependencies = [
     "httpx>=0.27",
     "huggingface_hub>=1.7.1",
     "jupyter-client",
+    "litellm<=1.82.6",
     "ldp",
     "nbformat",
     "numpy",

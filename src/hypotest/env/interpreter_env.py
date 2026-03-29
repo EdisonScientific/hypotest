@@ -47,7 +47,14 @@ from . import config as cfg
 from .code_safety import check_code_safety
 from .config import ExecutionConfig
 from .interpreter import ExecutionResult, Interpreter
-from .prompts import CORRECT_MSG, HYPOTHESIS_TASK_DESC, INCORRECT_MSG, RUBRIC_SCORE_PROMPT, PromptingConfig
+from .prompts import (
+    CORRECT_MSG,
+    FAITHFULNESS_GATE_PROMPT,
+    HYPOTHESIS_TASK_DESC,
+    INCORRECT_MSG,
+    RUBRIC_SCORE_PROMPT,
+    PromptingConfig,
+)
 from .tools.filesystem import FilesystemTool, list_dir_tool
 from .utils import NBLanguage, view_notebook
 
@@ -315,6 +322,7 @@ class ProblemInstance(BaseModel):
     rubric: str
     max_score: int = Field(alias="max_points")
     input_data_path: str = ""
+    faithfulness_rubric: str = ""
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
     nb_primary_language: str = Field(default=str(NBLanguage.PYTHON))
 
@@ -884,6 +892,8 @@ class InterpreterEnvState:
         self.raw_score: int = 0
         self.score: float = 0.0
         self.score_metadata: dict[str, str | int] = {}
+        self.faithfulness_passed: bool | None = None
+        self.faithfulness_metadata: dict[str, str] = {}
 
     async def start(self):
         """Start the interpreter (local or Docker-based)."""
@@ -1490,6 +1500,7 @@ class InterpreterEnvConfig(BaseModel):
     use_enroot: bool = False
     container_sqsh_path: Path | None = None
     normalize_reward: bool = True
+    enable_faithfulness_gate: bool = False
 
 
 class InterpreterEnv(Environment[InterpreterEnvState]):
@@ -1818,9 +1829,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         return self.work_dir / "score_info.json"
 
     @tenacity.retry(stop=tenacity.stop_after_attempt(3), retry=tenacity.retry_if_exception_type(ValueError))
-    async def _score_solution(self, solution: str) -> bool:
+    async def _evaluate_rubric(self, solution: str, nb_content: str) -> int:
+        """Evaluate the solution against the rubric. Returns raw integer score."""
         assert self.rubric_model is not None
-        nb_content, _ = view_notebook(self.state.nb.cells, self.language.value)
 
         prompt = self.state.score_metadata["prompt"] = RUBRIC_SCORE_PROMPT.format(
             hypothesis=self.problem.hypothesis,
@@ -1836,19 +1847,76 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.state.score_metadata["response"] = resp.text
 
         try:
-            raw_score = int(resp.text.split("<score>")[1].split("</score>")[0])
-            self.state.raw_score = raw_score
-
+            return int(resp.text.split("<score>")[1].split("</score>")[0])
         except Exception as e:
             raise ValueError("Failed to parse score from response") from e
 
+    @tenacity.retry(stop=tenacity.stop_after_attempt(3), retry=tenacity.retry_if_exception_type(ValueError))
+    async def _evaluate_faithfulness_gate(self, solution: str, nb_content: str) -> bool:
+        """Evaluate whether the conclusion is supported by notebook state. Returns True if faithful."""
+        assert self.rubric_model is not None
+
+        additional = ""
+        if self.problem.faithfulness_rubric:
+            additional = f"Additional task-specific criteria:\n{self.problem.faithfulness_rubric}"
+
+        prompt = FAITHFULNESS_GATE_PROMPT.format(
+            hypothesis=self.problem.hypothesis,
+            notebook=nb_content,
+            proposed_solution=solution,
+            additional_criteria=additional,
+        )
+        self.state.faithfulness_metadata["prompt"] = prompt
+
+        resp = await self.rubric_model.call_single(prompt, timeout=3 * 60)
+        if not resp.text:
+            raise ValueError("No response from faithfulness gate")
+        self.state.faithfulness_metadata["response"] = resp.text
+
+        if "<verdict>PASS</verdict>" in resp.text:
+            return True
+        if "<verdict>FAIL</verdict>" in resp.text:
+            return False
+        raise ValueError("Failed to parse verdict from faithfulness gate response")
+
+    async def _score_solution(self, solution: str) -> bool:
+        assert self.rubric_model is not None
+        nb_content, _ = view_notebook(self.state.nb.cells, self.language.value)
+
+        if self.config.enable_faithfulness_gate:
+            logger.error("running faithfulness gate")
+            rubric_task = asyncio.ensure_future(self._evaluate_rubric(solution, nb_content))
+            gate_task = asyncio.ensure_future(self._evaluate_faithfulness_gate(solution, nb_content))
+
+            # Always await the rubric score — it's the primary evaluation.
+            # If it fails, cancel the gate task so it doesn't dangle.
+            try:
+                raw_score = await rubric_task
+            except Exception:
+                gate_task.cancel()
+                raise
+
+            # The faithfulness gate is supplementary; if it errors out, log and fall back to rubric-only scoring
+            try:
+                self.state.faithfulness_passed = await gate_task
+            except Exception:
+                self.logger.exception("Faithfulness gate failed — falling back to rubric-only scoring")
+                self.state.faithfulness_passed = None
         else:
+            raw_score = await self._evaluate_rubric(solution, nb_content)
+
+        try:
+            self.state.raw_score = raw_score
             correct = raw_score == self.problem.max_score
             score = raw_score / self.problem.max_score if self.config.normalize_reward else raw_score
             score = max(
                 0.0,
                 min(1.0 if self.config.normalize_reward else self.problem.max_score, score),
             )
+
+            if self.config.enable_faithfulness_gate and self.state.faithfulness_passed is False:
+                self.logger.info("Faithfulness gate FAILED — zeroing reward")
+                score = 0.0
 
             self.state.score = score
             self.state.total_reward += score
@@ -1860,6 +1928,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 "score": self.state.score,
                 "raw_score": self.state.raw_score,
                 "max_score": self.problem.max_score,
+                "faithfulness_passed": self.state.faithfulness_passed,
             }
             with self.score_info_path.open("w") as f:
                 json.dump(score_info, f, indent=2)
@@ -1932,6 +2001,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 "score": self.state.score,
                 "score_metadata": self.state.score_metadata,
                 "total_reward": self.state.total_reward,
+                "faithfulness_passed": self.state.faithfulness_passed,
+                "faithfulness_metadata": self.state.faithfulness_metadata,
             },
             info={
                 "language": self.state.language,
