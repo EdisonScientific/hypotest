@@ -38,12 +38,18 @@ class DatasetConfig(BaseModel):
     use_ray: bool = True
     use_docker: bool = False
     use_enroot: bool = False
-    container_sqsh_path: str | None = None
+    container_sqsh_path: FilePath | None = None
     force_python: bool = True
     normalize_reward: bool = True
     save_dir: Path | None = None
 
     execution_config: ExecutionConfig = Field(default_factory=ExecutionConfig)
+
+    @model_validator(mode="after")
+    def validate_enroot(self) -> Self:
+        if self.use_enroot and not self.container_sqsh_path:
+            raise ValueError("container_sqsh_path cannot be empty when use_enroot is set")
+        return self
 
     @model_validator(mode="after")
     def validate_dataset_source(self) -> Self:
@@ -153,6 +159,8 @@ async def launch_server():
     parser.add_argument("--rubric-model-api-base", type=str, default=os.getenv("HYPOTEST_RUBRIC_MODEL_API_BASE"))
     parser.add_argument("--rubric-model-api-key", type=str, default=os.getenv("HYPOTEST_RUBRIC_MODEL_API_KEY"))
     parser.add_argument("--use-docker", action="store_true")
+    parser.add_argument("--use-enroot", action="store_true")
+    parser.add_argument("--container-sqsh", type=FilePath)
 
     args = parser.parse_args()
 
@@ -180,6 +188,8 @@ async def launch_server():
                     ],
                 },
                 use_docker=args.use_docker,
+                use_enroot=args.use_enroot,
+                container_sqsh_path=args.container_sqsh,
                 execution_config={"cell_execution_timeout": 600},
             ),
             port=args.port,
