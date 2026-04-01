@@ -35,7 +35,7 @@ class DatasetConfig(BaseModel):
     )
 
     work_dir: Path | None = None
-    use_ray: bool = True
+    use_ray: bool = False
     use_docker: bool = False
     use_enroot: bool = False
     container_sqsh_path: FilePath | None = None
@@ -159,6 +159,7 @@ async def launch_server():
     parser.add_argument("--rubric-model-api-base", type=str, default=os.getenv("HYPOTEST_RUBRIC_MODEL_API_BASE"))
     parser.add_argument("--rubric-model-api-key", type=str, default=os.getenv("HYPOTEST_RUBRIC_MODEL_API_KEY"))
     parser.add_argument("--use-docker", action="store_true")
+    parser.add_argument("--use-ray", action="store_true")
     parser.add_argument("--use-enroot", action="store_true")
     parser.add_argument("--container-sqsh", type=FilePath)
 
@@ -188,6 +189,7 @@ async def launch_server():
                     ],
                 },
                 use_docker=args.use_docker,
+                use_ray=args.use_ray,
                 use_enroot=args.use_enroot,
                 container_sqsh_path=args.container_sqsh,
                 execution_config={"cell_execution_timeout": 600},
