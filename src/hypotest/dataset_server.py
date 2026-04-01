@@ -37,7 +37,7 @@ class DatasetConfig(BaseModel):
     work_dir: Path | None = None
     use_ray: bool = True
     use_docker: bool = False
-    use_enroot: bool = True
+    use_enroot: bool = False
     container_sqsh_path: str | None = None
     force_python: bool = True
     normalize_reward: bool = True
