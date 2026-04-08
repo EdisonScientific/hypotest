@@ -4,21 +4,55 @@ import json
 import os
 import pickle
 from pathlib import Path
-from typing import Literal, Self, cast
+from typing import Self, cast
 
 import yaml
-from aviary.core import TaskDatasetClient
+from aviary.core import Message, TaskDatasetClient, ToolRequestMessage
 from ldp.agent import AgentConfig, SimpleAgent
+from ldp.agent.simple_agent import SimpleAgentState
 from ldp.alg import RolloutManager
 from ldp.data_structures import Trajectory
+from ldp.graph import OpResult, compute_graph
+from ldp.llms import prepend_sys
 from pydantic import BaseModel, ConfigDict, Field, FilePath, field_validator, model_validator
 from tqdm.asyncio import tqdm
 
 from hypotest.dataset_server import DEFAULT_SERVER_PORT
 
 
+def _strip_images(msg: Message) -> Message:
+    if not msg.is_multimodal:
+        return msg
+    parsed = json.loads(msg.content)  # type: ignore[arg-type]
+    text_parts = [item for item in parsed if item["type"] != "image_url"]
+    if not text_parts:
+        return msg.model_copy(update={"content": "[image removed]", "content_is_json_str": False})
+    if len(text_parts) == 1 and text_parts[0]["type"] == "text":
+        return msg.model_copy(update={"content": text_parts[0]["text"], "content_is_json_str": False})
+    return msg.model_copy(update={"content": json.dumps(text_parts)})
+
+
+class NoImagesAgent(SimpleAgent):
+    """SimpleAgent that strips images from messages before LLM calls."""
+
+    @compute_graph()
+    async def get_asv(
+        self, agent_state: SimpleAgentState, obs: list[Message]
+    ) -> tuple[OpResult[ToolRequestMessage], SimpleAgentState, float]:
+        next_state = agent_state.get_next_state(obs)
+
+        messages = [_strip_images(m) for m in next_state.messages]
+        messages = prepend_sys(messages, sys_content=self.sys_prompt) if self.sys_prompt is not None else messages
+        result = cast(
+            "OpResult[ToolRequestMessage]",
+            await self._llm_call_op(await self._config_op(), msgs=messages, tools=next_state.tools),
+        )
+        next_state.messages = [*next_state.messages, result.value]
+        return result, next_state, 0.0
+
+
 class SimpleAgentConfig(AgentConfig):
-    agent_type: Literal["SimpleAgent"] = "SimpleAgent"  # type: ignore[mutable-override]
+    agent_type: str = "SimpleAgent"
 
 
 class BenchmarkConfig(BaseModel):
