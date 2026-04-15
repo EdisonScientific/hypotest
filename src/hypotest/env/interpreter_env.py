@@ -314,6 +314,41 @@ async def _kill_process_group(
         logger.exception("[%s] Process pid=%d still alive after SIGKILL — possible zombie", label, proc.pid)
 
 
+def _build_resource_limit_prefix(
+    memory_limit_mb: int | None,
+    max_pids: int | None,
+) -> list[str]:
+    """Build a prlimit command prefix for resource-limited execution.
+
+    Uses prlimit to set RLIMIT_AS (virtual address space) which is inherited
+    by all child processes through the env -> enroot -> bash -> python chain.
+    When a sandbox exceeds the limit, allocations fail with MemoryError rather
+    than consuming all node memory.
+
+    Returns an empty list if no limits are configured or prlimit is not available.
+    """
+    if memory_limit_mb is None and max_pids is None:
+        return []
+
+    if shutil.which("prlimit") is None:
+        logger.warning(
+            "prlimit not found on PATH; skipping resource limits "
+            "(memory_limit_mb=%s, max_pids=%s)",
+            memory_limit_mb,
+            max_pids,
+        )
+        return []
+
+    prefix = ["prlimit"]
+    if memory_limit_mb is not None:
+        prefix.append(f"--as={memory_limit_mb * 1024 * 1024}")
+    if max_pids is not None:
+        prefix.append(f"--nproc={max_pids}")
+
+    prefix.append("--")
+    return prefix
+
+
 class ProblemInstance(BaseModel):
     id: UUID
     hypothesis: str
@@ -356,10 +391,19 @@ def _prep_workspace_dir(work_dir: str, workspace_path: str = "/data_workspace") 
     },
 )
 class EnrootKernelServer:
-    def __init__(self, container_sqsh_path: Path, execution_timeout: float, safe_execute: bool = True):
+    def __init__(
+        self,
+        container_sqsh_path: Path,
+        execution_timeout: float,
+        safe_execute: bool = True,
+        sandbox_memory_limit_mb: int | None = None,
+        sandbox_max_pids: int | None = None,
+    ):
         self.container_sqsh_path = container_sqsh_path
         self.execution_timeout = execution_timeout
         self.safe_execute = safe_execute
+        self.sandbox_memory_limit_mb = sandbox_memory_limit_mb
+        self.sandbox_max_pids = sandbox_max_pids
         self._enroot_proc: asyncio.subprocess.Process | None = None
         self._http_client: httpx.AsyncClient | None = None
         self._container_port: int | None = None
@@ -464,10 +508,11 @@ class EnrootKernelServer:
         bash: str,
         enroot_env: dict[str, str],
         container_sqsh_path: Path,
+        resource_prefix: list[str] | None = None,
     ) -> list[str]:
-        """Assemble the full ``enroot start`` command."""
+        """Assemble the full ``enroot start`` command, optionally prefixed with prlimit."""
         env_args = [f"{k}={v}" for k, v in enroot_env.items()]
-        return [
+        cmd = [
             "env",
             "-i",
             "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
@@ -488,6 +533,9 @@ class EnrootKernelServer:
             "-lc",
             bash,
         ]
+        if resource_prefix:
+            return [*resource_prefix, *cmd]
+        return cmd
 
     async def initialize(self, work_dir: Path, language: NBLanguage) -> None:
         startup_token = str(uuid.uuid4())
@@ -501,6 +549,10 @@ class EnrootKernelServer:
         assert kernel_server_path.is_file(), f"kernel server must be a valid path, found {kernel_server_path}"
 
         enroot_env = self._setup_enroot_env(startup_token)
+
+        resource_prefix = _build_resource_limit_prefix(
+            self.sandbox_memory_limit_mb, self.sandbox_max_pids
+        )
 
         online = False
         attempt = 0
@@ -527,6 +579,7 @@ class EnrootKernelServer:
                 bash,
                 enroot_env,
                 self.container_sqsh_path,
+                resource_prefix=resource_prefix,
             )
 
             async with CONTAINER_LAUNCH_SEM:
@@ -688,14 +741,12 @@ class EnrootKernelServer:
         assert self._http_client is not None
 
         try:
-            logger.error(f"req {req_uuid} starting execute query")
             response = await self._http_client.post(
                 "/execute",
                 json={"code": code, "timeout": timeout},
             )
             response.raise_for_status()
         except httpx.TimeoutException as e:
-            logger.error(f"req {req_uuid} hitting timeout")
             effective_timeout = timeout if timeout is not None else self.execution_timeout
             logger.warning(
                 "[%s] HTTP %s during /execute (requested kernel timeout=%.1fs): %s",
@@ -716,14 +767,11 @@ class EnrootKernelServer:
                 execution_time=effective_timeout,
             )
 
-        logger.error(f"req {req_uuid} getting response data")
         data = response.json()
 
         # Convert serialized outputs back to NotebookNode
-        logger.error(f"req {req_uuid} parsing data into nb outputs")
         notebook_outputs = [nbformat.from_dict(o) for o in data["notebook_outputs"]]
 
-        logger.error(f"req {req_uuid} building execution results")
         return ExecutionResult(
             notebook_outputs=notebook_outputs,
             error_occurred=data["error_occurred"],
@@ -769,9 +817,6 @@ class EnrootKernelServer:
             max_files: Maximum number of files to display (default: 20)
             show_hidden: Whether to show hidden files starting with '.' (default: False)
         """
-        if req_uuid:
-            logger.error(f"req {req_uuid} listing node directory {directory}")
-
         try:
             normalized = self._normalize_node_workspace_path(directory)
         except ValueError:
@@ -786,8 +831,6 @@ class EnrootKernelServer:
             show_hidden=show_hidden,
         )
 
-        if req_uuid:
-            logger.error(f"req {req_uuid} finished listing node directory {directory}")
         return result
 
     async def close(self):
@@ -845,6 +888,8 @@ class InterpreterEnvState:
         use_ray: bool = True,
         container_sqsh_path: Path | None = None,
         save_dir: Path | None = None,
+        sandbox_memory_limit_mb: int | None = None,
+        sandbox_max_pids: int | None = None,
     ):
         self.work_dir = work_dir
         self.language = language
@@ -861,6 +906,8 @@ class InterpreterEnvState:
         self.container_sqsh_path = container_sqsh_path
         self.save_dir = save_dir
         self.use_ray = use_ray if RAY_INSTALLED else False
+        self.sandbox_memory_limit_mb = sandbox_memory_limit_mb
+        self.sandbox_max_pids = sandbox_max_pids
 
         # Local interpreter (only used when use_docker=False)
         self.interpreter: Interpreter | None = None
@@ -912,7 +959,11 @@ class InterpreterEnvState:
     async def _start_ray_enroot_container(self) -> None:
         logger.warning("[ray-enroot] creating actor for work_dir=%s", self.work_dir)
         self.kernel_container = EnrootKernelServer.remote(  # type: ignore[attr-defined]
-            self.container_sqsh_path, self.execution_timeout, safe_execute=self.safe_execute
+            self.container_sqsh_path,
+            self.execution_timeout,
+            safe_execute=self.safe_execute,
+            sandbox_memory_limit_mb=self.sandbox_memory_limit_mb,
+            sandbox_max_pids=self.sandbox_max_pids,
         )
         logger.warning("[ray-enroot] actor created, calling initialize for work_dir=%s", self.work_dir)
         init_ref = self.kernel_container.initialize.remote(self.work_dir, self.language)  # type: ignore[union-attr]
@@ -997,6 +1048,10 @@ class InterpreterEnvState:
             self._container_port = await get_free_port()
             startup_token = str(uuid.uuid4())
 
+            resource_prefix = _build_resource_limit_prefix(
+                self.sandbox_memory_limit_mb, self.sandbox_max_pids
+            )
+
             bash = dedent(f"""\
                 set -euo pipefail
                 cd /data_workspace
@@ -1015,6 +1070,7 @@ class InterpreterEnvState:
             assert self.container_sqsh_path is not None, "container_sqsh_path must be set when using enroot container"
 
             cmd = [
+                *resource_prefix,
                 "env",
                 "-i",
                 "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
@@ -1430,7 +1486,6 @@ class InterpreterEnvState:
             Tuple of (ExecutionResult, actual_cell_index)
         """
         if self.safe_execute:
-            logger.error(f"debug: req {req_uuid} starting safety check")
             block_reason = check_code_safety(code, self.language)
             if block_reason is not None:
                 logger.warning("Blocked code execution in execute_and_add_cell: %s", block_reason)
@@ -1458,7 +1513,6 @@ class InterpreterEnvState:
             _warned_unsafe_execution.add("unsafe_execution")
 
         if self.use_ray and self.use_enroot:
-            logger.error(f"req {req_uuid} running ray execute_via_http")
             result_ref = self.kernel_container._execute_via_http.remote(code, timeout, req_uuid=req_uuid)  # type: ignore[union-attr]
             try:
                 result = await self._await_ray_ref(
@@ -1470,20 +1524,17 @@ class InterpreterEnvState:
             except Exception:
                 logger.exception("req %s failed waiting for ray execute_via_http", req_uuid)
                 raise
-            logger.error(f"req {req_uuid} received result")
         elif self.use_docker or self.use_enroot:
             result = await self._execute_via_http(code, timeout)
         else:
             assert self.interpreter is not None
             result = await self.interpreter.execute_code(code, timeout)
 
-        logger.error(f"req {req_uuid} adding/updating cell")
         if cell_idx is None or cell_idx >= len(self.nb.cells):
             actual_idx = self._add_cell(code, result)
         else:
             self._update_cell(cell_idx, code, result)
             actual_idx = cell_idx
-        logger.error(f"req {req_uuid} finishing code exec")
 
         return result, actual_idx
 
@@ -1603,6 +1654,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             use_docker=self.config.use_docker,
             use_enroot=self.config.use_enroot,
             container_sqsh_path=self.config.container_sqsh_path,
+            sandbox_memory_limit_mb=self.execution_config.sandbox_memory_limit_mb,
+            sandbox_max_pids=self.execution_config.sandbox_max_pids,
         )
         logger.warning("[reset:%s] starting container", reset_id)
         await self.state.start()
@@ -1695,7 +1748,6 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 return "Error listing directory: node-local workspace is unavailable"
 
             list_dir_uuid = str(uuid.uuid4())
-            logger.error(f"req {list_dir_uuid} calling list_dir_on_node")
             list_ref = self.state.kernel_container._list_dir_on_node.remote(  # type: ignore[attr-defined]
                 directory=directory,
                 max_files=max_files,
@@ -1709,7 +1761,6 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 operation="list_dir",
                 max_retries=2,
             )
-            logger.error(f"req {list_dir_uuid} finished list_dir_on_node")
             return cast(str, result)
 
         return self._filesystem_tool.list_dir(directory, max_files, show_hidden)
@@ -1748,10 +1799,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             The response includes the cell number (e.g., "[Cell #0] output...").
         """
         run_cell_uuid = str(uuid.uuid4())
-        logger.error(f"debug: req {run_cell_uuid} querying remaining time")
         remaining_seconds = self.get_remaining_time()
 
-        logger.error(f"debug: req {run_cell_uuid} checking time limit")
         if remaining_seconds <= self.execution_config.force_submit_threshold:
             self.logger.warning(
                 f"Refusing cell execution with {remaining_seconds:.1f}s remaining "
@@ -1776,7 +1825,6 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 cell_idx = None
 
         # Execute code and update notebook atomically
-        logger.error(f"debug: req {run_cell_uuid} starting executing code")
         result, actual_cell_idx = await self.state.execute_and_add_cell(
             code, cell_idx=cell_idx, timeout=effective_timeout, req_uuid=run_cell_uuid,
         )
@@ -1784,19 +1832,16 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         # Build response with cell number
         cell_info = f"[Cell #{actual_cell_idx}] "
 
-        logger.error(f"req {run_cell_uuid} handling images")
         if result.has_images():
             # Format images as data URLs for Message
             image_urls = [f"data:{mime_type};base64,{base64_data}" for mime_type, base64_data in result.get_images()]
 
-            logger.error(f"req {run_cell_uuid} building image message")
             return Message.create_message(
                 role="tool",
                 text=cell_info + result.get_truncated_text(),
                 images=cast(list[np.ndarray | str], image_urls),
             )
 
-        logger.error(f"req {run_cell_uuid} finishing run_cell")
         return cell_info + result.get_truncated_text()
 
     async def reset_kernel(self) -> str:
@@ -1804,9 +1849,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         This clears all variables and execution state.
         """
-        reset_kernel_uuid = str(uuid.uuid4())
         if self.state.use_ray and self.state.kernel_container is not None:
-            logger.error(f"req {reset_kernel_uuid} resetting kernel")
             reset_ref = self.state.kernel_container._reset_via_http.remote()  # type: ignore[attr-defined]
             await reset_ref
         elif self.state.use_docker or self.state.use_enroot:
@@ -1820,7 +1863,6 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.state.nb.metadata.kernelspec = self.state.language.make_kernelspec()
         self.state.notebook_runtime_errors = []
         self.state._execution_count = 0
-        logger.error(f"req {reset_kernel_uuid} reset finished")
 
         return "Kernel reset successfully."
 
@@ -1884,7 +1926,6 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         nb_content, _ = view_notebook(self.state.nb.cells, self.language.value)
 
         if self.config.enable_faithfulness_gate:
-            logger.error("running faithfulness gate")
             rubric_task = asyncio.ensure_future(self._evaluate_rubric(solution, nb_content))
             gate_task = asyncio.ensure_future(self._evaluate_faithfulness_gate(solution, nb_content))
 
@@ -1943,7 +1984,6 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         Args:
             answer: Your final response to the research question
         """
-        submit_answer_uuid = str(uuid.uuid4())
         if self.state.done:
             return "Episode already finished."
 
@@ -1954,9 +1994,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             self.logger.warning("No rubric_model configured, skipping scoring")
             return answer
 
-        logger.error(f"req {submit_answer_uuid} calling score_solution")
         correct = await self._score_solution(answer)
-        logger.error(f"req {submit_answer_uuid} finished scoring")
         return CORRECT_MSG if correct else INCORRECT_MSG
 
     # ========== Time Management ==========

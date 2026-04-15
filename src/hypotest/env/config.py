@@ -62,6 +62,10 @@ class ExecutionConfig(BaseModel):
     # safety
     safe_execute: bool = os.getenv("SAFE_EXECUTE_SANDBOX", "").lower() == "true"
 
+    # Resource limits for sandboxed containers (prlimit RLIMIT_AS/RLIMIT_NPROC)
+    sandbox_memory_limit_mb: int | None = None  # e.g., 8192 for 8GB
+    sandbox_max_pids: int | None = None  # e.g., 512 to prevent fork bombs
+
     # Capabilities
     has_gpu: bool = False
 

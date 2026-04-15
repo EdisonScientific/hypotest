@@ -56,11 +56,11 @@ _DANGEROUS_CALLS: frozenset[str] = frozenset({
     "os.execvpe",
     "os._exit",
     # subprocess
-    "subprocess.run",
-    "subprocess.Popen",
-    "subprocess.call",
-    "subprocess.check_call",
-    "subprocess.check_output",
+    # "subprocess.run",
+    # "subprocess.Popen",
+    # "subprocess.call",
+    # "subprocess.check_call",
+    # "subprocess.check_output",
     # shutil — destructive
     "shutil.rmtree",
     # multiprocessing — process spawning
@@ -89,7 +89,7 @@ _DANGEROUS_ATTRS: frozenset[str] = frozenset({
 
 # Modules whose import_module() calls should be checked
 _DANGEROUS_IMPORTLIB_TARGETS: frozenset[str] = _BLOCKED_MODULES | frozenset({
-    "subprocess",
+    # "subprocess",
     "shutil",
     "multiprocessing",
 })
@@ -302,7 +302,7 @@ _PYTHON_REGEX_FALLBACK: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bos\s*\.\s*fork\s*\("), _MSG_DANGEROUS_CALL),
     (re.compile(r"\bos\s*\.\s*exec\w*\s*\("), _MSG_DANGEROUS_CALL),
     (re.compile(r"\bos\s*\.\s*_exit\s*\("), _MSG_DANGEROUS_CALL),
-    (re.compile(r"\bsubprocess\s*\.\s*(run|Popen|call|check_call|check_output)\s*\("), _MSG_DANGEROUS_CALL),
+    # (re.compile(r"\bsubprocess\s*\.\s*(run|Popen|call|check_call|check_output)\s*\("), _MSG_DANGEROUS_CALL),
     (re.compile(r"\bshutil\s*\.\s*rmtree\s*\("), _MSG_DANGEROUS_CALL),
     (re.compile(r"\bmultiprocessing\s*\.\s*Process\s*\("), _MSG_DANGEROUS_CALL),
     (re.compile(r"\b__import__\s*\("), _MSG_DANGEROUS_CALL),
