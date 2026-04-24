@@ -18,10 +18,12 @@ from lmi import LiteLLMModel
 from hypotest.env import config as cfg
 from hypotest.env.config import ExecutionConfig
 from hypotest.env.interpreter_env import (
+    EnrootKernelServer,
     InterpreterEnv,
     InterpreterEnvConfig,
     InterpreterEnvState,
     ProblemInstance,
+    _build_resource_limit_prefix,
 )
 from hypotest.env.kernel_server import NBLanguage
 
@@ -921,3 +923,78 @@ class TestRubricGrading:
 
             finally:
                 await env.close()
+
+
+class TestResourceLimitPrefix:
+    """Tests for _build_resource_limit_prefix helper."""
+
+    def test_returns_empty_when_no_limits(self):
+        assert _build_resource_limit_prefix(None, None) == []
+
+    @patch("hypotest.env.interpreter_env.shutil.which", return_value="/usr/bin/prlimit")
+    def test_memory_limit_only(self, mock_which):
+        result = _build_resource_limit_prefix(8192, None)
+        assert result == ["prlimit", f"--as={8192 * 1024 * 1024}", "--"]
+
+    @patch("hypotest.env.interpreter_env.shutil.which", return_value="/usr/bin/prlimit")
+    def test_pids_limit_only(self, mock_which):
+        result = _build_resource_limit_prefix(None, 256)
+        assert result == ["prlimit", "--nproc=256", "--"]
+
+    @patch("hypotest.env.interpreter_env.shutil.which", return_value="/usr/bin/prlimit")
+    def test_both_limits(self, mock_which):
+        result = _build_resource_limit_prefix(4096, 512)
+        assert f"--as={4096 * 1024 * 1024}" in result
+        assert "--nproc=512" in result
+        assert result[0] == "prlimit"
+        assert result[-1] == "--"
+
+    @patch("hypotest.env.interpreter_env.shutil.which", return_value=None)
+    def test_returns_empty_when_prlimit_not_available(self, mock_which):
+        assert _build_resource_limit_prefix(8192, 512) == []
+
+
+class TestExecutionConfigSandboxFields:
+    """Tests for sandbox resource limit fields on ExecutionConfig."""
+
+    def test_defaults_are_none(self):
+        config = ExecutionConfig()
+        assert config.sandbox_memory_limit_mb is None
+        assert config.sandbox_max_pids is None
+
+    def test_overrides_work(self):
+        config = ExecutionConfig(sandbox_memory_limit_mb=8192, sandbox_max_pids=512)
+        assert config.sandbox_memory_limit_mb == 8192
+        assert config.sandbox_max_pids == 512
+
+    def test_factory_standard_passes_overrides(self):
+        config = ExecutionConfig.standard(sandbox_memory_limit_mb=4096)
+        assert config.sandbox_memory_limit_mb == 4096
+        assert config.sandbox_max_pids is None
+
+    def test_factory_gpu_passes_overrides(self):
+        config = ExecutionConfig.gpu(sandbox_memory_limit_mb=16384, sandbox_max_pids=1024)
+        assert config.sandbox_memory_limit_mb == 16384
+        assert config.sandbox_max_pids == 1024
+
+
+class TestBuildEnrootCmdWithPrefix:
+    """Tests for EnrootKernelServer._build_enroot_cmd with resource limit prefix."""
+
+    def test_without_prefix(self):
+        cmd = EnrootKernelServer._build_enroot_cmd(
+            pathlib.Path("/work"), pathlib.Path("/node"), pathlib.Path("/ks.py"),
+            "echo hi", {}, pathlib.Path("/sqsh.sqsh"),
+        )
+        assert cmd[0] == "env"
+        assert "enroot" in cmd
+
+    def test_with_prefix(self):
+        prefix = ["prlimit", "--as=8589934592", "--"]
+        cmd = EnrootKernelServer._build_enroot_cmd(
+            pathlib.Path("/work"), pathlib.Path("/node"), pathlib.Path("/ks.py"),
+            "echo hi", {}, pathlib.Path("/sqsh.sqsh"),
+            resource_prefix=prefix,
+        )
+        assert cmd[:3] == prefix
+        assert "enroot" in cmd

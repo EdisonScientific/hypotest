@@ -8,7 +8,7 @@ import socket
 from collections import Counter
 from pathlib import Path
 from tempfile import mkdtemp
-from typing import Any, Self, cast
+from typing import Any, Literal, Self, cast
 from uuid import UUID
 
 import yaml
@@ -45,6 +45,13 @@ class DatasetConfig(BaseModel):
     force_python: bool = True
     normalize_reward: bool = True
     enable_faithfulness_gate: bool = False
+    faithfulness_mode: Literal["off", "binary", "shadow", "hybrid"] = "off"
+    wager_mode: Literal["off", "shadow", "active"] = "off"
+    wager_beta: float = 0.5
+    wager_gamma: float = 0.3
+    cell_timeout_override_mode: Literal["off", "on"] = "off"
+    cell_timeout_min: float = 60.0
+    cell_timeout_max: float = 1200.0
     save_dir: Path | None = None
 
     execution_config: ExecutionConfig = Field(default_factory=ExecutionConfig)

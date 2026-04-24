@@ -17,11 +17,12 @@ import subprocess
 import sys
 import time
 import uuid
+import warnings
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from tempfile import mkdtemp
 from textwrap import dedent
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import UUID
 
 import aiodocker
@@ -46,7 +47,20 @@ from pydantic import BaseModel, Field, JsonValue, model_validator
 from . import config as cfg
 from .code_safety import check_code_safety
 from .config import ExecutionConfig
+from .hybrid_gate import (
+    HYBRID_GATE_PROMPT,
+    hybrid_reward,
+    parse_hybrid_response,
+    synthesize_per_item_awards,
+)
+from .install_shim import _write_install_shims
 from .interpreter import ExecutionResult, Interpreter
+from .wager import (
+    WAGER_BETA_DEFAULT,
+    WAGER_GAMMA_DEFAULT,
+    clamp_confidence,
+    score_with_wager,
+)
 from .prompts import (
     CORRECT_MSG,
     FAITHFULNESS_GATE_PROMPT,
@@ -382,6 +396,8 @@ def _prep_workspace_dir(work_dir: str, workspace_path: str = "/data_workspace") 
         f"target = {workspace_path}/pydeps\n"
     )
 
+    _write_install_shims(wd)
+
 
 @ray.remote(
     scheduling_strategy="SPREAD",
@@ -458,15 +474,32 @@ class EnrootKernelServer:
 
             cd $WORKDIR
 
+            # Install-shim wrappers (pip / conda / apt-get) + R shim + JSONL log
+            # all live under $WORKDIR/.install_shim/ (hidden from the agent's
+            # list_dir default view). Pre-written by _write_install_shims().
+            # cp -a preserves execute bits but ensure anyway.
+            if [ -d "$WORKDIR/.install_shim/bin" ]; then
+                chmod 755 "$WORKDIR/.install_shim/bin"/* 2>/dev/null || true
+            fi
+
             mkdir -p "$WORKDIR/r_libs"
             cat >"$WORKDIR/Rprofile" <<'EOF'
             .local_lib <- Sys.getenv("R_LIBS_USER")
             if (nzchar(.local_lib)) .libPaths(unique(c(.local_lib, .libPaths())))
             EOF
+            # Append the R install-shim (pre-written by _write_install_shims).
+            if [ -f "$WORKDIR/.install_shim/r_shim.R" ]; then
+                cat "$WORKDIR/.install_shim/r_shim.R" >> "$WORKDIR/Rprofile"
+            fi
 
             mkdir -p $WORKDIR/r_libs
             export R_LIBS_USER="$WORKDIR/r_libs"
             export R_PROFILE_USER="$WORKDIR/Rprofile"
+
+            # Prepend the shim bin dir so pip/conda/apt-get resolve to our wrappers.
+            # The wrappers exec the real installer at their absolute paths, so no recursion.
+            export PATH="$WORKDIR/.install_shim/bin:$PATH"
+            export INSTALL_SHIM_LOG="$WORKDIR/.install_shim/log"
 
             export PYTHONPATH="$WORKDIR/pydeps:${{PYTHONPATH}}"
             export PIP_CONFIG_FILE=$WORKDIR/pip.conf
@@ -941,6 +974,13 @@ class InterpreterEnvState:
         self.score_metadata: dict[str, str | int] = {}
         self.faithfulness_passed: bool | None = None
         self.faithfulness_metadata: dict[str, str] = {}
+        self.rubric_reward_raw: float = 0.0
+        self.hybrid_reward_value: float = 0.0
+        self.hybrid_metadata: dict[str, Any] = {}
+        self.wager: float = 0.0
+        self.wager_reward_shadow: float = 0.0
+        self.wager_metadata: dict[str, Any] = {}
+        self.cell_timeout_override_requests: list[float] = []
 
     async def start(self):
         """Start the interpreter (local or Docker-based)."""
@@ -1055,6 +1095,12 @@ class InterpreterEnvState:
             bash = dedent(f"""\
                 set -euo pipefail
                 cd /data_workspace
+
+                if [ -d /data_workspace/.install_shim/bin ]; then
+                    chmod 755 /data_workspace/.install_shim/bin/* 2>/dev/null || true
+                fi
+                export PATH="/data_workspace/.install_shim/bin:$PATH"
+                export INSTALL_SHIM_LOG="/data_workspace/.install_shim/log"
 
                 export PYTHONPATH="/data_workspace/pydeps:${{PYTHONPATH}}"
                 export PIP_CONFIG_FILE=/data_workspace/pip.conf
@@ -1552,6 +1598,34 @@ class InterpreterEnvConfig(BaseModel):
     container_sqsh_path: Path | None = None
     normalize_reward: bool = True
     enable_faithfulness_gate: bool = False
+    faithfulness_mode: Literal["off", "binary", "shadow", "hybrid"] = "off"
+    wager_mode: Literal["off", "shadow", "active"] = "off"
+    wager_beta: float = WAGER_BETA_DEFAULT
+    wager_gamma: float = WAGER_GAMMA_DEFAULT
+    cell_timeout_override_mode: Literal["off", "on"] = "off"
+    cell_timeout_min: float = 60.0
+    cell_timeout_max: float = 1200.0
+
+    @model_validator(mode="after")
+    def _migrate_enable_faithfulness_gate(self) -> "InterpreterEnvConfig":
+        if self.enable_faithfulness_gate and self.faithfulness_mode == "off":
+            warnings.warn(
+                "enable_faithfulness_gate=True is deprecated; use faithfulness_mode='binary' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.faithfulness_mode = "binary"
+        return self
+
+    @model_validator(mode="after")
+    def _validate_wager_requires_gate(self) -> "InterpreterEnvConfig":
+        if self.wager_mode != "off" and self.faithfulness_mode == "off":
+            raise ValueError(
+                f"wager_mode={self.wager_mode!r} requires faithfulness_mode "
+                "∈ {'shadow', 'hybrid'}; got 'off'. Wager uses the gate's "
+                "correct signal; it cannot operate standalone."
+            )
+        return self
 
 
 class InterpreterEnv(Environment[InterpreterEnvState]):
@@ -1669,10 +1743,138 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             messages.append(Message(role="system", content=self.prompting_config.system_prompt))
 
         self._filesystem_tool = FilesystemTool(self.work_dir)
+
+        # Reproducibility: wager_mode='off' runs expose the IDENTICAL submit_answer
+        # schema they saw before the wager patch landed. Only wager_mode ∈ {shadow,
+        # active} builds the closure that adds a `confidence` field. The closure is
+        # renamed to "submit_answer" so the tool-call name the policy sees is stable
+        # across modes.
+        if self.config.wager_mode == "off":
+            submit_tool = Tool.from_function(self.submit_answer)
+        else:
+            base_submit = self.submit_answer  # bound method; captured in closure
+
+            async def _submit_answer_with_wager(answer: str, confidence: float = 0.0) -> str:
+                """Submit your response to the research question.
+
+                Note that this tool may only be called once and ends the episode.
+
+                Args:
+                    answer: Your final response to the research question.
+                    confidence: A wager value in [0.0, 1.0] reflecting how strongly
+                        your work supports the answer. 0.0 = fully hedged (you
+                        submit an answer but aren't willing to wager on it; full
+                        credit if correct, no extra cost if wrong). Larger values
+                        stake more on the answer: larger bonus if correct, larger
+                        reduction of procedural credit if wrong. 1.0 = maximum
+                        wager. Choose the value that reflects how strongly your
+                        work supports the answer. Wagering high on answers you
+                        cannot defend will cost more than it gains; wagering low
+                        on answers you can defend leaves value on the table. If
+                        you are unsure, the safe default is a low confidence.
+                """
+                self.state.wager = clamp_confidence(confidence)
+                return await base_submit(answer)
+
+            _submit_answer_with_wager.__name__ = "submit_answer"
+            submit_tool = Tool.from_function(_submit_answer_with_wager)
+
+        # Same reproducibility principle for run_cell: when the cell-timeout
+        # override is off, the exposed tool is the plain `self.run_cell` whose
+        # schema is identical to pre-patch. When on, the closure adds a
+        # `timeout_seconds` kwarg clamped to [cell_timeout_min, cell_timeout_max]
+        # (default [60, 1200]) and delegates to `_run_cell_with_cap` with the
+        # clamped cap.
+        if self.config.cell_timeout_override_mode == "off":
+            run_cell_tool = Tool.from_function(self.run_cell)
+        else:
+            ct_min = float(self.config.cell_timeout_min)
+            ct_max = float(self.config.cell_timeout_max)
+            env_default_cap = float(self.execution_timeout)
+            run_cell_impl = self._run_cell_with_cap  # bound method captured in closure
+
+            async def _run_cell_with_timeout(
+                code: str,
+                idx: int | None = None,
+                timeout_seconds: float | None = None,
+            ) -> Message | str | list[dict[str, Any]]:
+                """Run code in a notebook cell and return the execution output.
+
+                This method allows running code in a new cell (append) or re-running
+                an existing cell with updated code.
+
+                Usage Examples:
+                    run_cell("print('Hello, world!')")
+                    run_cell("print('Hello, world!')", idx=0)
+                    run_cell("slow_op()", timeout_seconds=900)
+
+                Error Recovery:
+                    When a cell fails with an error, you MUST fix it by calling
+                    run_cell with the corrected code and the SAME idx as the failed
+                    cell:
+
+                    run_cell("corrected_code", idx=3)  # Fix error in Cell #3
+
+                    The cell number is shown in the output prefix (e.g., "[Cell #3]").
+                    Do NOT create a new cell to fix an error - always edit the
+                    failed cell.
+
+                Args:
+                    code: Code to execute.
+                    idx: Cell index to run. If None or >= len(cells), appends a new
+                        cell. If provided, updates and re-runs the existing cell at
+                        that index. Use this to fix errors in existing cells.
+                    timeout_seconds: Optional per-cell execution cap, in seconds.
+                        Use this if you expect a long-running cell (e.g., a large
+                        DE analysis, a permutation test) to exceed the default cap.
+                        Values below the minimum (60s) or above the maximum (1200s)
+                        are silently clamped. Leave unset for most cells to use the
+                        default cap. A cell that hits its cap returns a TimeoutError
+                        output just like any other timeout.
+
+                Returns:
+                    Message with multimodal content if images present, otherwise
+                    string. The response includes the cell number (e.g.,
+                    "[Cell #0] output...").
+
+                Related tools:
+                    `reset_kernel` and `list_dir` are separate tools, NOT Python
+                    symbols in the kernel namespace. Do NOT write `reset_kernel()`
+                    or `list_dir()` inside a `run_cell` call — invoke them as
+                    separate tool calls instead. A `reset_kernel` tool call after
+                    a `TimeoutError` is the supported way to recover from a locked
+                    kernel.
+
+                Installing packages:
+                    Install commands (`pip install`, `conda install`, `apt-get install`,
+                    `BiocManager::install`, `install.packages`) are intercepted: if
+                    the package is already present, the call returns quickly with a
+                    "[pre-installed]" message. To force a fresh install of a
+                    specific version, use the installer's native force flag
+                    (`pip install --force-reinstall`, `BiocManager::install(..., force=TRUE)`,
+                    `conda install --force-reinstall`, `apt-get install --reinstall`).
+                    Version pins without a force flag are treated as informational;
+                    the existing install is used and a "[version-mismatch]" message
+                    is printed.
+                """
+                if timeout_seconds is None:
+                    cap = env_default_cap
+                else:
+                    try:
+                        cap = float(timeout_seconds)
+                    except (TypeError, ValueError):
+                        cap = env_default_cap
+                    cap = max(ct_min, min(ct_max, cap))
+                    self.state.cell_timeout_override_requests.append(cap)
+                return await run_cell_impl(code, idx=idx, timeout_cap=cap)
+
+            _run_cell_with_timeout.__name__ = "run_cell"
+            run_cell_tool = Tool.from_function(_run_cell_with_timeout)
+
         self.tools = [
-            Tool.from_function(self.run_cell),
+            run_cell_tool,
             Tool.from_function(self.reset_kernel),
-            Tool.from_function(self.submit_answer),
+            submit_tool,
             Tool.from_function(self.list_dir),
         ]
 
@@ -1730,7 +1932,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         Recursively lists files in a directory, with built-in protection against
         overwhelming the context with too many files. Use this tool instead of
-        writing code to list directories to avoid context bloat.
+        writing code to list directories to avoid context bloat. This is a tool
+        — do NOT call it as code (e.g., `list_dir()`) inside a `run_cell` call;
+        invoke it as a separate tool call.
 
         Usage Examples:
             list_dir()                      # List working directory
@@ -1797,7 +2001,42 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         Returns:
             Message with multimodal content if images present, otherwise string.
             The response includes the cell number (e.g., "[Cell #0] output...").
+
+        Related tools:
+            `reset_kernel` and `list_dir` are separate tools, NOT Python symbols
+            in the kernel namespace. Do NOT write `reset_kernel()` or `list_dir()`
+            inside a `run_cell` call — invoke them as separate tool calls instead.
+            A `reset_kernel` tool call after a `TimeoutError` is the supported way
+            to recover from a locked kernel.
+
+        Installing packages:
+            Install commands (`pip install`, `conda install`, `apt-get install`,
+            `BiocManager::install`, `install.packages`) are intercepted: if the
+            package is already present, the call returns quickly with a
+            "[pre-installed]" message. To force a fresh install of a specific
+            version, use the installer's native force flag
+            (`pip install --force-reinstall`, `BiocManager::install(..., force=TRUE)`,
+            `conda install --force-reinstall`, `apt-get install --reinstall`).
+            Version pins without a force flag are treated as informational; the
+            existing install is used and a "[version-mismatch]" message is printed.
         """
+        return await self._run_cell_with_cap(code, idx=idx, timeout_cap=self.execution_timeout)
+
+    async def _run_cell_with_cap(
+        self,
+        code: str,
+        idx: int | None = None,
+        timeout_cap: float | None = None,
+    ) -> Message | str | list[dict[str, Any]]:
+        """Implementation shared by `run_cell` and the timeout-override closure.
+
+        `timeout_cap` caps the per-cell execution time. `run_cell` passes
+        `self.execution_timeout` (the config default). The override closure
+        passes the model's clamped requested value.
+        """
+        if timeout_cap is None:
+            timeout_cap = self.execution_timeout
+
         run_cell_uuid = str(uuid.uuid4())
         remaining_seconds = self.get_remaining_time()
 
@@ -1809,11 +2048,11 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             return cfg.FORCE_MSG
 
         dynamic_timeout = remaining_seconds - self.execution_config.force_submit_threshold
-        effective_timeout = min(self.execution_timeout, dynamic_timeout)
+        effective_timeout = min(timeout_cap, dynamic_timeout)
 
         self.logger.info(
             f"Cell execution with dynamic timeout: {effective_timeout:.1f}s "
-            f"(remaining: {remaining_seconds:.1f}s, default: {self.execution_timeout}s)"
+            f"(remaining: {remaining_seconds:.1f}s, cap: {timeout_cap}s)"
         )
 
         # Parse idx (handle string input from LLM)
@@ -1833,21 +2072,53 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         cell_info = f"[Cell #{actual_cell_idx}] "
 
         if result.has_images():
-            # Format images as data URLs for Message
-            image_urls = [f"data:{mime_type};base64,{base64_data}" for mime_type, base64_data in result.get_images()]
-
-            return Message.create_message(
-                role="tool",
-                text=cell_info + result.get_truncated_text(),
-                images=cast(list[np.ndarray | str], image_urls),
-            )
+            # Format images as data URLs for Message. Aviary validates the image
+            # via PIL on construction; a figure with >178M pixels trips
+            # PIL.Image.DecompressionBombError. Reshape that to a cell-level
+            # error matching the `[Cell #N] Error: ...` shape the model sees for
+            # every other kernel error, so the framework's generic
+            # "Encountered exception during tool call:" wrapper doesn't fire.
+            try:
+                image_urls = [f"data:{mime_type};base64,{base64_data}" for mime_type, base64_data in result.get_images()]
+                return Message.create_message(
+                    role="tool",
+                    text=cell_info + result.get_truncated_text(),
+                    images=cast(list[np.ndarray | str], image_urls),
+                )
+            except Exception as e:
+                if type(e).__name__ != "DecompressionBombError" and "DecompressionBombError" not in str(e):
+                    raise
+                self.logger.warning(
+                    "DecompressionBombError on image output for cell %d: %s",
+                    actual_cell_idx, e,
+                )
+                hint = "Hint: reduce the figure size or dpi on plt.savefig / fig.savefig."
+                # Replace the cell's image output with an error output so the
+                # notebook state is consistent with what the model sees in text.
+                if 0 <= actual_cell_idx < len(self.state.nb.cells):
+                    self.state.nb.cells[actual_cell_idx].outputs = [
+                        nbformat.v4.new_output(
+                            output_type="error",
+                            ename="DecompressionBombError",
+                            evalue=str(e),
+                            traceback=[f"DecompressionBombError: {e}", hint],
+                        )
+                    ]
+                return (
+                    f"{cell_info}Error: DecompressionBombError\n"
+                    f"Message: {e}\n"
+                    f"Traceback: {hint}"
+                )
 
         return cell_info + result.get_truncated_text()
 
     async def reset_kernel(self) -> str:
         """Reset the kernel to a clean state.
 
-        This clears all variables and execution state.
+        This clears all variables and execution state. This is a tool — do NOT
+        call it as code (e.g., `reset_kernel()`) inside a `run_cell` call;
+        invoke it as a separate tool call. After a `TimeoutError` in a prior
+        cell, this is the supported way to unlock a frozen kernel.
         """
         if self.state.use_ray and self.state.kernel_container is not None:
             reset_ref = self.state.kernel_container._reset_via_http.remote()  # type: ignore[attr-defined]
@@ -1921,46 +2192,208 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             return False
         raise ValueError("Failed to parse verdict from faithfulness gate response")
 
+    async def _evaluate_hybrid_gate(self, solution: str, nb_content: str) -> dict[str, Any]:
+        """Per-item hybrid faithfulness judge. Fail-open on any error.
+
+        The judge reads the raw rubric text and is responsible for numbering
+        items and echoing each item's weight inline. We do NOT parse the
+        rubric on the client — formats in the dataset are too varied for
+        regex to handle reliably.
+
+        Returns a dict with parse_hybrid_response fields plus:
+            item_weights, prompt, response, judge_call_failed, parse_failed,
+            weights_mismatch (True if sum(weights) != problem.max_score).
+        """
+        assert self.rubric_model is not None
+
+        prompt = HYBRID_GATE_PROMPT.format(
+            hypothesis=self.problem.hypothesis,
+            notebook=nb_content,
+            proposed_solution=solution,
+            rubric=self.problem.rubric,
+        )
+
+        try:
+            resp = await self.rubric_model.call_single(prompt, timeout=3 * 60)
+        except Exception as e:
+            self.logger.exception("Hybrid judge call failed — failing open")
+            return {
+                "per_item": [], "proc_present_pts": 0, "proc_max_pts": 0,
+                "concl_present_pts": 0, "concl_max_pts": 0,
+                "item_weights": [], "prompt": prompt, "response": "",
+                "judge_call_failed": True, "parse_failed": False,
+                "weights_mismatch": False, "error": repr(e),
+            }
+
+        if not resp.text:
+            self.logger.warning("Hybrid judge returned empty response — failing open")
+            return {
+                "per_item": [], "proc_present_pts": 0, "proc_max_pts": 0,
+                "concl_present_pts": 0, "concl_max_pts": 0,
+                "item_weights": [], "prompt": prompt, "response": "",
+                "judge_call_failed": True, "parse_failed": False,
+                "weights_mismatch": False, "error": "empty response",
+            }
+
+        parsed = parse_hybrid_response(resp.text)
+
+        # Build the 1-indexed weight list the rubric-award synthesis needs.
+        # Items may come out of order; fill gaps with 0 (treated as "no such item").
+        item_weights: list[int] = []
+        if parsed["per_item"]:
+            max_idx = max(idx for idx, _, _, _ in parsed["per_item"])
+            by_idx = {idx: w for idx, w, _, _ in parsed["per_item"]}
+            item_weights = [by_idx.get(i, 0) for i in range(1, max_idx + 1)]
+
+        total_weight = sum(item_weights)
+        weights_mismatch = bool(item_weights) and total_weight != self.problem.max_score
+        if weights_mismatch:
+            self.logger.warning(
+                "Hybrid judge weights sum to %d but problem.max_score=%d — failing open on scoring",
+                total_weight, self.problem.max_score,
+            )
+
+        return {
+            **parsed,
+            "item_weights": item_weights,
+            "prompt": prompt,
+            "response": resp.text,
+            "judge_call_failed": False,
+            "parse_failed": not parsed["per_item"],
+            "weights_mismatch": weights_mismatch,
+        }
+
     async def _score_solution(self, solution: str) -> bool:
         assert self.rubric_model is not None
         nb_content, _ = view_notebook(self.state.nb.cells, self.language.value)
 
-        if self.config.enable_faithfulness_gate:
+        mode = self.config.faithfulness_mode
+        faith_result: dict[str, Any] | None = None
+
+        if mode == "binary":
             rubric_task = asyncio.ensure_future(self._evaluate_rubric(solution, nb_content))
             gate_task = asyncio.ensure_future(self._evaluate_faithfulness_gate(solution, nb_content))
-
-            # Always await the rubric score — it's the primary evaluation.
-            # If it fails, cancel the gate task so it doesn't dangle.
             try:
                 raw_score = await rubric_task
             except Exception:
                 gate_task.cancel()
                 raise
-
-            # The faithfulness gate is supplementary; if it errors out, log and fall back to rubric-only scoring
             try:
                 self.state.faithfulness_passed = await gate_task
             except Exception:
-                self.logger.exception("Faithfulness gate failed — falling back to rubric-only scoring")
+                self.logger.exception("Binary faithfulness gate failed — falling back to rubric-only scoring")
                 self.state.faithfulness_passed = None
-        else:
+
+        elif mode in ("shadow", "hybrid"):
+            rubric_task = asyncio.ensure_future(self._evaluate_rubric(solution, nb_content))
+            hybrid_task = asyncio.ensure_future(self._evaluate_hybrid_gate(solution, nb_content))
+            try:
+                raw_score = await rubric_task
+            except Exception:
+                hybrid_task.cancel()
+                raise
+            try:
+                faith_result = await hybrid_task
+            except Exception:
+                self.logger.exception("Hybrid gate failed — failing open to rubric-only scoring")
+                faith_result = {
+                    "per_item": [], "item_weights": [],
+                    "judge_call_failed": True, "parse_failed": False,
+                    "weights_mismatch": False,
+                }
+
+        else:  # "off"
             raw_score = await self._evaluate_rubric(solution, nb_content)
 
         try:
             self.state.raw_score = raw_score
             correct = raw_score == self.problem.max_score
-            score = raw_score / self.problem.max_score if self.config.normalize_reward else raw_score
-            score = max(
+            rubric_score = raw_score / self.problem.max_score if self.config.normalize_reward else raw_score
+            rubric_score = max(
                 0.0,
-                min(1.0 if self.config.normalize_reward else self.problem.max_score, score),
+                min(1.0 if self.config.normalize_reward else self.problem.max_score, rubric_score),
             )
+            self.state.rubric_reward_raw = float(rubric_score)
 
-            if self.config.enable_faithfulness_gate and self.state.faithfulness_passed is False:
-                self.logger.info("Faithfulness gate FAILED — zeroing reward")
-                score = 0.0
+            if mode == "binary":
+                if self.state.faithfulness_passed is False:
+                    self.logger.info("Binary faithfulness gate FAILED — zeroing reward")
+                    applied = 0.0
+                else:
+                    applied = rubric_score
 
-            self.state.score = score
-            self.state.total_reward += score
+            elif mode in ("shadow", "hybrid"):
+                assert faith_result is not None
+                item_weights = faith_result.get("item_weights", [])
+                judge_broken = (
+                    faith_result.get("judge_call_failed", False)
+                    or faith_result.get("parse_failed", False)
+                    or faith_result.get("weights_mismatch", False)
+                )
+                if judge_broken or not item_weights:
+                    # Fail-open: hybrid reward equals rubric reward, no items stripped.
+                    self.state.hybrid_reward_value = float(rubric_score)
+                    self.state.hybrid_metadata = {**faith_result, "strip_reason": "judge_unavailable"}
+                else:
+                    rubric_awards = synthesize_per_item_awards(raw_score, item_weights)
+                    hybrid_value, breakdown = hybrid_reward(rubric_awards, faith_result, self.problem.max_score)
+                    self.state.hybrid_reward_value = float(hybrid_value)
+                    self.state.hybrid_metadata = {**faith_result, **breakdown}
+                applied = rubric_score if mode == "shadow" else self.state.hybrid_reward_value
+
+            else:  # "off"
+                applied = rubric_score
+
+            # Scheme D: wager-shaped reward. Runs AFTER faithfulness-mode scoring
+            # and consumes the gate's correct signal via hybrid_metadata. Shadow
+            # mode computes but does not apply. Active mode applies and relaxes
+            # the upper clamp so the upside bonus can lift reward above 1.0.
+            wager_mode = self.config.wager_mode
+            if wager_mode != "off":
+                hm = self.state.hybrid_metadata or {}
+                proc_max = int(hm.get("proc_max_pts", 0))
+                concl_max_hm = int(hm.get("concl_max_pts", 0))
+                proc_credited = float(hm.get("proc_pts_credited", 0.0))
+                concl_credited = float(hm.get("concl_pts_credited", 0.0))
+                gate_unavailable = (
+                    (proc_max + concl_max_hm) <= 0
+                    or hm.get("strip_reason") == "judge_unavailable"
+                )
+                if gate_unavailable:
+                    self.state.wager_reward_shadow = float(applied)
+                    self.state.wager_metadata = {
+                        "skipped_reason": "gate_unavailable",
+                        "wager": self.state.wager,
+                    }
+                else:
+                    gate_correct = concl_credited >= concl_max_hm and concl_max_hm > 0
+                    wager_value, wager_breakdown = score_with_wager(
+                        proc_credit=proc_credited,
+                        proc_max=proc_max,
+                        concl_credit=concl_credited,
+                        concl_max=concl_max_hm,
+                        correct=gate_correct,
+                        wager=self.state.wager,
+                        beta=self.config.wager_beta,
+                        gamma=self.config.wager_gamma,
+                    )
+                    self.state.wager_reward_shadow = float(wager_value)
+                    self.state.wager_metadata = wager_breakdown
+
+                if wager_mode == "active":
+                    applied = self.state.wager_reward_shadow
+
+            # Upper clamp relaxes only when wager is active — the bonus can
+            # legitimately lift reward above 1.0, and downstream (NeMo-RL
+            # advantage computation) does not re-clamp.
+            if wager_mode == "active":
+                applied = max(0.0, applied)
+            # In off/shadow the existing clamp is preserved implicitly (the
+            # computed `applied` already came out of rubric_score/hybrid paths
+            # which were clamped above).
+
+            self.state.score = applied
+            self.state.total_reward += applied
             return correct
 
         finally:
@@ -1970,9 +2403,17 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 "raw_score": self.state.raw_score,
                 "max_score": self.problem.max_score,
                 "faithfulness_passed": self.state.faithfulness_passed,
+                "faithfulness_mode": self.config.faithfulness_mode,
+                "rubric_reward_raw": self.state.rubric_reward_raw,
+                "hybrid_reward_value": self.state.hybrid_reward_value,
+                "hybrid_metadata": self.state.hybrid_metadata,
+                "wager_mode": self.config.wager_mode,
+                "wager": self.state.wager,
+                "wager_reward_shadow": self.state.wager_reward_shadow,
+                "wager_metadata": self.state.wager_metadata,
             }
             with self.score_info_path.open("w") as f:
-                json.dump(score_info, f, indent=2)
+                json.dump(score_info, f, indent=2, default=str)
 
             self.logger.info(f"Received solution ({self.state.raw_score}/{self.problem.max_score}): {solution!r}.")
 
@@ -2041,6 +2482,14 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 "total_reward": self.state.total_reward,
                 "faithfulness_passed": self.state.faithfulness_passed,
                 "faithfulness_metadata": self.state.faithfulness_metadata,
+                "rubric_reward_raw": self.state.rubric_reward_raw,
+                "hybrid_reward_value": self.state.hybrid_reward_value,
+                "hybrid_metadata": self.state.hybrid_metadata,
+                "faithfulness_mode": self.config.faithfulness_mode,
+                "wager": self.state.wager,
+                "wager_reward_shadow": self.state.wager_reward_shadow,
+                "wager_metadata": self.state.wager_metadata,
+                "wager_mode": self.config.wager_mode,
             },
             info={
                 "language": self.state.language,
