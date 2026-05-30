@@ -107,11 +107,28 @@ def _load_image_as_base64(file_path: Path) -> str:
         raise RuntimeError(f"Failed to load image {file_path}: {e}") from e
 
 
-def encode_image_to_base64(image: str) -> str:
+def encode_image_to_base64_with_mime(
+    image: str,
+    mime_type: str = "image/png",
+    max_size_mib: float = 5.0,
+) -> tuple[str, str]:
+    """Encode a Jupyter base64 image and return its actual MIME type.
+
+    Compression may convert images to JPEG, so callers that build data URLs need
+    the post-processing MIME type rather than the original notebook MIME key.
+    """
     decoded_image = base64.b64decode(image)
     decoded_image = resize_image_if_needed(decoded_image)
-    decoded_image = compress_image_if_needed(decoded_image)
-    return base64.b64encode(decoded_image).decode("utf-8")
+    if len(base64.b64encode(decoded_image)) <= int(max_size_mib * 1024 * 1024):
+        return mime_type, base64.b64encode(decoded_image).decode("utf-8")
+
+    decoded_image = compress_image_if_needed(decoded_image, max_size_mib=max_size_mib)
+    return "image/jpeg", base64.b64encode(decoded_image).decode("utf-8")
+
+
+def encode_image_to_base64(image: str) -> str:
+    _, encoded = encode_image_to_base64_with_mime(image)
+    return encoded
 
 
 def create_image_message(file_path: Path, role: str = "user") -> Message | str:

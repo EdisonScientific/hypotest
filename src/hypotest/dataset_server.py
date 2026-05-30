@@ -52,6 +52,9 @@ class DatasetConfig(BaseModel):
     cell_timeout_override_mode: Literal["off", "on"] = "off"
     cell_timeout_min: float = 60.0
     cell_timeout_max: float = 1200.0
+    replace_image_payloads_with_placeholders: bool = True
+    include_images_in_rubric_model: bool = True
+    max_rubric_images: int = 20
     save_dir: Path | None = None
 
     execution_config: ExecutionConfig = Field(default_factory=ExecutionConfig)
@@ -150,13 +153,19 @@ class Dataset(TaskDataset[InterpreterEnv]):
         )
         language = language if language is not None else NBLanguage.PYTHON  # default auto language to python
 
-        return InterpreterEnv(
+        env = InterpreterEnv(
             problem=problem,
             rubric_model=self.rubric_model,
             work_dir=problem_dir,
             save_dir=save_dir,
             config=InterpreterEnvConfig(language=language, **self.config.model_dump()),
         )
+        # Populate correlation IDs read by InterpreterEnv._diag — without these,
+        # every diag event downstream emits env_id=None/task_idx=None, breaking
+        # cross-node hang correlation against the NemoGym driver logs.
+        env._nemo_task_idx = idx
+        env._nemo_env_id = run_id
+        return env
 
     def __len__(self) -> int:
         return len(self.problems)

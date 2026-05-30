@@ -92,4 +92,11 @@ class NotebookEnv(InterpreterEnv):
         return obs, reward, self.state.done, False
 
     def get_env_state_msg(self) -> EnvStateMessage:
-        return EnvStateMessage(content=view_notebook(self.state.nb.cells, self.language.value))
+        nb_content, nb_images = view_notebook(
+            self.state.nb.cells,
+            self.language.value,
+            include_images=not self.config.replace_image_payloads_with_placeholders,
+        )
+        if self.config.replace_image_payloads_with_placeholders:
+            nb_images = []
+        return EnvStateMessage.create_message(text=nb_content, images=nb_images)

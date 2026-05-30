@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 import warnings
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from tempfile import mkdtemp
 from textwrap import dedent
@@ -70,7 +70,7 @@ from .prompts import (
     PromptingConfig,
 )
 from .tools.filesystem import FilesystemTool, list_dir_tool
-from .utils import NBLanguage, view_notebook
+from .utils import NBLanguage, render_notebook_for_rubric
 
 RAY_INSTALLED = True
 try:
@@ -94,6 +94,10 @@ _RETRY_MAX_SLEEP = 16.0
 MAX_RAY_RESULT_WAIT_RETRIES = int(os.getenv("MAX_RAY_RESULT_WAIT_RETRIES", "3"))
 _RAY_RESULT_WAIT_TIMEOUT_GRACE = float(os.getenv("RAY_RESULT_WAIT_TIMEOUT_GRACE", "30"))
 _LIST_DIR_RAY_TIMEOUT = float(os.getenv("LIST_DIR_RAY_TIMEOUT", "30"))
+_RAY_ENROOT_CLOSE_TIMEOUT = float(os.getenv("RAY_ENROOT_CLOSE_TIMEOUT", "90"))
+_RAY_ENROOT_FORCE_KILL_TIMEOUT = float(os.getenv("RAY_ENROOT_FORCE_KILL_TIMEOUT", "30"))
+_ENROOT_GRACEFUL_CLOSE_TIMEOUT = float(os.getenv("ENROOT_GRACEFUL_CLOSE_TIMEOUT", "10"))
+_ENROOT_FORCE_SIGTERM_TIMEOUT = float(os.getenv("ENROOT_FORCE_SIGTERM_TIMEOUT", "2"))
 
 _warned_unsafe_execution: set[str] = set()
 _BACKGROUND_CLEANUP_TASKS: set[asyncio.Task[None]] = set()
@@ -141,10 +145,41 @@ async def get_free_port() -> int:
 
 logger = logging.getLogger(__name__)
 
+_QUIET_CONTAINER_BRINGUP = os.getenv(
+    "NEMO_GYM_QUIET_CONTAINER_BRINGUP", "0"
+).lower() in {"1", "true", "yes", "on"}
 # Container lifecycle log level: root logger defaults to WARNING and we
 # cannot reconfigure it, so use WARNING for all container diagnostics to
 # ensure they are visible in production logs.
-_CONTAINER_LOG_LEVEL = logging.WARNING
+_CONTAINER_LOG_LEVEL = logging.DEBUG if _QUIET_CONTAINER_BRINGUP else logging.WARNING
+_DIAG_PREFIX = "AVIARY_DIAG "
+_DIAG_LOG_PATH = os.getenv("AVIARY_DIAG_LOG_PATH")
+_DIAG_TO_STDERR = os.getenv("AVIARY_DIAG_LOG_TO_STDERR", "1") != "0"
+
+
+def _container_bringup_log(message: str, *args: Any) -> None:
+    if not _QUIET_CONTAINER_BRINGUP:
+        logger.warning(message, *args)
+
+
+def _diag(event: str, **fields: Any) -> None:
+    payload: dict[str, Any] = {
+        "event": event,
+        "ts": round(time.time(), 6),
+        "pid": os.getpid(),
+        "component": "hypotest.env.interpreter_env",
+        "module_file": __file__,
+    }
+    payload.update(fields)
+    line = json.dumps(payload, sort_keys=True, default=repr)
+    if _DIAG_TO_STDERR:
+        logger.warning("%s%s", _DIAG_PREFIX, line)
+    if _DIAG_LOG_PATH:
+        try:
+            with open(_DIAG_LOG_PATH, "a", encoding="utf-8") as diag_f:
+                diag_f.write(line + "\n")
+        except Exception:
+            logger.exception("Failed writing AVIARY_DIAG payload to %s", _DIAG_LOG_PATH)
 
 
 class _PortCollisionError(Exception):
@@ -264,6 +299,14 @@ async def _kill_process_group(
 
     Handles all edge cases: already-dead process, missing process group, etc.
     """
+    kill_t0 = time.perf_counter()
+    _diag(
+        "hypotest_kill_process_group_start",
+        label=label,
+        pid=proc.pid,
+        sigterm_timeout_s=sigterm_timeout,
+        returncode=proc.returncode,
+    )
     if proc.returncode is not None:
         logger.log(
             _CONTAINER_LOG_LEVEL,
@@ -272,6 +315,13 @@ async def _kill_process_group(
             proc.pid,
             proc.returncode,
         )
+        _diag(
+            "hypotest_kill_process_group_already_exited",
+            label=label,
+            pid=proc.pid,
+            returncode=proc.returncode,
+            elapsed_s=round(time.perf_counter() - kill_t0, 3),
+        )
         return
 
     pgid = None
@@ -279,19 +329,29 @@ async def _kill_process_group(
         pgid = os.getpgid(proc.pid)
     except ProcessLookupError:
         logger.log(_CONTAINER_LOG_LEVEL, "[%s] Process pid=%d vanished before we could get pgid", label, proc.pid)
+        _diag("hypotest_kill_process_group_no_pgid", label=label, pid=proc.pid)
         return
 
     # SIGTERM the whole group
     try:
         logger.log(_CONTAINER_LOG_LEVEL, "[%s] Sending SIGTERM to pgid=%d (pid=%d)", label, pgid, proc.pid)
+        _diag("hypotest_kill_process_group_sigterm", label=label, pid=proc.pid, pgid=pgid)
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
         logger.log(_CONTAINER_LOG_LEVEL, "[%s] Process group pgid=%d already gone after SIGTERM", label, pgid)
+        _diag("hypotest_kill_process_group_gone_after_sigterm", label=label, pid=proc.pid, pgid=pgid)
         return
 
     try:
         await asyncio.wait_for(proc.communicate(), timeout=sigterm_timeout)
     except TimeoutError:
+        _diag(
+            "hypotest_kill_process_group_sigterm_timeout",
+            label=label,
+            pid=proc.pid,
+            pgid=pgid,
+            elapsed_s=round(time.perf_counter() - kill_t0, 3),
+        )
         logger.warning(
             "[%s] Process pid=%d did not exit within %.1fs of SIGTERM, sending SIGKILL",
             label,
@@ -306,13 +366,23 @@ async def _kill_process_group(
             proc.pid,
             proc.returncode,
         )
+        _diag(
+            "hypotest_kill_process_group_sigterm_done",
+            label=label,
+            pid=proc.pid,
+            pgid=pgid,
+            returncode=proc.returncode,
+            elapsed_s=round(time.perf_counter() - kill_t0, 3),
+        )
         return
 
     # SIGKILL the whole group
     try:
+        _diag("hypotest_kill_process_group_sigkill", label=label, pid=proc.pid, pgid=pgid)
         os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
         logger.log(_CONTAINER_LOG_LEVEL, "[%s] Process group pgid=%d already gone before SIGKILL", label, pgid)
+        _diag("hypotest_kill_process_group_gone_before_sigkill", label=label, pid=proc.pid, pgid=pgid)
         return
 
     try:
@@ -324,7 +394,22 @@ async def _kill_process_group(
             proc.pid,
             proc.returncode,
         )
+        _diag(
+            "hypotest_kill_process_group_sigkill_done",
+            label=label,
+            pid=proc.pid,
+            pgid=pgid,
+            returncode=proc.returncode,
+            elapsed_s=round(time.perf_counter() - kill_t0, 3),
+        )
     except TimeoutError:
+        _diag(
+            "hypotest_kill_process_group_sigkill_timeout",
+            label=label,
+            pid=proc.pid,
+            pgid=pgid,
+            elapsed_s=round(time.perf_counter() - kill_t0, 3),
+        )
         logger.exception("[%s] Process pid=%d still alive after SIGKILL — possible zombie", label, proc.pid)
 
 
@@ -571,12 +656,23 @@ class EnrootKernelServer:
         return cmd
 
     async def initialize(self, work_dir: Path, language: NBLanguage) -> None:
+        init_t0 = time.perf_counter()
+        _diag(
+            "hypotest_enroot_actor_initialize_start",
+            work_dir=str(work_dir),
+            language=language.value,
+            container_sqsh_path=str(self.container_sqsh_path),
+        )
         startup_token = str(uuid.uuid4())
         node_workdir = Path(f"{cfg.CONTAINER_WORKSPACE_PREFIX}.{startup_token.split('-', maxsplit=1)[0]}")
         self._node_workdir = node_workdir
 
         _prep_workspace_dir(str(work_dir), workspace_path=str(node_workdir))
-        logger.warning("[ray-enroot] prepared node-local workspace %s for host work_dir=%s", node_workdir, work_dir)
+        _container_bringup_log(
+            "[ray-enroot] prepared node-local workspace %s for host work_dir=%s",
+            node_workdir,
+            work_dir,
+        )
 
         kernel_server_path = Path(__file__).parent / "kernel_server.py"
         assert kernel_server_path.is_file(), f"kernel server must be a valid path, found {kernel_server_path}"
@@ -634,6 +730,15 @@ class EnrootKernelServer:
                     stdout=self._container_log_file,
                     stderr=subprocess.STDOUT,
                 )
+                _diag(
+                    "hypotest_enroot_actor_process_started",
+                    label=self._proc_label(),
+                    attempt=attempt,
+                    work_dir=str(work_dir),
+                    node_workdir=str(node_workdir),
+                    port=self._container_port,
+                    pid=self._enroot_proc.pid,
+                )
                 logger.log(
                     _CONTAINER_LOG_LEVEL,
                     "[%s] Container launch attempt #%d started (work_dir=%s, token=%s)",
@@ -661,10 +766,27 @@ class EnrootKernelServer:
                     launch_ms,
                     attempt,
                 )
+                _diag(
+                    "hypotest_enroot_actor_initialize_done",
+                    label=self._proc_label(),
+                    work_dir=str(work_dir),
+                    node_workdir=str(node_workdir),
+                    attempt=attempt,
+                    elapsed_s=round(time.perf_counter() - init_t0, 3),
+                )
                 online = True
             except Exception as e:
                 last_err = e
                 launch_ms = (time.perf_counter() - launch_t0) * 1000.0
+                _diag(
+                    "hypotest_enroot_actor_initialize_attempt_failed",
+                    label=self._proc_label(),
+                    work_dir=str(work_dir),
+                    node_workdir=str(node_workdir),
+                    attempt=attempt,
+                    elapsed_s=round(time.perf_counter() - init_t0, 3),
+                    error=repr(e),
+                )
                 await self._log_container_failure(attempt, launch_ms, e)
                 await self._cleanup_failed_startup()
                 if not isinstance(e, _PortCollisionError):
@@ -866,39 +988,91 @@ class EnrootKernelServer:
 
         return result
 
-    async def close(self):
-        label = self._proc_label()
-        logger.log(_CONTAINER_LOG_LEVEL, "[%s] Closing EnrootKernelServer", label)
-
+    async def _cleanup_runtime(self, label: str, *, sigterm_timeout: float = 15.0) -> None:
+        cleanup_t0 = time.perf_counter()
+        _diag(
+            "hypotest_enroot_actor_cleanup_runtime_start",
+            label=label,
+            port=self._container_port,
+            has_http_client=self._http_client is not None,
+            has_proc=self._enroot_proc is not None,
+            node_workdir=str(self._node_workdir) if self._node_workdir is not None else None,
+            sigterm_timeout_s=sigterm_timeout,
+        )
         if self._container_port is not None:
             async with used_ports_lock:
                 _USED_PORTS.discard(self._container_port)
+            self._container_port = None
 
         if self._http_client is not None:
-            try:
-                response = await self._http_client.post("/close")
-                response.raise_for_status()
-            except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.TimeoutException):
-                logger.log(
-                    _CONTAINER_LOG_LEVEL, "[%s] Graceful /close request failed (container may already be down)", label
-                )
-            except Exception:
-                logger.warning("[%s] Unexpected error on /close request", label, exc_info=True)
             with contextlib.suppress(Exception):
+                _diag("hypotest_enroot_actor_http_client_close_start", label=label)
                 await self._http_client.aclose()
+                _diag("hypotest_enroot_actor_http_client_close_done", label=label)
             self._http_client = None
 
         if self._enroot_proc is not None:
-            await _kill_process_group(self._enroot_proc, label=label)
+            _diag("hypotest_enroot_actor_process_cleanup_start", label=label, pid=self._enroot_proc.pid)
+            await _kill_process_group(self._enroot_proc, label=label, sigterm_timeout=sigterm_timeout)
             self._enroot_proc = None
+            _diag("hypotest_enroot_actor_process_cleanup_done", label=label)
 
         await self._close_container_log()
 
         if self._node_workdir is not None:
+            _diag("hypotest_enroot_actor_node_workdir_cleanup_start", label=label, node_workdir=str(self._node_workdir))
             await asyncio.to_thread(shutil.rmtree, self._node_workdir, ignore_errors=True)
             self._node_workdir = None
+            _diag("hypotest_enroot_actor_node_workdir_cleanup_done", label=label)
+        _diag(
+            "hypotest_enroot_actor_cleanup_runtime_done",
+            label=label,
+            elapsed_s=round(time.perf_counter() - cleanup_t0, 3),
+        )
+
+    async def force_kill(self):
+        label = self._proc_label()
+        _diag("hypotest_enroot_actor_force_kill_start", label=label)
+        logger.warning("[%s] Force-killing EnrootKernelServer", label)
+        await self._cleanup_runtime(label, sigterm_timeout=_ENROOT_FORCE_SIGTERM_TIMEOUT)
+        logger.warning("[%s] EnrootKernelServer force-killed", label)
+        _diag("hypotest_enroot_actor_force_kill_done", label=label)
+
+    async def close(self):
+        label = self._proc_label()
+        close_t0 = time.perf_counter()
+        _diag("hypotest_enroot_actor_close_start", label=label, graceful_timeout_s=_ENROOT_GRACEFUL_CLOSE_TIMEOUT)
+        logger.log(_CONTAINER_LOG_LEVEL, "[%s] Closing EnrootKernelServer", label)
+
+        if self._http_client is not None:
+            try:
+                _diag("hypotest_enroot_actor_http_close_start", label=label)
+                response = await self._http_client.post(
+                    "/close",
+                    timeout=httpx.Timeout(_ENROOT_GRACEFUL_CLOSE_TIMEOUT, connect=5.0),
+                )
+                response.raise_for_status()
+                _diag("hypotest_enroot_actor_http_close_done", label=label, status=response.status_code)
+            except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.TimeoutException):
+                _diag(
+                    "hypotest_enroot_actor_http_close_timeout_or_error",
+                    label=label,
+                    graceful_timeout_s=_ENROOT_GRACEFUL_CLOSE_TIMEOUT,
+                )
+                logger.log(
+                    _CONTAINER_LOG_LEVEL,
+                    "[%s] Graceful /close request failed or timed out after %.1fs (forcing process cleanup)",
+                    label,
+                    _ENROOT_GRACEFUL_CLOSE_TIMEOUT,
+                )
+            except Exception:
+                _diag("hypotest_enroot_actor_http_close_unexpected_exception", label=label)
+                logger.warning("[%s] Unexpected error on /close request", label, exc_info=True)
+
+        await self._cleanup_runtime(label)
 
         logger.log(_CONTAINER_LOG_LEVEL, "[%s] EnrootKernelServer closed", label)
+        _diag("hypotest_enroot_actor_close_done", label=label, elapsed_s=round(time.perf_counter() - close_t0, 3))
 
 
 class InterpreterEnvState:
@@ -971,9 +1145,9 @@ class InterpreterEnvState:
 
         self.raw_score: int = 0
         self.score: float = 0.0
-        self.score_metadata: dict[str, str | int] = {}
+        self.score_metadata: dict[str, Any] = {}
         self.faithfulness_passed: bool | None = None
-        self.faithfulness_metadata: dict[str, str] = {}
+        self.faithfulness_metadata: dict[str, Any] = {}
         self.rubric_reward_raw: float = 0.0
         self.hybrid_reward_value: float = 0.0
         self.hybrid_metadata: dict[str, Any] = {}
@@ -984,6 +1158,14 @@ class InterpreterEnvState:
 
     async def start(self):
         """Start the interpreter (local or Docker-based)."""
+        start_t0 = time.perf_counter()
+        _diag(
+            "hypotest_state_start",
+            work_dir=str(self.work_dir),
+            use_ray=self.use_ray,
+            use_enroot=self.use_enroot,
+            use_docker=self.use_docker,
+        )
         if self.use_enroot:
             assert self.container_sqsh_path is not None, "container_sqsh_path must be set in config to use enroot"
             if self.use_ray:
@@ -995,9 +1177,12 @@ class InterpreterEnvState:
         else:
             assert self.interpreter is not None
             await self.interpreter.start()
+        _diag("hypotest_state_start_done", work_dir=str(self.work_dir), elapsed_s=round(time.perf_counter() - start_t0, 3))
 
     async def _start_ray_enroot_container(self) -> None:
-        logger.warning("[ray-enroot] creating actor for work_dir=%s", self.work_dir)
+        _container_bringup_log(
+            "[ray-enroot] creating actor for work_dir=%s", self.work_dir
+        )
         self.kernel_container = EnrootKernelServer.remote(  # type: ignore[attr-defined]
             self.container_sqsh_path,
             self.execution_timeout,
@@ -1005,7 +1190,10 @@ class InterpreterEnvState:
             sandbox_memory_limit_mb=self.sandbox_memory_limit_mb,
             sandbox_max_pids=self.sandbox_max_pids,
         )
-        logger.warning("[ray-enroot] actor created, calling initialize for work_dir=%s", self.work_dir)
+        _container_bringup_log(
+            "[ray-enroot] actor created, calling initialize for work_dir=%s",
+            self.work_dir,
+        )
         init_ref = self.kernel_container.initialize.remote(self.work_dir, self.language)  # type: ignore[union-attr]
         await self._await_ray_ref(
             init_ref,
@@ -1014,7 +1202,9 @@ class InterpreterEnvState:
             operation="initialize",
             max_retries=1,
         )
-        logger.warning("[ray-enroot] initialize complete for work_dir=%s", self.work_dir)
+        _container_bringup_log(
+            "[ray-enroot] initialize complete for work_dir=%s", self.work_dir
+        )
 
     async def _await_ray_ref(
         self,
@@ -1028,13 +1218,40 @@ class InterpreterEnvState:
         effective_timeout = timeout if timeout is not None else self.execution_timeout
         wait_timeout = effective_timeout + _RAY_RESULT_WAIT_TIMEOUT_GRACE
         last_timeout: TimeoutError | None = None
+        ray_t0 = time.perf_counter()
+        _diag(
+            "hypotest_ray_ref_wait_start",
+            work_dir=str(self.work_dir),
+            req_uuid=req_uuid,
+            operation=operation,
+            timeout_s=wait_timeout,
+            max_retries=max_retries,
+        )
 
         for attempt in range(1, max_retries + 1):
             try:
-                return await asyncio.wait_for(asyncio.shield(ref), timeout=wait_timeout)
+                result = await asyncio.wait_for(asyncio.shield(ref), timeout=wait_timeout)
+                _diag(
+                    "hypotest_ray_ref_wait_done",
+                    work_dir=str(self.work_dir),
+                    req_uuid=req_uuid,
+                    operation=operation,
+                    attempt=attempt,
+                    elapsed_s=round(time.perf_counter() - ray_t0, 3),
+                )
+                return result
             except TimeoutError as exc:
                 last_timeout = exc
                 if attempt >= max_retries:
+                    _diag(
+                        "hypotest_ray_ref_wait_timeout",
+                        work_dir=str(self.work_dir),
+                        req_uuid=req_uuid,
+                        operation=operation,
+                        attempt=attempt,
+                        elapsed_s=round(time.perf_counter() - ray_t0, 3),
+                        timeout_s=wait_timeout,
+                    )
                     logger.error(
                         "[ray-enroot] req %s exhausted waits for %s on work_dir=%s "
                         "(attempts=%d, timeout_per_attempt=%.1fs)",
@@ -1069,6 +1286,37 @@ class InterpreterEnvState:
         port = self._container_port or "?"
         pid = self._enroot_proc.pid if self._enroot_proc else "?"
         return f"enroot-state(port={port}, pid={pid})"
+
+    async def _force_close_ray_enroot_container(self) -> None:
+        if self.kernel_container is None:
+            return
+
+        force_t0 = time.perf_counter()
+        _diag("hypotest_ray_enroot_force_close_start", work_dir=str(self.work_dir), actor=repr(self.kernel_container))
+        try:
+            logger.error("[ray-enroot] forcing kernel container cleanup for work_dir=%s", self.work_dir)
+            force_ref = self.kernel_container.force_kill.remote()  # type: ignore[attr-defined]
+            await self._await_ray_ref(
+                force_ref,
+                timeout=_RAY_ENROOT_FORCE_KILL_TIMEOUT,
+                req_uuid=f"force-close:{self.work_dir.name}",
+                operation="force_kill",
+                max_retries=1,
+            )
+        except Exception:
+            _diag(
+                "hypotest_ray_enroot_force_close_exception",
+                work_dir=str(self.work_dir),
+                elapsed_s=round(time.perf_counter() - force_t0, 3),
+            )
+            logger.exception("[ray-enroot] force_kill failed for work_dir=%s; killing actor", self.work_dir)
+        finally:
+            if RAY_INSTALLED:
+                with contextlib.suppress(Exception):
+                    _diag("hypotest_ray_enroot_ray_kill_start", work_dir=str(self.work_dir), actor=repr(self.kernel_container))
+                    ray.kill(self.kernel_container, no_restart=True)  # type: ignore[arg-type]
+                    _diag("hypotest_ray_enroot_ray_kill_done", work_dir=str(self.work_dir))
+            _diag("hypotest_ray_enroot_force_close_done", work_dir=str(self.work_dir), elapsed_s=round(time.perf_counter() - force_t0, 3))
 
     async def _start_enroot_container(self) -> None:
         _prep_workspace_dir(str(self.work_dir))
@@ -1377,15 +1625,51 @@ class InterpreterEnvState:
 
     async def close(self):
         """Save the notebook and close the interpreter or container."""
+        close_t0 = time.perf_counter()
+        _diag(
+            "hypotest_state_close_start",
+            work_dir=str(self.work_dir),
+            save_dir=str(self.save_dir) if self.save_dir is not None else None,
+            use_ray=self.use_ray,
+            use_enroot=self.use_enroot,
+            use_docker=self.use_docker,
+            kernel_container=repr(getattr(self, "kernel_container", None)),
+        )
+        _diag("hypotest_state_close_notebook_write_start", work_dir=str(self.work_dir))
         nbformat.write(self.nb, self.work_dir / "notebook.ipynb")
+        _diag("hypotest_state_close_notebook_write_done", work_dir=str(self.work_dir))
 
         if self.use_ray and self.use_enroot:
             if self.kernel_container is not None:
+                _diag(
+                    "hypotest_state_close_ray_actor_close_start",
+                    work_dir=str(self.work_dir),
+                    timeout_s=_RAY_ENROOT_CLOSE_TIMEOUT + _RAY_RESULT_WAIT_TIMEOUT_GRACE,
+                )
                 close_ref = self.kernel_container.close.remote()  # type: ignore[attr-defined]
-                await close_ref
-                self.kernel_container = None
+                try:
+                    await self._await_ray_ref(
+                        close_ref,
+                        timeout=_RAY_ENROOT_CLOSE_TIMEOUT,
+                        req_uuid=f"close:{self.work_dir.name}",
+                        operation="close",
+                        max_retries=1,
+                    )
+                    _diag("hypotest_state_close_ray_actor_close_done", work_dir=str(self.work_dir))
+                except TimeoutError:
+                    _diag("hypotest_state_close_ray_actor_close_timeout", work_dir=str(self.work_dir))
+                    logger.exception(
+                        "[ray-enroot] timed out closing kernel container for work_dir=%s after %.1fs",
+                        self.work_dir,
+                        _RAY_ENROOT_CLOSE_TIMEOUT + _RAY_RESULT_WAIT_TIMEOUT_GRACE,
+                    )
+                    await self._force_close_ray_enroot_container()
+                finally:
+                    self.kernel_container = None
+                    _diag("hypotest_state_close_kernel_container_cleared", work_dir=str(self.work_dir))
 
         elif self.use_docker or self.use_enroot:
+            _diag("hypotest_state_close_local_container_cleanup_start", work_dir=str(self.work_dir))
             if self._container_port is not None:
                 async with used_ports_lock:
                     _USED_PORTS.discard(self._container_port)
@@ -1412,11 +1696,15 @@ class InterpreterEnvState:
                 self._enroot_proc = None
 
             await self._close_container_log()
+            _diag("hypotest_state_close_local_container_cleanup_done", work_dir=str(self.work_dir))
 
         elif self.interpreter is not None:
+            _diag("hypotest_state_close_local_interpreter_start", work_dir=str(self.work_dir))
             await self.interpreter.close()
+            _diag("hypotest_state_close_local_interpreter_done", work_dir=str(self.work_dir))
 
         if self.save_dir is not None and self.work_dir.exists():
+            _diag("hypotest_state_close_save_dir_start", work_dir=str(self.work_dir), save_dir=str(self.save_dir))
             self.save_dir.parent.mkdir(parents=True, exist_ok=True)
             if self.save_dir.exists():
                 try:
@@ -1431,7 +1719,9 @@ class InterpreterEnvState:
                 self.work_dir.replace(self.save_dir)
             except Exception as e:
                 logger.warning("Failed to move work_dir %s to save_dir %s: %s", self.work_dir, self.save_dir, e)
+            _diag("hypotest_state_close_save_dir_done", work_dir=str(self.work_dir), save_dir=str(self.save_dir))
         elif self.work_dir.exists():
+            _diag("hypotest_state_close_workspace_detach_start", work_dir=str(self.work_dir))
             try:
                 cleanup_path = _detach_dir_for_cleanup(self.work_dir)
             except Exception as e:
@@ -1440,6 +1730,8 @@ class InterpreterEnvState:
                 if cleanup_path is not None:
                     logger.warning("Detached workspace %s to %s for background cleanup", self.work_dir, cleanup_path)
                     _schedule_dir_cleanup(cleanup_path)
+                    _diag("hypotest_state_close_workspace_detached", work_dir=str(self.work_dir), cleanup_path=str(cleanup_path))
+        _diag("hypotest_state_close_done", work_dir=str(self.work_dir), elapsed_s=round(time.perf_counter() - close_t0, 3))
 
     def _add_cell(self, code: str, result: "ExecutionResult") -> int:
         """Add a new code cell to the notebook with execution results.
@@ -1605,6 +1897,9 @@ class InterpreterEnvConfig(BaseModel):
     cell_timeout_override_mode: Literal["off", "on"] = "off"
     cell_timeout_min: float = 60.0
     cell_timeout_max: float = 1200.0
+    replace_image_payloads_with_placeholders: bool = True
+    include_images_in_rubric_model: bool = True
+    max_rubric_images: int = 20
 
     @model_validator(mode="after")
     def _migrate_enable_faithfulness_gate(self) -> "InterpreterEnvConfig":
@@ -1686,13 +1981,38 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
     async def close(self) -> None:
         """Save notebook, shut down interpreter/container."""
+        close_t0 = time.perf_counter()
+        _diag(
+            "hypotest_env_close_start",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            step_count=self.step_count,
+            done=self.done,
+        )
         self.logger.info("Closing environment")
         await self.state.close()
+        _diag(
+            "hypotest_env_close_done",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            elapsed_s=round(time.perf_counter() - close_t0, 3),
+        )
 
     async def reset(self) -> tuple[Messages, list[Tool]]:
         """Reset the environment and prepare for execution."""
+        reset_t0 = time.perf_counter()
         reset_id = getattr(self, "_nemo_env_id", "?")[:8]
-        logger.warning("[reset:%s] building state for work_dir=%s", reset_id, self.work_dir)
+        _diag(
+            "hypotest_env_reset_start",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+        )
+        _container_bringup_log(
+            "[reset:%s] building state for work_dir=%s", reset_id, self.work_dir
+        )
 
         # Format environment capabilities with job_timeout
         env_capabilities = self.execution_config.environment_capabilities_prompt.format(
@@ -1731,9 +2051,11 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             sandbox_memory_limit_mb=self.execution_config.sandbox_memory_limit_mb,
             sandbox_max_pids=self.execution_config.sandbox_max_pids,
         )
-        logger.warning("[reset:%s] starting container", reset_id)
+        _container_bringup_log("[reset:%s] starting container", reset_id)
         await self.state.start()
-        logger.warning("[reset:%s] container started, building tools", reset_id)
+        _container_bringup_log(
+            "[reset:%s] container started, building tools", reset_id
+        )
 
         # Record start time for timeout tracking
         self.start_time = time.perf_counter()
@@ -1894,12 +2216,29 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         # Always show initial directory listing (with truncation protection)
         messages.append(Message(content=await self.list_dir()))
 
-        logger.warning("[reset:%s] reset fully complete", reset_id)
+        _container_bringup_log("[reset:%s] reset fully complete", reset_id)
+        _diag(
+            "hypotest_env_reset_done",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            tool_names=[tool.info.name for tool in self.tools],
+            elapsed_s=round(time.perf_counter() - reset_t0, 3),
+        )
         return messages, self.tools
 
     async def step(self, action: ToolRequestMessage) -> tuple[Messages, float, bool, bool]:
         """Execute a step in the environment."""
+        step_t0 = time.perf_counter()
         self.step_count += 1
+        _diag(
+            "hypotest_env_step_start",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            step_count=self.step_count,
+            tool_names=[tool_call.function.name for tool_call in action.tool_calls],
+        )
         obs = cast(
             Messages,
             await self.exec_tool_calls(action, concurrency=False, handle_tool_exc=True),
@@ -1918,6 +2257,17 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         self.state.actions.append(str(action))
         reward = self.state.score if self.state.done else 0.0
+        _diag(
+            "hypotest_env_step_done",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            step_count=self.step_count,
+            done=self.state.done,
+            reward=reward,
+            obs_count=len(obs),
+            elapsed_s=round(time.perf_counter() - step_t0, 3),
+        )
         return obs, reward, self.state.done, False
 
     # ========== Tools ==========
@@ -2037,13 +2387,34 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         if timeout_cap is None:
             timeout_cap = self.execution_timeout
 
+        run_cell_t0 = time.perf_counter()
         run_cell_uuid = str(uuid.uuid4())
         remaining_seconds = self.get_remaining_time()
+        _diag(
+            "hypotest_run_cell_start",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            step_count=self.step_count,
+            req_uuid=run_cell_uuid,
+            remaining_s=remaining_seconds,
+            code_chars=len(code),
+            idx=idx,
+            timeout_cap_s=timeout_cap,
+        )
 
         if remaining_seconds <= self.execution_config.force_submit_threshold:
             self.logger.warning(
                 f"Refusing cell execution with {remaining_seconds:.1f}s remaining "
                 f"(force threshold: {self.execution_config.force_submit_threshold}s)"
+            )
+            _diag(
+                "hypotest_run_cell_refused_force_submit",
+                env_id=getattr(self, "_nemo_env_id", None),
+                task_idx=getattr(self, "_nemo_task_idx", None),
+                work_dir=str(self.work_dir),
+                req_uuid=run_cell_uuid,
+                remaining_s=remaining_seconds,
             )
             return cfg.FORCE_MSG
 
@@ -2064,14 +2435,46 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 cell_idx = None
 
         # Execute code and update notebook atomically
+        exec_t0 = time.perf_counter()
+        _diag(
+            "hypotest_run_cell_execute_start",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            step_count=self.step_count,
+            req_uuid=run_cell_uuid,
+            timeout_s=effective_timeout,
+            cell_idx=cell_idx,
+        )
         result, actual_cell_idx = await self.state.execute_and_add_cell(
             code, cell_idx=cell_idx, timeout=effective_timeout, req_uuid=run_cell_uuid,
+        )
+        _diag(
+            "hypotest_run_cell_execute_done",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            step_count=self.step_count,
+            req_uuid=run_cell_uuid,
+            actual_cell_idx=actual_cell_idx,
+            error_occurred=result.error_occurred,
+            elapsed_s=round(time.perf_counter() - run_cell_t0, 3),
+            execute_elapsed_s=round(time.perf_counter() - exec_t0, 3),
         )
 
         # Build response with cell number
         cell_info = f"[Cell #{actual_cell_idx}] "
 
-        if result.has_images():
+        image_count = result.count_images()
+        if image_count:
+            if self.config.replace_image_payloads_with_placeholders:
+                image_word = "image output" if image_count == 1 else "image outputs"
+                return (
+                    cell_info
+                    + result.get_truncated_text()
+                    + f"\n[{image_count} {image_word} omitted from policy context]"
+                )
+
             # Format images as data URLs for Message. Aviary validates the image
             # via PIL on construction; a figure with >178M pixels trips
             # PIL.Image.DecompressionBombError. Reshape that to a cell-level
@@ -2079,7 +2482,15 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             # every other kernel error, so the framework's generic
             # "Encountered exception during tool call:" wrapper doesn't fire.
             try:
-                image_urls = [f"data:{mime_type};base64,{base64_data}" for mime_type, base64_data in result.get_images()]
+                images = result.get_images()
+                if not images:
+                    image_word = "image output" if image_count == 1 else "image outputs"
+                    return (
+                        cell_info
+                        + result.get_truncated_text()
+                        + f"\n[{image_count} {image_word} could not be encoded]"
+                    )
+                image_urls = [f"data:{mime_type};base64,{base64_data}" for mime_type, base64_data in images]
                 return Message.create_message(
                     role="tool",
                     text=cell_info + result.get_truncated_text(),
@@ -2120,6 +2531,14 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         invoke it as a separate tool call. After a `TimeoutError` in a prior
         cell, this is the supported way to unlock a frozen kernel.
         """
+        reset_t0 = time.perf_counter()
+        _diag(
+            "hypotest_tool_reset_kernel_start",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            step_count=self.step_count,
+        )
         if self.state.use_ray and self.state.kernel_container is not None:
             reset_ref = self.state.kernel_container._reset_via_http.remote()  # type: ignore[attr-defined]
             await reset_ref
@@ -2135,15 +2554,59 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.state.notebook_runtime_errors = []
         self.state._execution_count = 0
 
+        _diag(
+            "hypotest_tool_reset_kernel_done",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            step_count=self.step_count,
+            elapsed_s=round(time.perf_counter() - reset_t0, 3),
+        )
         return "Kernel reset successfully."
 
     @property
     def score_info_path(self) -> Path:
         return self.work_dir / "score_info.json"
 
+    @staticmethod
+    def _rubric_image_metadata(rubric_images: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """Return image metadata safe for score_info.json; never include data URLs."""
+        metadata: list[dict[str, Any]] = []
+        for image in rubric_images:
+            item = {k: v for k, v in image.items() if k != "data_url"}
+            data_url = str(image.get("data_url", ""))
+            item["data_url_chars"] = len(data_url)
+            metadata.append(item)
+        return metadata
+
+    async def _call_rubric_model(
+        self,
+        prompt: str,
+        rubric_images: list[Mapping[str, Any]],
+        *,
+        timeout: float,
+    ) -> Any:
+        assert self.rubric_model is not None
+        if not rubric_images:
+            return await self.rubric_model.call_single(prompt, timeout=timeout)
+
+        image_urls = [str(image["data_url"]) for image in rubric_images]
+        message = Message.create_message(
+            role="user",
+            text=prompt,
+            images=cast(list[np.ndarray | str], image_urls),
+        )
+        return await self.rubric_model.call_single([message], timeout=timeout)
+
     @tenacity.retry(stop=tenacity.stop_after_attempt(3), retry=tenacity.retry_if_exception_type(ValueError))
-    async def _evaluate_rubric(self, solution: str, nb_content: str) -> int:
+    async def _evaluate_rubric(
+        self,
+        solution: str,
+        nb_content: str,
+        rubric_images: list[Mapping[str, Any]],
+    ) -> int:
         """Evaluate the solution against the rubric. Returns raw integer score."""
+        eval_t0 = time.perf_counter()
         assert self.rubric_model is not None
 
         prompt = self.state.score_metadata["prompt"] = RUBRIC_SCORE_PROMPT.format(
@@ -2153,8 +2616,26 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             notebook=nb_content,
             proposed_solution=solution,
         )
+        self.state.score_metadata["rubric_images"] = self._rubric_image_metadata(rubric_images)
 
-        resp = await self.rubric_model.call_single(prompt, timeout=3 * 60)
+        _diag(
+            "hypotest_score_rubric_model_call_start",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            prompt_chars=len(prompt),
+            image_count=len(rubric_images),
+            timeout_s=3 * 60,
+        )
+        resp = await self._call_rubric_model(prompt, rubric_images, timeout=3 * 60)
+        _diag(
+            "hypotest_score_rubric_model_call_done",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            response_chars=len(resp.text or ""),
+            elapsed_s=round(time.perf_counter() - eval_t0, 3),
+        )
         if not resp.text:
             raise ValueError("No response from rubric model")
         self.state.score_metadata["response"] = resp.text
@@ -2165,8 +2646,14 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             raise ValueError("Failed to parse score from response") from e
 
     @tenacity.retry(stop=tenacity.stop_after_attempt(3), retry=tenacity.retry_if_exception_type(ValueError))
-    async def _evaluate_faithfulness_gate(self, solution: str, nb_content: str) -> bool:
+    async def _evaluate_faithfulness_gate(
+        self,
+        solution: str,
+        nb_content: str,
+        rubric_images: list[Mapping[str, Any]],
+    ) -> bool:
         """Evaluate whether the conclusion is supported by notebook state. Returns True if faithful."""
+        eval_t0 = time.perf_counter()
         assert self.rubric_model is not None
 
         additional = ""
@@ -2180,8 +2667,26 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             additional_criteria=additional,
         )
         self.state.faithfulness_metadata["prompt"] = prompt
+        self.state.faithfulness_metadata["rubric_images"] = self._rubric_image_metadata(rubric_images)
 
-        resp = await self.rubric_model.call_single(prompt, timeout=3 * 60)
+        _diag(
+            "hypotest_score_faithfulness_model_call_start",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            prompt_chars=len(prompt),
+            image_count=len(rubric_images),
+            timeout_s=3 * 60,
+        )
+        resp = await self._call_rubric_model(prompt, rubric_images, timeout=3 * 60)
+        _diag(
+            "hypotest_score_faithfulness_model_call_done",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            response_chars=len(resp.text or ""),
+            elapsed_s=round(time.perf_counter() - eval_t0, 3),
+        )
         if not resp.text:
             raise ValueError("No response from faithfulness gate")
         self.state.faithfulness_metadata["response"] = resp.text
@@ -2192,7 +2697,12 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             return False
         raise ValueError("Failed to parse verdict from faithfulness gate response")
 
-    async def _evaluate_hybrid_gate(self, solution: str, nb_content: str) -> dict[str, Any]:
+    async def _evaluate_hybrid_gate(
+        self,
+        solution: str,
+        nb_content: str,
+        rubric_images: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
         """Per-item hybrid faithfulness judge. Fail-open on any error.
 
         The judge reads the raw rubric text and is responsible for numbering
@@ -2204,6 +2714,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             item_weights, prompt, response, judge_call_failed, parse_failed,
             weights_mismatch (True if sum(weights) != problem.max_score).
         """
+        eval_t0 = time.perf_counter()
         assert self.rubric_model is not None
 
         prompt = HYBRID_GATE_PROMPT.format(
@@ -2214,13 +2725,40 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         )
 
         try:
-            resp = await self.rubric_model.call_single(prompt, timeout=3 * 60)
+            _diag(
+                "hypotest_score_hybrid_model_call_start",
+                env_id=getattr(self, "_nemo_env_id", None),
+                task_idx=getattr(self, "_nemo_task_idx", None),
+                work_dir=str(self.work_dir),
+                prompt_chars=len(prompt),
+                image_count=len(rubric_images),
+                timeout_s=3 * 60,
+            )
+            resp = await self._call_rubric_model(prompt, rubric_images, timeout=3 * 60)
+            _diag(
+                "hypotest_score_hybrid_model_call_done",
+                env_id=getattr(self, "_nemo_env_id", None),
+                task_idx=getattr(self, "_nemo_task_idx", None),
+                work_dir=str(self.work_dir),
+                response_chars=len(resp.text or ""),
+                elapsed_s=round(time.perf_counter() - eval_t0, 3),
+            )
         except Exception as e:
+            _diag(
+                "hypotest_score_hybrid_model_call_exception",
+                env_id=getattr(self, "_nemo_env_id", None),
+                task_idx=getattr(self, "_nemo_task_idx", None),
+                work_dir=str(self.work_dir),
+                elapsed_s=round(time.perf_counter() - eval_t0, 3),
+                error=repr(e),
+            )
             self.logger.exception("Hybrid judge call failed — failing open")
             return {
                 "per_item": [], "proc_present_pts": 0, "proc_max_pts": 0,
                 "concl_present_pts": 0, "concl_max_pts": 0,
-                "item_weights": [], "prompt": prompt, "response": "",
+                "item_weights": [], "prompt": prompt,
+                "rubric_images": self._rubric_image_metadata(rubric_images),
+                "response": "",
                 "judge_call_failed": True, "parse_failed": False,
                 "weights_mismatch": False, "error": repr(e),
             }
@@ -2230,7 +2768,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             return {
                 "per_item": [], "proc_present_pts": 0, "proc_max_pts": 0,
                 "concl_present_pts": 0, "concl_max_pts": 0,
-                "item_weights": [], "prompt": prompt, "response": "",
+                "item_weights": [], "prompt": prompt,
+                "rubric_images": self._rubric_image_metadata(rubric_images),
+                "response": "",
                 "judge_call_failed": True, "parse_failed": False,
                 "weights_mismatch": False, "error": "empty response",
             }
@@ -2257,6 +2797,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             **parsed,
             "item_weights": item_weights,
             "prompt": prompt,
+            "rubric_images": self._rubric_image_metadata(rubric_images),
             "response": resp.text,
             "judge_call_failed": False,
             "parse_failed": not parsed["per_item"],
@@ -2264,15 +2805,39 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         }
 
     async def _score_solution(self, solution: str) -> bool:
+        score_t0 = time.perf_counter()
+        _diag(
+            "hypotest_score_solution_start",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            step_count=self.step_count,
+            answer_chars=len(solution),
+            faithfulness_mode=self.config.faithfulness_mode,
+            wager_mode=self.config.wager_mode,
+        )
         assert self.rubric_model is not None
-        nb_content, _ = view_notebook(self.state.nb.cells, self.language.value)
+        nb_content, rubric_images = render_notebook_for_rubric(
+            self.state.nb.cells,
+            self.language.value,
+            include_images=self.config.include_images_in_rubric_model,
+            max_images=self.config.max_rubric_images,
+        )
+        _diag(
+            "hypotest_score_solution_notebook_rendered",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            notebook_chars=len(nb_content),
+            image_count=len(rubric_images),
+        )
 
         mode = self.config.faithfulness_mode
         faith_result: dict[str, Any] | None = None
 
         if mode == "binary":
-            rubric_task = asyncio.ensure_future(self._evaluate_rubric(solution, nb_content))
-            gate_task = asyncio.ensure_future(self._evaluate_faithfulness_gate(solution, nb_content))
+            rubric_task = asyncio.ensure_future(self._evaluate_rubric(solution, nb_content, rubric_images))
+            gate_task = asyncio.ensure_future(self._evaluate_faithfulness_gate(solution, nb_content, rubric_images))
             try:
                 raw_score = await rubric_task
             except Exception:
@@ -2285,8 +2850,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 self.state.faithfulness_passed = None
 
         elif mode in ("shadow", "hybrid"):
-            rubric_task = asyncio.ensure_future(self._evaluate_rubric(solution, nb_content))
-            hybrid_task = asyncio.ensure_future(self._evaluate_hybrid_gate(solution, nb_content))
+            rubric_task = asyncio.ensure_future(self._evaluate_rubric(solution, nb_content, rubric_images))
+            hybrid_task = asyncio.ensure_future(self._evaluate_hybrid_gate(solution, nb_content, rubric_images))
             try:
                 raw_score = await rubric_task
             except Exception:
@@ -2303,7 +2868,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 }
 
         else:  # "off"
-            raw_score = await self._evaluate_rubric(solution, nb_content)
+            raw_score = await self._evaluate_rubric(solution, nb_content, rubric_images)
 
         try:
             self.state.raw_score = raw_score
@@ -2394,6 +2959,16 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
             self.state.score = applied
             self.state.total_reward += applied
+            _diag(
+                "hypotest_score_solution_done",
+                env_id=getattr(self, "_nemo_env_id", None),
+                task_idx=getattr(self, "_nemo_task_idx", None),
+                work_dir=str(self.work_dir),
+                raw_score=raw_score,
+                score=applied,
+                correct=correct,
+                elapsed_s=round(time.perf_counter() - score_t0, 3),
+            )
             return correct
 
         finally:
@@ -2416,6 +2991,15 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 json.dump(score_info, f, indent=2, default=str)
 
             self.logger.info(f"Received solution ({self.state.raw_score}/{self.problem.max_score}): {solution!r}.")
+            _diag(
+                "hypotest_score_solution_finally",
+                env_id=getattr(self, "_nemo_env_id", None),
+                task_idx=getattr(self, "_nemo_task_idx", None),
+                work_dir=str(self.work_dir),
+                raw_score=self.state.raw_score,
+                score=self.state.score,
+                elapsed_s=round(time.perf_counter() - score_t0, 3),
+            )
 
     async def submit_answer(self, answer: str) -> str:
         """Submit your response to the research question.
@@ -2425,7 +3009,24 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         Args:
             answer: Your final response to the research question
         """
+        submit_t0 = time.perf_counter()
+        _diag(
+            "hypotest_submit_answer_start",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            step_count=self.step_count,
+            answer_chars=len(answer),
+            already_done=self.state.done,
+        )
         if self.state.done:
+            _diag(
+                "hypotest_submit_answer_already_done",
+                env_id=getattr(self, "_nemo_env_id", None),
+                task_idx=getattr(self, "_nemo_task_idx", None),
+                work_dir=str(self.work_dir),
+                elapsed_s=round(time.perf_counter() - submit_t0, 3),
+            )
             return "Episode already finished."
 
         self.state.answer = answer
@@ -2433,9 +3034,26 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         if self.rubric_model is None:
             self.logger.warning("No rubric_model configured, skipping scoring")
+            _diag(
+                "hypotest_submit_answer_no_rubric",
+                env_id=getattr(self, "_nemo_env_id", None),
+                task_idx=getattr(self, "_nemo_task_idx", None),
+                work_dir=str(self.work_dir),
+                elapsed_s=round(time.perf_counter() - submit_t0, 3),
+            )
             return answer
 
         correct = await self._score_solution(answer)
+        _diag(
+            "hypotest_submit_answer_done",
+            env_id=getattr(self, "_nemo_env_id", None),
+            task_idx=getattr(self, "_nemo_task_idx", None),
+            work_dir=str(self.work_dir),
+            correct=correct,
+            raw_score=self.state.raw_score,
+            score=self.state.score,
+            elapsed_s=round(time.perf_counter() - submit_t0, 3),
+        )
         return CORRECT_MSG if correct else INCORRECT_MSG
 
     # ========== Time Management ==========
