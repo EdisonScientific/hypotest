@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1.4
+# Bundled dataset-server image: the hypotest dataset server + the scientific
+# kernel stack in one image, running Jupyter kernels IN-PROCESS (no inner
+# container) for the k8s deployment.
+#
+# This layers on top of the kernel/exec image (Dockerfile) so that image stays
+# byte-stable for the existing docker/enroot execution paths.
+#
+#   BASE_IMAGE  kernel image to build on:
+#                 interpreter-env:full  (default, amd64 production)
+#                 interpreter-env:core  (lightweight, arm64 local testing)
+#
+# Built via the Makefile (`make server-image` / `make server-image-core`),
+# which builds the base first and threads the build-date cutoff.
+
+ARG BASE_IMAGE=interpreter-env:full
+ARG BUILD_CUTOFF_DATE
+
+FROM ${BASE_IMAGE}
+
+ARG BUILD_CUTOFF_DATE
+
+# Install the hypotest package + runtime deps into the kernel environment
+# (single-env model: the in-process server and the kernel share kernel_env, so
+# the server's jupyter_client discovers the python3 / ir kernelspecs directly).
+# Bounded to the build-date cutoff via uv --exclude-newer.
+#
+# NOTE: installing pip deps into the conda kernel_env can in principle upgrade a
+# conda-pinned scientific lib (numpy ABI etc.). Watching for this in the smoke
+# build; if it bites, add a constraints file pinning the conda versions.
+WORKDIR /app/hypotest
+COPY pyproject.toml README.md LICENSE uv.lock ./
+COPY src ./src
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eux; \
+    CUTOFF="${BUILD_CUTOFF_DATE:-$(date -u +%Y-%m-%d)}"; \
+    uv pip install --python /app/kernel_env/bin/python --exclude-newer "${CUTOFF}" .
+
+WORKDIR /workspace
+EXPOSE 8405
+
+# The bundled image defaults to the dataset server (aviary TaskDatasetServer).
+# The k8s deployment mounts a config at /config/server.yaml (ConfigMap) and
+# supplies api_key / dataset / capsule paths via env (Secret + env).
+CMD ["/app/kernel_env/bin/python", "-m", "hypotest.dataset_server", "/config/server.yaml"]

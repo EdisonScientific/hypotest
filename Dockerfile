@@ -1,38 +1,79 @@
 # syntax=docker/dockerfile:1.4
-# Standalone scientific computing image (CPU)
+# Multi-stage scientific-computing / kernel-execution image for hypotest.
 #
-# Build: docker build -f Dockerfile.standalone -t scientific-env .
-# Run:   docker run -it -p 8888:8888 -v $(pwd):/work scientific-env
+# Stages
+#   core - Ubuntu + Miniconda + core Python scientific stack + the Python Jupyter
+#          kernel + the standalone kernel server. Arch-aware (amd64 + arm64), so
+#          it builds natively on Apple Silicon for local testing. Lightweight.
+#   full - core + the full R / bioconda / chemistry / bioinformatics stack and
+#          CPU PyTorch. amd64 only (bioconda has poor linux-aarch64 coverage).
+#          This is the production kernel/exec image (formerly the only image).
+#
+# Supply-chain cutoff: network installs are bounded to BUILD_CUTOFF_DATE so no
+# package published after the cutoff is pulled (defense vs Shai-Hulud-style
+# attacks on popular packages).
+#   - pip  -> `uv pip install --exclude-newer ${BUILD_CUTOFF_DATE}`
+#   - apt  -> Ubuntu archive snapshot (snapshot.ubuntu.com) at the cutoff
+#   - conda/mamba -> bounded by a build-time repodata-filtering proxy
+#                    (FOLLOW-UP: not yet wired; conda installs below are still
+#                    exact-pinned, which fixes direct deps but not transitive).
+#   - torch -> exact-pinned (its wheel index lacks upload-time metadata, so
+#              --exclude-newer can't bound it; see the full stage).
+#
+# Build via the Makefile (`make image` / `make image-core`), which measures the
+# cutoff date and passes it as a build-arg. Building this Dockerfile directly
+# falls back to "today" for the cutoff.
 
-FROM ubuntu:22.04
+ARG BUILD_CUTOFF_DATE
+
+# =============================================================================
+# core: lightweight, arch-aware base (amd64 + arm64)
+# =============================================================================
+FROM ubuntu:22.04 AS core
+
+ARG BUILD_CUTOFF_DATE
+ARG TARGETARCH
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies
+# System dependencies, pinned to an Ubuntu archive snapshot at the cutoff date so
+# no .deb newer than the cutoff is installed.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update -qq && \
+    set -eux; \
+    CUTOFF="${BUILD_CUTOFF_DATE:-$(date -u +%Y-%m-%d)}"; \
+    SNAP_TS="$(date -u -d "${CUTOFF} 00:00:00" +%Y%m%dT000000Z)"; \
+    sed -i -E "s|https?://(archive\|security)\.ubuntu\.com/ubuntu|https://snapshot.ubuntu.com/ubuntu/${SNAP_TS}|g" \
+        /etc/apt/sources.list; \
+    apt-get -o Acquire::Check-Valid-Until=false update -qq; \
     apt-get install -yq --no-install-recommends \
-    util-linux \
-    git \
-    openssh-client \
-    wget \
-    gpg \
-    software-properties-common \
-    build-essential && \
+        util-linux \
+        git \
+        openssh-client \
+        wget \
+        gpg \
+        software-properties-common \
+        build-essential; \
     rm -rf /var/lib/apt/lists/*
 
-# Download and install Miniconda
+# Miniconda (arch-aware: x86_64 on amd64, aarch64 on arm64).
 RUN --mount=type=cache,target=/root/.cache/miniconda \
-    wget https://repo.anaconda.com/miniconda/Miniconda3-py312_25.3.1-1-Linux-x86_64.sh -O ~/miniconda.sh && \
-    chmod +x ~/miniconda.sh && \
-    bash ~/miniconda.sh -b -p /app/miniconda && \
-    rm ~/miniconda.sh && \
+    set -eux; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "$arch" in \
+        amd64|x86_64)  MC_ARCH=x86_64 ;; \
+        arm64|aarch64) MC_ARCH=aarch64 ;; \
+        *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    wget -q "https://repo.anaconda.com/miniconda/Miniconda3-py312_25.3.1-1-Linux-${MC_ARCH}.sh" \
+        -O /tmp/miniconda.sh; \
+    bash /tmp/miniconda.sh -b -p /app/miniconda; \
+    rm /tmp/miniconda.sh; \
     /app/miniconda/bin/conda init bash
 
-# Override base image python with miniconda python
+# Override base-image python with the miniconda python.
 RUN ln -sf /app/miniconda/bin/python /usr/local/bin/python && \
     ln -sf /app/miniconda/bin/python3 /usr/local/bin/python3 && \
     ln -sf /app/miniconda/bin/pip /usr/local/bin/pip && \
@@ -42,15 +83,70 @@ ENV VIRTUAL_ENV="/app/miniconda"
 ENV PATH="/app/miniconda/bin:$PATH"
 ENV PYTHONPATH="/app/miniconda/lib/python3.12/site-packages:${PYTHONPATH:-}"
 
-# Install uv and mamba
+# Install uv (exact-pinned: bootstraps the cutoff-aware installer itself) and mamba.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install --no-cache-dir uv==0.8.19
 RUN conda install -c conda-forge mamba==2.3.2 -y
 
-# Create kernel environment with all analysis packages
+# Create the kernel environment.
 RUN conda create -p /app/kernel_env python=3.12 -y
 
-# Install R packages
+# Core Python scientific stack.
+RUN mamba install -p /app/kernel_env -c conda-forge -y \
+            numpy=1.26.4 \
+            pandas=2.3.2 \
+            scipy=1.16.2 \
+            scikit-learn=1.7.2 \
+            matplotlib=3.10.6 \
+            seaborn=0.13.2 \
+            plotly=6.3.0 \
+            openpyxl=3.1.5 \
+            jupyter=1.1.1 \
+            ipykernel=6.30.1 \
+            nbconvert=7.16.6
+
+# Register the Python Jupyter kernel.
+RUN /app/kernel_env/bin/python -m ipykernel install --name python3 --display-name "Python 3 (ipykernel)"
+
+# Kernel server dependencies, bounded to the cutoff date.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eux; \
+    CUTOFF="${BUILD_CUTOFF_DATE:-$(date -u +%Y-%m-%d)}"; \
+    uv pip install --python /app/kernel_env/bin/python --exclude-newer "${CUTOFF}" \
+        fastapi uvicorn
+
+# Light cleanup for the core stage.
+RUN mamba clean -all -y && \
+    find /app/kernel_env \( -type d -name __pycache__ -o -type d -name tests -o -type d -name '*.tests' -o -type d -name 'test' \) -exec rm -rf {} + || true
+
+# Copy the standalone kernel server for container-based execution.
+COPY src/hypotest/env/kernel_server.py /envs/kernel_server.py
+
+# Put the conda env's shared libs on the loader path. conda-forge binaries
+# (e.g. scipy) are built against the env's newer libstdc++/libgcc, not Ubuntu's
+# system ones; without this, any process that runs kernel_env's python WITHOUT
+# activating the env (the in-process kernel path, and the docker exec path) hits
+# `GLIBCXX_3.4.x not found`. LD_LIBRARY_PATH is in REQUIRED_PATH_ENV_VARS, so the
+# in-process Interpreter propagates it into the kernel subprocess. The enroot
+# path runs `env -i` + `source activate`, so it is unaffected by this.
+ENV LD_LIBRARY_PATH="/app/kernel_env/lib"
+
+WORKDIR /workspace
+EXPOSE 8000
+
+# Default for the kernel/exec image is the standalone kernel server (the
+# docker/enroot execution paths override this command / bind-mount the server,
+# so they are unaffected; the bundled dataset-server image overrides CMD).
+CMD ["/app/kernel_env/bin/python", "/envs/kernel_server.py", "--work_dir", "/workspace"]
+
+# =============================================================================
+# full: production stack (amd64 only) — adds R, bioconda, chemistry, torch
+# =============================================================================
+FROM core AS full
+
+ARG BUILD_CUTOFF_DATE
+
+# R packages.
 RUN mamba install -p /app/kernel_env -c conda-forge -y \
             r-base=4.3.3 \
             r-r.utils=2.13.0 \
@@ -80,21 +176,7 @@ RUN mamba install -p /app/kernel_env -c conda-forge -y \
             r-viridis=0.6.5 \
             r-hdf5r=1.3.11
 
-# Install core Python scientific stack
-RUN mamba install -p /app/kernel_env -c conda-forge -y \
-            numpy=1.26.4 \
-            pandas=2.3.2 \
-            scipy=1.16.2 \
-            scikit-learn=1.7.2 \
-            matplotlib=3.10.6 \
-            seaborn=0.13.2 \
-            plotly=6.3.0 \
-            openpyxl=3.1.5 \
-            jupyter=1.1.1 \
-            ipykernel=6.30.1 \
-            nbconvert=7.16.6
-
-# Install ML/optimization packages
+# Core Python ML / optimization packages.
 RUN mamba install -p /app/kernel_env -c conda-forge -y \
             keras=3.11.2 \
             optuna=4.5.0 \
@@ -102,7 +184,7 @@ RUN mamba install -p /app/kernel_env -c conda-forge -y \
             lightgbm=4.6.0 \
             statsmodels=0.14.5
 
-# Install bioinformatics Python packages
+# Bioinformatics Python packages.
 RUN mamba install -p /app/kernel_env -c conda-forge -y \
             anndata=0.12.2 \
             scanpy=1.11.4 \
@@ -112,7 +194,7 @@ RUN mamba install -p /app/kernel_env -c conda-forge -y \
             leidenalg=0.10.2 \
             python-igraph=0.11.9
 
-# Install visualization and utility packages
+# Visualization and utility packages.
 RUN mamba install -p /app/kernel_env -c conda-forge -y \
             matplotlib-venn=1.1.2 \
             ete3=3.1.3 \
@@ -121,13 +203,13 @@ RUN mamba install -p /app/kernel_env -c conda-forge -y \
             udocker=1.3.17 \
             sqlite=3.50.4
 
-# Install chemistry packages
+# Chemistry packages.
 RUN mamba install -p /app/kernel_env -c conda-forge -y \
             rdkit=2025.09.2 \
             pubchempy=1.0.5 \
             chempy=0.10.1
 
-# Install bioinformatics tools
+# Bioinformatics tools (conda-forge + bioconda).
 RUN mamba install -p /app/kernel_env -c conda-forge -c bioconda -y \
             biokit=0.5.0 \
             gseapy=1.1.10 \
@@ -168,18 +250,19 @@ RUN mamba install -p /app/kernel_env -c conda-forge -c bioconda -y \
             samtools=1.22.1 \
             gatk=3.8
 
-# Install pytorch (CPU)
-RUN /app/kernel_env/bin/python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+# PyTorch (CPU). Exact-pinned: the PyTorch wheel index does not expose
+# upload-time metadata, so uv --exclude-newer cannot bound it; the version pin
+# is the supply-chain control here.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python /app/kernel_env/bin/python \
+        --index-url https://download.pytorch.org/whl/cpu \
+        torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
 
-# Install Jupyter kernels
-RUN /app/kernel_env/bin/python -m ipykernel install --name python3 --display-name "Python 3 (ipykernel)" && \
-    export PATH="/app/kernel_env/bin:$PATH" && \
+# Register the R Jupyter kernel.
+RUN export PATH="/app/kernel_env/bin:$PATH" && \
     /app/kernel_env/bin/R -e 'IRkernel::installspec(user = FALSE, name = "ir", displayname = "R")'
 
-# Install kernel server dependencies
-RUN /app/kernel_env/bin/pip install --no-cache-dir fastapi uvicorn
-
-# Clean up conda caches
+# Cleanup.
 RUN mamba clean -all -y && \
     find /app/miniconda \( -type d -name __pycache__ -o -type d -name tests -o -type d -name '*.tests' -o -type d -name 'test' \) -exec rm -rf {} + || true && \
     find /app/miniconda -type f -name '*.a' -delete && \
@@ -187,11 +270,3 @@ RUN mamba clean -all -y && \
     find /app/kernel_env \( -type d -name __pycache__ -o -type d -name tests -o -type d -name '*.tests' -o -type d -name 'test' \) -exec rm -rf {} + || true && \
     find /app/kernel_env -type f -name '*.a' -delete && \
     find /app/kernel_env -type f -name '*.js.map' -delete
-
-# Copy kernel server for Docker-based execution
-COPY src/hypotest/env/kernel_server.py /envs/kernel_server.py
-
-WORKDIR /workspace
-EXPOSE 8000
-
-CMD ["/app/kernel_env/bin/python", "/envs/kernel_server.py", "--work_dir", "/workspace"]

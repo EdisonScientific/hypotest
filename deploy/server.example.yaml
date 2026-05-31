@@ -1,0 +1,35 @@
+# Example config for the bundled dataset-server image (in-process kernel, k8s).
+#
+# The image's default CMD is:
+#   python -m hypotest.dataset_server /config/server.yaml
+# so mount this file at /config/server.yaml (e.g. via a ConfigMap) and supply
+# secrets via env (e.g. a k8s Secret).
+#
+# Quick local run on the core (arm64) image:
+#   docker run --rm -p 8405:8405 \
+#     -e HYPOTEST_SERVER_API_KEY=dev-key \
+#     -v "$(pwd)/deploy/server.example.yaml:/config/server.yaml:ro" \
+#     -v "/path/to/problems.jsonl:/config/problems.jsonl:ro" \
+#     -v "/path/to/capsules:/data/capsules:ro" \
+#     hypotest-server:core
+
+dataset:
+  # Problem source: a local JSONL (shown) or `hf_dataset: EdisonScientific/bixbench_hypothesis`.
+  problem_jsonl: /config/problems.jsonl
+  capsule_dir: /data/capsules
+
+  # In-process execution path: no inner container, k8s pod is the isolation
+  # boundary. Disables the docker/enroot/ray backends.
+  use_docker: false
+  use_enroot: false
+  use_ray: false
+  force_python: true
+
+  execution_config:
+    # Enables the code-safety filter (the guardrail for the in-process model).
+    safe_execute: true
+    cell_execution_timeout: 600
+
+# Value, or the NAME of an env var holding the key (resolved via os.getenv).
+api_key: HYPOTEST_SERVER_API_KEY
+port: 8405
