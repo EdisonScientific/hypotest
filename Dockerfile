@@ -42,12 +42,16 @@ ENV DEBIAN_FRONTEND=noninteractive
 # than the cutoff is installed. snapshot.ubuntu.com serves the main archive
 # (amd64) but NOT ubuntu-ports, so the sed below applies on amd64 (the full/prod
 # image) and no-ops on arm64 — the arm64 core image (local testing only) falls
-# through to the live ports archive.
+# through to the live ports archive. ca-certificates is installed first (from the
+# default archive) so apt can verify TLS for the HTTPS snapshot (which 301-redirects
+# from http); that one bootstrap package is the only un-dated apt fetch.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     set -eux; \
     CUTOFF="${BUILD_CUTOFF_DATE:-$(date -u +%Y-%m-%d)}"; \
     SNAP_TS="$(date -u -d "${CUTOFF} 00:00:00" +%Y%m%dT000000Z)"; \
+    apt-get update -qq; \
+    apt-get install -yq --no-install-recommends ca-certificates; \
     sed -i -E "s|https?://(archive\|security)\.ubuntu\.com/ubuntu|https://snapshot.ubuntu.com/ubuntu/${SNAP_TS}|g" \
         /etc/apt/sources.list; \
     apt-get -o Acquire::Check-Valid-Until=false update -qq; \
@@ -147,8 +151,18 @@ FROM core AS full
 
 ARG BUILD_CUTOFF_DATE
 
-# R packages.
-RUN mamba install -p /app/kernel_env -c conda-forge -y \
+# Full scientific stack (R / ML / bio / chem / bioinformatics), bounded to the
+# build-date cutoff via the same proxy as core and built in ONE layer (cutoff +
+# small image). bioconda is added for the bioinformatics tools; the proxy serves
+# any /<channel> path.
+RUN set -eux; \
+    CUTOFF="${BUILD_CUTOFF_DATE:-$(date -u +%Y-%m-%d)}"; \
+    python /opt/cutoff_proxy.py --port 8723 --cutoff "${CUTOFF}" & \
+    PROXY=$!; \
+    for _ in $(seq 1 50); do wget -q -O - http://127.0.0.1:8723/healthz >/dev/null 2>&1 && break; sleep 0.2; done; \
+    export CONDA_REPODATA_USE_ZST=false CONDA_REPODATA_FNS=repodata.json; \
+    CF="http://127.0.0.1:8723/conda-forge"; BIO="http://127.0.0.1:8723/bioconda"; \
+    mamba install -p /app/kernel_env --override-channels -c "${CF}" -y \
             r-base=4.3.3 \
             r-r.utils=2.13.0 \
             r-recommended=4.3 \
@@ -175,43 +189,33 @@ RUN mamba install -p /app/kernel_env -c conda-forge -y \
             r-reshape=0.8.10 \
             r-rstatix=0.7.2 \
             r-viridis=0.6.5 \
-            r-hdf5r=1.3.11
-
-# Core Python ML / optimization packages.
-RUN mamba install -p /app/kernel_env -c conda-forge -y \
+            r-hdf5r=1.3.11; \
+    mamba install -p /app/kernel_env --override-channels -c "${CF}" -y \
             keras=3.11.2 \
             optuna=4.5.0 \
             imbalanced-learn=0.14.0 \
             lightgbm=4.6.0 \
-            statsmodels=0.14.5
-
-# Bioinformatics Python packages.
-RUN mamba install -p /app/kernel_env -c conda-forge -y \
+            statsmodels=0.14.5; \
+    mamba install -p /app/kernel_env --override-channels -c "${CF}" -y \
             anndata=0.12.2 \
             scanpy=1.11.4 \
             biopython=1.85 \
             muon=0.1.6 \
             umap-learn=0.5.9.post2 \
             leidenalg=0.10.2 \
-            python-igraph=0.11.9
-
-# Visualization and utility packages.
-RUN mamba install -p /app/kernel_env -c conda-forge -y \
+            python-igraph=0.11.9; \
+    mamba install -p /app/kernel_env --override-channels -c "${CF}" -y \
             matplotlib-venn=1.1.2 \
             ete3=3.1.3 \
             fcsparser=0.2.8 \
             datasets=2.2.1 \
             udocker=1.3.17 \
-            sqlite=3.50.4
-
-# Chemistry packages.
-RUN mamba install -p /app/kernel_env -c conda-forge -y \
+            sqlite=3.50.4; \
+    mamba install -p /app/kernel_env --override-channels -c "${CF}" -y \
             rdkit=2025.09.2 \
             pubchempy=1.0.5 \
-            chempy=0.10.1
-
-# Bioinformatics tools (conda-forge + bioconda).
-RUN mamba install -p /app/kernel_env -c conda-forge -c bioconda -y \
+            chempy=0.10.1; \
+    mamba install -p /app/kernel_env --override-channels -c "${CF}" -c "${BIO}" -y \
             biokit=0.5.0 \
             gseapy=1.1.10 \
             blast=2.17.0 \
@@ -249,25 +253,16 @@ RUN mamba install -p /app/kernel_env -c conda-forge -c bioconda -y \
             hhsuite=3.3.0 \
             mmseqs2=18.8cc5c \
             samtools=1.22.1 \
-            gatk=3.8
+            gatk=3.8; \
+    /app/kernel_env/bin/R -e 'IRkernel::installspec(user = FALSE, name = "ir", displayname = "R")'; \
+    mamba clean --all -y; conda clean --all -y; \
+    find /app/miniconda /app/kernel_env \( -type d -name __pycache__ -o -type d -name tests -o -type d -name '*.tests' -o -type d -name 'test' \) -exec rm -rf {} + 2>/dev/null || true; \
+    find /app/miniconda /app/kernel_env -type f \( -name '*.a' -o -name '*.js.map' \) -delete 2>/dev/null || true; \
+    kill "${PROXY}" 2>/dev/null || true
 
-# PyTorch (CPU). Exact-pinned: the PyTorch wheel index does not expose
-# upload-time metadata, so uv --exclude-newer cannot bound it; the version pin
-# is the supply-chain control here.
+# PyTorch (CPU). Exact-pinned: the PyTorch wheel index does not expose upload-time
+# metadata, so uv --exclude-newer cannot bound it; the version pin is the control.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /app/kernel_env/bin/python \
         --index-url https://download.pytorch.org/whl/cpu \
         torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
-
-# Register the R Jupyter kernel.
-RUN export PATH="/app/kernel_env/bin:$PATH" && \
-    /app/kernel_env/bin/R -e 'IRkernel::installspec(user = FALSE, name = "ir", displayname = "R")'
-
-# Cleanup.
-RUN mamba clean -all -y && \
-    find /app/miniconda \( -type d -name __pycache__ -o -type d -name tests -o -type d -name '*.tests' -o -type d -name 'test' \) -exec rm -rf {} + || true && \
-    find /app/miniconda -type f -name '*.a' -delete && \
-    find /app/miniconda -type f -name '*.js.map' -delete && \
-    find /app/kernel_env \( -type d -name __pycache__ -o -type d -name tests -o -type d -name '*.tests' -o -type d -name 'test' \) -exec rm -rf {} + || true && \
-    find /app/kernel_env -type f -name '*.a' -delete && \
-    find /app/kernel_env -type f -name '*.js.map' -delete
