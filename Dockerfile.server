@@ -39,7 +39,42 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 WORKDIR /workspace
 EXPOSE 8405
 
-# The bundled image defaults to the dataset server (aviary TaskDatasetServer).
-# The k8s deployment mounts a config at /config/server.yaml (ConfigMap) and
-# supplies api_key / dataset / capsule paths via env (Secret + env).
+# Runtime supply-chain cutoff for agent installs — the same date bound as the
+# build, applied via config files so it covers naive installs however invoked.
+#   conda - no native date cutoff and no dated-index service, so the entrypoint
+#           runs the filtering proxy and this condarc routes ALL channel
+#           resolution through it (channel_alias): naive `conda install foo`,
+#           `-c conda-forge`, and `mamba install` alike.
+#   pip   - likewise no date option / dated index, so /etc/pip.conf points the
+#           index at the same proxy's /simple/. pip reads /etc/pip.conf on every
+#           invocation, so `pip`, `pip3`, `python -m pip`, `%pip`, `!pip` are all
+#           bounded.
+#   R     - CRAN has a dated-snapshot service (Posit PPM), so it's pure config
+#           (Rprofile.site repos); applies only when R is present (full base).
+#   apt   - already pinned to a dated snapshot in the base image's sources.list.
+# Explicit full upstream URLs bypass config routing; the k8s network egress
+# policy is the backstop. Scoped to this bundled image (kernel image / enroot +
+# docker paths unaffected). Written AFTER the build's hypotest install so it is
+# not applied at build time.
+ENV CUTOFF_DATE=${BUILD_CUTOFF_DATE}
+ENV CONDA_REPODATA_USE_ZST=false
+ENV CONDA_REPODATA_FNS=repodata.json
+RUN cat > /app/miniconda/.condarc <<'EOF'
+channel_alias: http://127.0.0.1:8723
+channels:
+  - conda-forge
+default_channels:
+  - http://127.0.0.1:8723/conda-forge
+EOF
+RUN printf '%s\n' '[global]' 'index-url = http://127.0.0.1:8723/simple' > /etc/pip.conf
+RUN if [ -d /app/kernel_env/lib/R/etc ]; then \
+        printf 'options(repos = c(CRAN = "https://packagemanager.posit.co/cran/%s"))\n' \
+            "${BUILD_CUTOFF_DATE:-$(date -u +%Y-%m-%d)}" >> /app/kernel_env/lib/R/etc/Rprofile.site; \
+    fi
+COPY docker/entrypoint.sh /opt/entrypoint.sh
+
+# The entrypoint starts the cutoff proxy, then execs the dataset server. The k8s
+# deployment mounts a config at /config/server.yaml (ConfigMap) and supplies
+# api_key / dataset / capsule paths via env (Secret + env).
+ENTRYPOINT ["sh", "/opt/entrypoint.sh"]
 CMD ["/app/kernel_env/bin/python", "-m", "hypotest.dataset_server", "/config/server.yaml"]

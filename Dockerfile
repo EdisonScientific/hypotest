@@ -38,8 +38,11 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
 
-# System dependencies, pinned to an Ubuntu archive snapshot at the cutoff date so
-# no .deb newer than the cutoff is installed.
+# System dependencies pinned to a dated Ubuntu archive snapshot so no .deb newer
+# than the cutoff is installed. snapshot.ubuntu.com serves the main archive
+# (amd64) but NOT ubuntu-ports, so the sed below applies on amd64 (the full/prod
+# image) and no-ops on arm64 — the arm64 core image (local testing only) falls
+# through to the live ports archive.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     set -eux; \
@@ -83,30 +86,32 @@ ENV VIRTUAL_ENV="/app/miniconda"
 ENV PATH="/app/miniconda/bin:$PATH"
 ENV PYTHONPATH="/app/miniconda/lib/python3.12/site-packages:${PYTHONPATH:-}"
 
-# Install uv (exact-pinned: bootstraps the cutoff-aware installer itself) and mamba.
+# Install uv (exact-pinned: bootstraps the cutoff-aware installer itself).
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install --no-cache-dir uv==0.8.19
-RUN conda install -c conda-forge mamba==2.3.2 -y
 
-# Create the kernel environment.
-RUN conda create -p /app/kernel_env python=3.12 -y
-
-# Core Python scientific stack.
-RUN mamba install -p /app/kernel_env -c conda-forge -y \
-            numpy=1.26.4 \
-            pandas=2.3.2 \
-            scipy=1.16.2 \
-            scikit-learn=1.7.2 \
-            matplotlib=3.10.6 \
-            seaborn=0.13.2 \
-            plotly=6.3.0 \
-            openpyxl=3.1.5 \
-            jupyter=1.1.1 \
-            ipykernel=6.30.1 \
-            nbconvert=7.16.6
-
-# Register the Python Jupyter kernel.
-RUN /app/kernel_env/bin/python -m ipykernel install --name python3 --display-name "Python 3 (ipykernel)"
+# Conda installs, bounded to the build-date cutoff via the repodata-filtering
+# proxy (conda has no native --exclude-newer). All conda/mamba work + the kernel
+# registration + cache cleanup run in ONE layer, so package tarballs never
+# persist across layers (keeps the image small). CONDA_REPODATA_USE_ZST/_FNS and
+# the proxy's own 404s force the client onto the full, plain repodata.json we filter.
+COPY docker/cutoff_proxy.py /opt/cutoff_proxy.py
+RUN set -eux; \
+    CUTOFF="${BUILD_CUTOFF_DATE:-$(date -u +%Y-%m-%d)}"; \
+    python /opt/cutoff_proxy.py --port 8723 --cutoff "${CUTOFF}" & \
+    PROXY=$!; \
+    for _ in $(seq 1 50); do wget -q -O - http://127.0.0.1:8723/healthz >/dev/null 2>&1 && break; sleep 0.2; done; \
+    export CONDA_REPODATA_USE_ZST=false CONDA_REPODATA_FNS=repodata.json; \
+    CF="http://127.0.0.1:8723/conda-forge"; \
+    conda install --override-channels -c "${CF}" mamba==2.3.2 -y; \
+    conda create -p /app/kernel_env --override-channels -c "${CF}" python=3.12 -y; \
+    mamba install -p /app/kernel_env --override-channels -c "${CF}" -y \
+        numpy=1.26.4 pandas=2.3.2 scipy=1.16.2 scikit-learn=1.7.2 matplotlib=3.10.6 \
+        seaborn=0.13.2 plotly=6.3.0 openpyxl=3.1.5 jupyter=1.1.1 ipykernel=6.30.1 nbconvert=7.16.6; \
+    /app/kernel_env/bin/python -m ipykernel install --name python3 --display-name "Python 3 (ipykernel)"; \
+    mamba clean --all -y; conda clean --all -y; \
+    find /app/kernel_env /app/miniconda \( -type d -name __pycache__ -o -type d -name tests -o -type d -name '*.tests' -o -type d -name 'test' \) -exec rm -rf {} + 2>/dev/null || true; \
+    kill "${PROXY}" 2>/dev/null || true
 
 # Kernel server dependencies, bounded to the cutoff date.
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -114,10 +119,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     CUTOFF="${BUILD_CUTOFF_DATE:-$(date -u +%Y-%m-%d)}"; \
     uv pip install --python /app/kernel_env/bin/python --exclude-newer "${CUTOFF}" \
         fastapi uvicorn
-
-# Light cleanup for the core stage.
-RUN mamba clean -all -y && \
-    find /app/kernel_env \( -type d -name __pycache__ -o -type d -name tests -o -type d -name '*.tests' -o -type d -name 'test' \) -exec rm -rf {} + || true
 
 # Copy the standalone kernel server for container-based execution.
 COPY src/hypotest/env/kernel_server.py /envs/kernel_server.py
