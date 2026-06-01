@@ -254,11 +254,16 @@ RUN set -eux; \
             mmseqs2=18.8cc5c \
             samtools=1.22.1 \
             gatk=3.8; \
-    /app/kernel_env/bin/R -e 'IRkernel::installspec(user = FALSE, name = "ir", displayname = "R")'; \
     mamba clean --all -y; conda clean --all -y; \
     find /app/miniconda /app/kernel_env \( -type d -name __pycache__ -o -type d -name tests -o -type d -name '*.tests' -o -type d -name 'test' \) -exec rm -rf {} + 2>/dev/null || true; \
     find /app/miniconda /app/kernel_env -type f \( -name '*.a' -o -name '*.js.map' \) -delete 2>/dev/null || true; \
     kill "${PROXY}" 2>/dev/null || true
+
+# Register the R Jupyter kernel. IRkernel::installspec shells out to `jupyter`,
+# which lives in kernel_env (not on the image PATH), so put it on PATH for this
+# call. Its own layer, so editing it never re-runs the conda install above.
+RUN PATH="/app/kernel_env/bin:$PATH" /app/kernel_env/bin/R -e \
+    'IRkernel::installspec(user = FALSE, name = "ir", displayname = "R")'
 
 # PyTorch (CPU). Exact-pinned: the PyTorch wheel index does not expose upload-time
 # metadata, so uv --exclude-newer cannot bound it; the version pin is the control.
