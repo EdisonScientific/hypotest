@@ -12,10 +12,10 @@ native force flag. See features/infra_fault_tolerance/infra_mitigations_handoff.
 Pure data + one I/O helper, no dependencies on the kernel / nbformat / ray
 stack. Import from here rather than from interpreter_env.py when unit-testing.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
-
 
 _PIP_SHIM_BASH = r"""#!/usr/bin/env bash
 # Install shim for pip.
@@ -340,6 +340,77 @@ local({
 """
 
 
+# R user-profile header: make R_LIBS_USER the first lib path. The install shim
+# (_R_SHIM_CODE) is appended after it. Kept here so the enroot bash and the k8s
+# kernel server write byte-identical Rprofiles.
+_RPROFILE_HEADER = (
+    '.local_lib <- Sys.getenv("R_LIBS_USER")\nif (nzchar(.local_lib)) .libPaths(unique(c(.local_lib, .libPaths())))\n'
+)
+
+
+def write_workspace_config(work_dir: Path, runtime_path: str, index_url: str | None = None) -> None:
+    """Write the agent workspace install scaffolding into ``work_dir``.
+
+    Creates ``pydeps/``, ``pip-cache/``, ``r_libs/``; a ``pip.conf`` whose
+    ``target``/``cache-dir`` point at ``runtime_path`` (where the workspace lives
+    when the kernel runs — the same dir for k8s, the in-container mount for
+    enroot) and which carries ``index_url`` when given (the runtime supply-chain
+    cutoff proxy; pip.conf overrides /etc/pip.conf, so it must re-state it); the
+    pip/conda/apt + R install shims; and the ``Rprofile`` (libPaths + R shim).
+
+    Single source of truth for the install model so the enroot and k8s kernel
+    paths can't drift. Pass ``index_url=None`` for enroot (no in-pod proxy).
+    """
+    wd = Path(work_dir)
+    for sub in ("pydeps", "pip-cache", "r_libs"):
+        (wd / sub).mkdir(parents=True, exist_ok=True)
+    pip_conf = [
+        "[global]",
+        "disable-pip-version-check = true",
+        "no-input = true",
+        f"cache-dir = {runtime_path}/pip-cache",
+        f"target = {runtime_path}/pydeps",
+    ]
+    if index_url:
+        pip_conf.append(f"index-url = {index_url}")
+    (wd / "pip.conf").write_text("\n".join(pip_conf) + "\n")
+    _write_install_shims(wd)
+    (wd / "Rprofile").write_text(_RPROFILE_HEADER + _R_SHIM_CODE)
+
+
+def workspace_env(runtime_path: str) -> dict[str, str]:
+    """Env vars the kernel needs for the workspace install model.
+
+    ``PYTHONPATH`` and ``PATH`` are the SEGMENTS to prepend to any existing
+    value; the rest are absolute. Used by both the enroot bash (to generate its
+    ``export`` lines) and the k8s kernel server (to update ``os.environ``).
+    """
+    return {
+        "PYTHONPATH": f"{runtime_path}/pydeps",
+        "PATH": f"{runtime_path}/.install_shim/bin",
+        "PIP_CONFIG_FILE": f"{runtime_path}/pip.conf",
+        "INSTALL_SHIM_LOG": f"{runtime_path}/.install_shim/log",
+        "R_LIBS_USER": f"{runtime_path}/r_libs",
+        "R_PROFILE_USER": f"{runtime_path}/Rprofile",
+    }
+
+
+def bash_export_block(runtime_path: str) -> str:
+    """Render ``workspace_env`` as ``export VAR=...`` lines for the enroot bash.
+
+    ``runtime_path`` may be a bash variable like ``$WORKDIR`` (kept literal so the
+    shell expands it). ``PYTHONPATH``/``PATH`` are prepended to any existing value.
+    Same single source as the k8s server's ``os.environ`` update, so they can't drift.
+    """
+    lines = []
+    for key, seg in workspace_env(runtime_path).items():
+        if key in {"PYTHONPATH", "PATH"}:
+            lines.append(f'export {key}="{seg}:${{{key}}}"')
+        else:
+            lines.append(f'export {key}="{seg}"')
+    return "\n".join(lines)
+
+
 def _write_install_shims(work_dir: Path) -> None:
     """Write pip/conda/apt-get wrappers + R shim into the workspace dir.
 
@@ -363,4 +434,3 @@ def _write_install_shims(work_dir: Path) -> None:
         wrapper_path.write_text(content)
         wrapper_path.chmod(0o755)
     (shim_dir / "r_shim.R").write_text(_R_SHIM_CODE)
-

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -90,3 +91,62 @@ def download_prefix(client: Any, bucket: str, prefix: str, dest: Path, max_worke
         # list() forces evaluation so any per-object exception propagates.
         list(ex.map(_one, keys))
     return len(keys)
+
+
+def pull_latest_capsule(source: str, uuid: str, dest: Path, client: Any = None) -> int:
+    """Place the most-recent capsule for ``uuid`` into ``dest``.
+
+    ``source`` is a local folder or an ``s3://bucket/prefix`` base. Among the
+    immediate subdirectories whose name contains ``uuid`` (e.g. ``capsule_<uuid>``,
+    or versioned siblings like ``capsule_<uuid>_<ts>``), the freshest is chosen by
+    newest S3 ``LastModified`` (or file mtime for a folder) and its contents are
+    copied into ``dest``. Returns the number of files placed. Raises
+    ``FileNotFoundError`` if no capsule for ``uuid`` is found.
+    """
+    if is_s3_uri(source):
+        return _pull_latest_capsule_s3(source, uuid, dest, client or make_client())
+    return _pull_latest_capsule_local(Path(source), uuid, dest)
+
+
+def _pull_latest_capsule_s3(source: str, uuid: str, dest: Path, client: Any) -> int:
+    bucket, base = parse_s3_uri(source)
+    list_prefix = base.rstrip("/") + "/" if base.strip("/") else ""
+    paginator = client.get_paginator("list_objects_v2")
+
+    candidate_prefixes = [
+        cp["Prefix"]
+        for page in paginator.paginate(Bucket=bucket, Prefix=list_prefix, Delimiter="/")
+        for cp in page.get("CommonPrefixes", [])
+        if uuid in cp["Prefix"][len(list_prefix):]
+    ]
+    if not candidate_prefixes:
+        raise FileNotFoundError(f"no capsule for {uuid} under s3://{bucket}/{list_prefix}")
+
+    best_prefix, best_lm = None, None
+    for prefix in candidate_prefixes:
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                if not obj["Key"].endswith("/") and (best_lm is None or obj["LastModified"] > best_lm):
+                    best_lm, best_prefix = obj["LastModified"], prefix
+    if best_prefix is None:
+        raise FileNotFoundError(f"no capsule objects for {uuid} under s3://{bucket}/{list_prefix}")
+
+    logger.warning("Most-recent capsule for %s: s3://%s/%s (LastModified=%s)", uuid, bucket, best_prefix, best_lm)
+    return download_prefix(client, bucket, best_prefix, dest)
+
+
+def _pull_latest_capsule_local(base: Path, uuid: str, dest: Path) -> int:
+    if not base.is_dir():
+        raise FileNotFoundError(f"capsule source folder not found: {base}")
+    candidates = [d for d in base.iterdir() if d.is_dir() and uuid in d.name]
+    if not candidates:
+        raise FileNotFoundError(f"no capsule for {uuid} under {base}")
+
+    def recency(d: Path) -> float:
+        return max((p.stat().st_mtime for p in d.rglob("*") if p.is_file()), default=d.stat().st_mtime)
+
+    best = max(candidates, key=recency)
+    logger.warning("Most-recent capsule for %s: %s", uuid, best)
+    dest.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(best, dest, dirs_exist_ok=True)
+    return sum(1 for p in best.rglob("*") if p.is_file())

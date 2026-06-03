@@ -53,14 +53,8 @@ from .hybrid_gate import (
     parse_hybrid_response,
     synthesize_per_item_awards,
 )
-from .install_shim import _write_install_shims
+from .install_shim import bash_export_block, write_workspace_config
 from .interpreter import ExecutionResult, Interpreter
-from .wager import (
-    WAGER_BETA_DEFAULT,
-    WAGER_GAMMA_DEFAULT,
-    clamp_confidence,
-    score_with_wager,
-)
 from .prompts import (
     CORRECT_MSG,
     FAITHFULNESS_GATE_PROMPT,
@@ -71,6 +65,12 @@ from .prompts import (
 )
 from .tools.filesystem import FilesystemTool, list_dir_tool
 from .utils import NBLanguage, view_notebook
+from .wager import (
+    WAGER_BETA_DEFAULT,
+    WAGER_GAMMA_DEFAULT,
+    clamp_confidence,
+    score_with_wager,
+)
 
 RAY_INSTALLED = True
 try:
@@ -346,8 +346,7 @@ def _build_resource_limit_prefix(
 
     if shutil.which("prlimit") is None:
         logger.warning(
-            "prlimit not found on PATH; skipping resource limits "
-            "(memory_limit_mb=%s, max_pids=%s)",
+            "prlimit not found on PATH; skipping resource limits (memory_limit_mb=%s, max_pids=%s)",
             memory_limit_mb,
             max_pids,
         )
@@ -384,19 +383,9 @@ class ProblemInstance(BaseModel):
 
 
 def _prep_workspace_dir(work_dir: str, workspace_path: str = "/data_workspace") -> None:
-    wd = Path(work_dir)
-    (wd / "pydeps").mkdir(parents=True, exist_ok=True)
-    (wd / "pip-cache").mkdir(parents=True, exist_ok=True)
-
-    (wd / "pip.conf").write_text(
-        "[global]\n"
-        "disable-pip-version-check = true\n"
-        "no-input = true\n"
-        f"cache-dir = {workspace_path}/pip-cache\n"
-        f"target = {workspace_path}/pydeps\n"
-    )
-
-    _write_install_shims(wd)
+    # Shared with the k8s kernel server (kernel_capsule_server) so the install
+    # model can't drift. Enroot has no in-pod cutoff proxy, so index_url is None.
+    write_workspace_config(Path(work_dir), runtime_path=workspace_path, index_url=None)
 
 
 @ray.remote(
@@ -463,7 +452,8 @@ class EnrootKernelServer:
         node_workdir: str, language: NBLanguage, port: int, startup_token: str, safe_execute: bool = True
     ) -> str:
         """Build the bash script that sets up the workspace and launches the kernel server."""
-        return dedent(f"""\
+        exports = bash_export_block("$WORKDIR")
+        script = dedent(f"""\
             set -euo pipefail
 
             WORKDIR="{node_workdir}"
@@ -474,35 +464,14 @@ class EnrootKernelServer:
 
             cd $WORKDIR
 
-            # Install-shim wrappers (pip / conda / apt-get) + R shim + JSONL log
-            # all live under $WORKDIR/.install_shim/ (hidden from the agent's
-            # list_dir default view). Pre-written by _write_install_shims().
-            # cp -a preserves execute bits but ensure anyway.
+            # pydeps / pip.conf / .install_shim (pip/conda/apt + R shim) / Rprofile /
+            # r_libs are written host-side by write_workspace_config() and copied in
+            # above; cp -a preserves execute bits but ensure them anyway.
             if [ -d "$WORKDIR/.install_shim/bin" ]; then
                 chmod 755 "$WORKDIR/.install_shim/bin"/* 2>/dev/null || true
             fi
 
-            mkdir -p "$WORKDIR/r_libs"
-            cat >"$WORKDIR/Rprofile" <<'EOF'
-            .local_lib <- Sys.getenv("R_LIBS_USER")
-            if (nzchar(.local_lib)) .libPaths(unique(c(.local_lib, .libPaths())))
-            EOF
-            # Append the R install-shim (pre-written by _write_install_shims).
-            if [ -f "$WORKDIR/.install_shim/r_shim.R" ]; then
-                cat "$WORKDIR/.install_shim/r_shim.R" >> "$WORKDIR/Rprofile"
-            fi
-
-            mkdir -p $WORKDIR/r_libs
-            export R_LIBS_USER="$WORKDIR/r_libs"
-            export R_PROFILE_USER="$WORKDIR/Rprofile"
-
-            # Prepend the shim bin dir so pip/conda/apt-get resolve to our wrappers.
-            # The wrappers exec the real installer at their absolute paths, so no recursion.
-            export PATH="$WORKDIR/.install_shim/bin:$PATH"
-            export INSTALL_SHIM_LOG="$WORKDIR/.install_shim/log"
-
-            export PYTHONPATH="$WORKDIR/pydeps:${{PYTHONPATH}}"
-            export PIP_CONFIG_FILE=$WORKDIR/pip.conf
+            __WORKSPACE_EXPORTS__
             export target_platform=${{target_platform:-linux-64}}
 
             source activate /app/kernel_env
@@ -512,6 +481,7 @@ class EnrootKernelServer:
                 --port {port} \\
                 --startup-token {startup_token} {"--safe-execute" if safe_execute else ""}
         """).strip()
+        return script.replace("__WORKSPACE_EXPORTS__", exports)
 
     @staticmethod
     def _setup_enroot_env(startup_token: str) -> dict[str, str]:
@@ -583,9 +553,7 @@ class EnrootKernelServer:
 
         enroot_env = self._setup_enroot_env(startup_token)
 
-        resource_prefix = _build_resource_limit_prefix(
-            self.sandbox_memory_limit_mb, self.sandbox_max_pids
-        )
+        resource_prefix = _build_resource_limit_prefix(self.sandbox_memory_limit_mb, self.sandbox_max_pids)
 
         online = False
         attempt = 0
@@ -857,14 +825,12 @@ class EnrootKernelServer:
         except Exception as e:
             return f"Error listing directory: {e!s}"
 
-        result = await asyncio.to_thread(
+        return await asyncio.to_thread(
             list_dir_tool,
             str(normalized),
             max_files=max_files,
             show_hidden=show_hidden,
         )
-
-        return result
 
     async def close(self):
         label = self._proc_label()
@@ -1035,7 +1001,7 @@ class InterpreterEnvState:
             except TimeoutError as exc:
                 last_timeout = exc
                 if attempt >= max_retries:
-                    logger.error(
+                    logger.exception(
                         "[ray-enroot] req %s exhausted waits for %s on work_dir=%s "
                         "(attempts=%d, timeout_per_attempt=%.1fs)",
                         req_uuid,
@@ -1088,28 +1054,27 @@ class InterpreterEnvState:
             self._container_port = await get_free_port()
             startup_token = str(uuid.uuid4())
 
-            resource_prefix = _build_resource_limit_prefix(
-                self.sandbox_memory_limit_mb, self.sandbox_max_pids
-            )
+            resource_prefix = _build_resource_limit_prefix(self.sandbox_memory_limit_mb, self.sandbox_max_pids)
 
-            bash = dedent(f"""\
+            exports = bash_export_block("/data_workspace")
+            bash = (
+                dedent(f"""\
                 set -euo pipefail
                 cd /data_workspace
 
                 if [ -d /data_workspace/.install_shim/bin ]; then
                     chmod 755 /data_workspace/.install_shim/bin/* 2>/dev/null || true
                 fi
-                export PATH="/data_workspace/.install_shim/bin:$PATH"
-                export INSTALL_SHIM_LOG="/data_workspace/.install_shim/log"
-
-                export PYTHONPATH="/data_workspace/pydeps:${{PYTHONPATH}}"
-                export PIP_CONFIG_FILE=/data_workspace/pip.conf
+                __WORKSPACE_EXPORTS__
                 exec /app/kernel_env/bin/python /envs/kernel_server.py \\
                     --work_dir /data_workspace \\
                     --language {self.language.value} \\
                     --port {self._container_port} \\
                     --startup-token {startup_token} {"--safe-execute" if self.safe_execute else ""}
-            """).strip()
+            """)
+                .strip()
+                .replace("__WORKSPACE_EXPORTS__", exports)
+            )
 
             kernel_server_path = Path(__file__).parent / "kernel_server.py"
             assert kernel_server_path.is_file(), f"kernel server must be a valid path, found {kernel_server_path}"
@@ -1425,7 +1390,9 @@ class InterpreterEnvState:
                     logger.warning("Failed to detach existing save_dir %s for cleanup: %s", self.save_dir, e)
                 else:
                     if cleanup_path is not None:
-                        logger.warning("Detached existing save_dir %s to %s for background cleanup", self.save_dir, cleanup_path)
+                        logger.warning(
+                            "Detached existing save_dir %s to %s for background cleanup", self.save_dir, cleanup_path
+                        )
                         _schedule_dir_cleanup(cleanup_path)
             try:
                 self.work_dir.replace(self.save_dir)
@@ -2065,7 +2032,10 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         # Execute code and update notebook atomically
         result, actual_cell_idx = await self.state.execute_and_add_cell(
-            code, cell_idx=cell_idx, timeout=effective_timeout, req_uuid=run_cell_uuid,
+            code,
+            cell_idx=cell_idx,
+            timeout=effective_timeout,
+            req_uuid=run_cell_uuid,
         )
 
         # Build response with cell number
@@ -2079,7 +2049,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             # every other kernel error, so the framework's generic
             # "Encountered exception during tool call:" wrapper doesn't fire.
             try:
-                image_urls = [f"data:{mime_type};base64,{base64_data}" for mime_type, base64_data in result.get_images()]
+                image_urls = [
+                    f"data:{mime_type};base64,{base64_data}" for mime_type, base64_data in result.get_images()
+                ]
                 return Message.create_message(
                     role="tool",
                     text=cell_info + result.get_truncated_text(),
@@ -2090,7 +2062,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                     raise
                 self.logger.warning(
                     "DecompressionBombError on image output for cell %d: %s",
-                    actual_cell_idx, e,
+                    actual_cell_idx,
+                    e,
                 )
                 hint = "Hint: reduce the figure size or dpi on plt.savefig / fig.savefig."
                 # Replace the cell's image output with an error output so the
@@ -2104,11 +2077,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                             traceback=[f"DecompressionBombError: {e}", hint],
                         )
                     ]
-                return (
-                    f"{cell_info}Error: DecompressionBombError\n"
-                    f"Message: {e}\n"
-                    f"Traceback: {hint}"
-                )
+                return f"{cell_info}Error: DecompressionBombError\nMessage: {e}\nTraceback: {hint}"
 
         return cell_info + result.get_truncated_text()
 
@@ -2218,21 +2187,35 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         except Exception as e:
             self.logger.exception("Hybrid judge call failed — failing open")
             return {
-                "per_item": [], "proc_present_pts": 0, "proc_max_pts": 0,
-                "concl_present_pts": 0, "concl_max_pts": 0,
-                "item_weights": [], "prompt": prompt, "response": "",
-                "judge_call_failed": True, "parse_failed": False,
-                "weights_mismatch": False, "error": repr(e),
+                "per_item": [],
+                "proc_present_pts": 0,
+                "proc_max_pts": 0,
+                "concl_present_pts": 0,
+                "concl_max_pts": 0,
+                "item_weights": [],
+                "prompt": prompt,
+                "response": "",
+                "judge_call_failed": True,
+                "parse_failed": False,
+                "weights_mismatch": False,
+                "error": repr(e),
             }
 
         if not resp.text:
             self.logger.warning("Hybrid judge returned empty response — failing open")
             return {
-                "per_item": [], "proc_present_pts": 0, "proc_max_pts": 0,
-                "concl_present_pts": 0, "concl_max_pts": 0,
-                "item_weights": [], "prompt": prompt, "response": "",
-                "judge_call_failed": True, "parse_failed": False,
-                "weights_mismatch": False, "error": "empty response",
+                "per_item": [],
+                "proc_present_pts": 0,
+                "proc_max_pts": 0,
+                "concl_present_pts": 0,
+                "concl_max_pts": 0,
+                "item_weights": [],
+                "prompt": prompt,
+                "response": "",
+                "judge_call_failed": True,
+                "parse_failed": False,
+                "weights_mismatch": False,
+                "error": "empty response",
             }
 
         parsed = parse_hybrid_response(resp.text)
@@ -2250,7 +2233,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         if weights_mismatch:
             self.logger.warning(
                 "Hybrid judge weights sum to %d but problem.max_score=%d — failing open on scoring",
-                total_weight, self.problem.max_score,
+                total_weight,
+                self.problem.max_score,
             )
 
         return {
@@ -2284,7 +2268,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 self.logger.exception("Binary faithfulness gate failed — falling back to rubric-only scoring")
                 self.state.faithfulness_passed = None
 
-        elif mode in ("shadow", "hybrid"):
+        elif mode in {"shadow", "hybrid"}:
             rubric_task = asyncio.ensure_future(self._evaluate_rubric(solution, nb_content))
             hybrid_task = asyncio.ensure_future(self._evaluate_hybrid_gate(solution, nb_content))
             try:
@@ -2297,8 +2281,10 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             except Exception:
                 self.logger.exception("Hybrid gate failed — failing open to rubric-only scoring")
                 faith_result = {
-                    "per_item": [], "item_weights": [],
-                    "judge_call_failed": True, "parse_failed": False,
+                    "per_item": [],
+                    "item_weights": [],
+                    "judge_call_failed": True,
+                    "parse_failed": False,
                     "weights_mismatch": False,
                 }
 
@@ -2322,7 +2308,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 else:
                     applied = rubric_score
 
-            elif mode in ("shadow", "hybrid"):
+            elif mode in {"shadow", "hybrid"}:
                 assert faith_result is not None
                 item_weights = faith_result.get("item_weights", [])
                 judge_broken = (
@@ -2355,10 +2341,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 concl_max_hm = int(hm.get("concl_max_pts", 0))
                 proc_credited = float(hm.get("proc_pts_credited", 0.0))
                 concl_credited = float(hm.get("concl_pts_credited", 0.0))
-                gate_unavailable = (
-                    (proc_max + concl_max_hm) <= 0
-                    or hm.get("strip_reason") == "judge_unavailable"
-                )
+                gate_unavailable = (proc_max + concl_max_hm) <= 0 or hm.get("strip_reason") == "judge_unavailable"
                 if gate_unavailable:
                     self.state.wager_reward_shadow = float(applied)
                     self.state.wager_metadata = {
@@ -2366,7 +2349,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                         "wager": self.state.wager,
                     }
                 else:
-                    gate_correct = concl_credited >= concl_max_hm and concl_max_hm > 0
+                    gate_correct = concl_credited >= concl_max_hm > 0
                     wager_value, wager_breakdown = score_with_wager(
                         proc_credit=proc_credited,
                         proc_max=proc_max,
