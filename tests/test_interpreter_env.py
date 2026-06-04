@@ -18,14 +18,14 @@ from lmi import LiteLLMModel
 from hypotest.env import config as cfg
 from hypotest.env.config import ExecutionConfig
 from hypotest.env.interpreter_env import (
-    EnrootKernelServer,
     InterpreterEnv,
     InterpreterEnvConfig,
     InterpreterEnvState,
     ProblemInstance,
-    _build_resource_limit_prefix,
 )
 from hypotest.env.kernel_server import NBLanguage
+from hypotest.env.sandbox.base import _build_resource_limit_prefix
+from hypotest.env.sandbox.enroot import EnrootKernelServer
 
 from .conftest import requires_matplotlib, should_skip_docker_test
 
@@ -452,10 +452,10 @@ class TestInterpreterEnvRunCell:
 
         original_execute = interpreter_env.state.execute_and_add_cell
 
-        async def mock_execute_and_add_cell(code, cell_idx=None, timeout=None):  # noqa: ASYNC109
+        async def mock_execute_and_add_cell(code, cell_idx=None, timeout=None, req_uuid=""):  # noqa: ASYNC109
             nonlocal captured_timeout
             captured_timeout = timeout
-            return await original_execute(code, cell_idx, timeout)
+            return await original_execute(code, cell_idx, timeout, req_uuid=req_uuid)
 
         with (
             patch.object(interpreter_env, "get_remaining_time", return_value=remaining_time),
@@ -931,17 +931,17 @@ class TestResourceLimitPrefix:
     def test_returns_empty_when_no_limits(self):
         assert _build_resource_limit_prefix(None, None) == []
 
-    @patch("hypotest.env.interpreter_env.shutil.which", return_value="/usr/bin/prlimit")
+    @patch("hypotest.env.sandbox.base.shutil.which", return_value="/usr/bin/prlimit")
     def test_memory_limit_only(self, mock_which):
         result = _build_resource_limit_prefix(8192, None)
         assert result == ["prlimit", f"--as={8192 * 1024 * 1024}", "--"]
 
-    @patch("hypotest.env.interpreter_env.shutil.which", return_value="/usr/bin/prlimit")
+    @patch("hypotest.env.sandbox.base.shutil.which", return_value="/usr/bin/prlimit")
     def test_pids_limit_only(self, mock_which):
         result = _build_resource_limit_prefix(None, 256)
         assert result == ["prlimit", "--nproc=256", "--"]
 
-    @patch("hypotest.env.interpreter_env.shutil.which", return_value="/usr/bin/prlimit")
+    @patch("hypotest.env.sandbox.base.shutil.which", return_value="/usr/bin/prlimit")
     def test_both_limits(self, mock_which):
         result = _build_resource_limit_prefix(4096, 512)
         assert f"--as={4096 * 1024 * 1024}" in result
@@ -949,7 +949,7 @@ class TestResourceLimitPrefix:
         assert result[0] == "prlimit"
         assert result[-1] == "--"
 
-    @patch("hypotest.env.interpreter_env.shutil.which", return_value=None)
+    @patch("hypotest.env.sandbox.base.shutil.which", return_value=None)
     def test_returns_empty_when_prlimit_not_available(self, mock_which):
         assert _build_resource_limit_prefix(8192, 512) == []
 

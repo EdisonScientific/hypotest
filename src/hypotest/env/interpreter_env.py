@@ -11,17 +11,11 @@ import json
 import logging
 import os
 import shutil
-import signal
-import socket
-import subprocess
-import sys
 import time
 import uuid
 import warnings
-from collections.abc import Awaitable, Callable
 from pathlib import Path
 from tempfile import mkdtemp
-from textwrap import dedent
 from typing import Any, Literal, cast
 from uuid import UUID
 
@@ -52,7 +46,6 @@ from .hybrid_gate import (
     parse_hybrid_response,
     synthesize_per_item_awards,
 )
-from .install_shim import bash_export_block, write_workspace_config
 from .interpreter import ExecutionResult
 from .prompts import (
     CORRECT_MSG,
@@ -62,8 +55,8 @@ from .prompts import (
     RUBRIC_SCORE_PROMPT,
     PromptingConfig,
 )
-from .sandbox import HttpKernelClient, ResourceSpec, Sandbox, SandboxConfig, make_sandbox
-from .tools.filesystem import FilesystemTool, list_dir_tool
+from .sandbox import ResourceSpec, Sandbox, SandboxConfig, SandboxScheduler, make_sandbox
+from .tools.filesystem import FilesystemTool
 from .utils import NBLanguage, view_notebook
 from .wager import (
     WAGER_BETA_DEFAULT,
@@ -74,23 +67,26 @@ from .wager import (
 
 RAY_INSTALLED = True
 try:
-    import ray
+    from ray.exceptions import RayActorError
 except ImportError:
     RAY_INSTALLED = False
 
+# Cell-replay budget for session recovery (swap + replay on backend death).
+_REPLAY_BUDGET = int(os.getenv("SANDBOX_REPLAY_BUDGET", "50"))
 
-# Port management for Docker containers
-_USED_PORTS: set[int] = set()
-used_ports_lock = asyncio.Lock()
+# Transport failures that warrant a sandbox swap+replay — the kernel/pod/actor DIED.
+# A cell timeout is NOT here: it comes back as an ExecutionResult (never an exception), and a
+# slow-but-alive call shouldn't trigger a disruptive recovery. Connection loss + actor death only.
+_RECOVERABLE_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+)
+if RAY_INSTALLED:
+    _RECOVERABLE_TRANSPORT_ERRORS = (*_RECOVERABLE_TRANSPORT_ERRORS, RayActorError)
 
-# container launch semaphore to limit concurrency
-CONTAINER_LAUNCH_SEM = asyncio.Semaphore(128)
-MAX_CONTAINER_LAUNCH_RETRIES = int(os.getenv("MAX_CONTAINER_LAUNCH_RETRIES", "5"))
-_RETRY_BASE_SLEEP = 1.0
-_RETRY_MAX_SLEEP = 16.0
-MAX_RAY_RESULT_WAIT_RETRIES = int(os.getenv("MAX_RAY_RESULT_WAIT_RETRIES", "3"))
-_RAY_RESULT_WAIT_TIMEOUT_GRACE = float(os.getenv("RAY_RESULT_WAIT_TIMEOUT_GRACE", "30"))
-_LIST_DIR_RAY_TIMEOUT = float(os.getenv("LIST_DIR_RAY_TIMEOUT", "30"))
+logger = logging.getLogger(__name__)
+
 
 _warned_unsafe_execution: set[str] = set()
 _BACKGROUND_CLEANUP_TASKS: set[asyncio.Task[None]] = set()
@@ -124,241 +120,6 @@ def _schedule_dir_cleanup(path: Path) -> None:
     task.add_done_callback(_BACKGROUND_CLEANUP_TASKS.discard)
 
 
-async def get_free_port() -> int:
-    """Get a free port for the kernel server container."""
-    while True:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            port = s.getsockname()[1]
-        async with used_ports_lock:
-            if port not in _USED_PORTS:
-                _USED_PORTS.add(port)
-                return port
-
-
-logger = logging.getLogger(__name__)
-
-# Container lifecycle log level: root logger defaults to WARNING and we
-# cannot reconfigure it, so use WARNING for all container diagnostics to
-# ensure they are visible in production logs.
-_CONTAINER_LOG_LEVEL = logging.WARNING
-
-
-class _PortCollisionError(Exception):
-    """Port already in use by another server — retry with a new port."""
-
-
-async def _poll_kernel_health(  # noqa: PLR0912
-    http_client: httpx.AsyncClient,
-    enroot_proc: asyncio.subprocess.Process | None,
-    container_port: int | None,
-    expected_startup_token: str | None,
-    read_log_tail: Callable[[int], Awaitable[str]],
-    label: str,
-) -> None:
-    """Poll kernel server /health endpoint until ready, with token validation and timeout."""
-    start_time = time.perf_counter()
-    poll_count = 0
-    last_status = "no_attempt"
-    consecutive_token_mismatches = 0
-    # Use a short per-request timeout for health checks so that a single
-    # poll can never block longer than a few seconds.  Without this, the
-    # client's default timeout (execution_timeout + 10 ≈ 190s) means one
-    # health poll can exceed the entire KERNEL_SERVER_STARTUP_TIMEOUT,
-    # e.g. when a port collision causes us to connect to the wrong server.
-    health_timeout = httpx.Timeout(5.0, connect=3.0)
-
-    while time.perf_counter() - start_time < cfg.KERNEL_SERVER_STARTUP_TIMEOUT:
-        poll_count += 1
-        elapsed = time.perf_counter() - start_time
-
-        # Check if the enroot process has died before we even get an HTTP response
-        if enroot_proc is not None and enroot_proc.returncode is not None:
-            rc = enroot_proc.returncode
-            log_tail = await read_log_tail(1000)
-            raise RuntimeError(
-                f"Enroot process exited prematurely with returncode={rc} after {elapsed:.1f}s. log: {log_tail!r}"
-            )
-
-        try:
-            response = await http_client.get("/health", timeout=health_timeout)
-            if response.status_code == 200:
-                if expected_startup_token is None:
-                    logger.log(
-                        _CONTAINER_LOG_LEVEL,
-                        "[%s] Kernel server healthy after %.1fs (%d polls)",
-                        label,
-                        elapsed,
-                        poll_count,
-                    )
-                    return
-                payload = response.json()
-                if payload.get("startup_token") == expected_startup_token:
-                    logger.log(
-                        _CONTAINER_LOG_LEVEL,
-                        "[%s] Kernel server healthy (token matched) after %.1fs (%d polls)",
-                        label,
-                        elapsed,
-                        poll_count,
-                    )
-                    return
-                last_status = f"token_mismatch(got={payload.get('startup_token', '?')[:8]})"
-                consecutive_token_mismatches += 1
-                if consecutive_token_mismatches >= 3:
-                    raise _PortCollisionError(
-                        f"Port {container_port} appears to be owned by another server "
-                        f"({consecutive_token_mismatches} consecutive token mismatches)"
-                    )
-            else:
-                last_status = f"http_{response.status_code}"
-                consecutive_token_mismatches = 0
-        except httpx.ConnectError:
-            last_status = "connect_error"
-            consecutive_token_mismatches = 0
-        except httpx.ReadError:
-            last_status = "read_error"
-            consecutive_token_mismatches = 0
-        except httpx.TimeoutException:
-            last_status = "timeout"
-            consecutive_token_mismatches = 0
-        except httpx.RemoteProtocolError:
-            last_status = "protocol_error"
-            consecutive_token_mismatches = 0
-
-        # Log progress every 5s
-        if poll_count % 10 == 0:
-            proc_alive = enroot_proc.returncode is None if enroot_proc else False
-            logger.log(
-                _CONTAINER_LOG_LEVEL,
-                "[%s] Health poll #%d at %.1fs: last_status=%s, process_alive=%s",
-                label,
-                poll_count,
-                elapsed,
-                last_status,
-                proc_alive,
-            )
-
-        await asyncio.sleep(0.5)
-
-    total_elapsed = time.perf_counter() - start_time
-    if last_status.startswith("token_mismatch"):
-        raise _PortCollisionError(
-            f"Port {container_port} health-check timed out with token_mismatch "
-            f"({poll_count} polls, elapsed={total_elapsed:.1f}s)"
-        )
-    log_tail = await read_log_tail(500)
-    raise TimeoutError(
-        f"Kernel server did not become healthy within {cfg.KERNEL_SERVER_STARTUP_TIMEOUT}s "
-        f"({poll_count} polls, last_status={last_status}, elapsed={total_elapsed:.1f}s)"
-        f"{f' log_tail={log_tail!r}' if log_tail else ''}"
-    )
-
-
-async def _kill_process_group(
-    proc: asyncio.subprocess.Process, label: str = "enroot", sigterm_timeout: float = 15
-) -> None:
-    """Safely terminate a process group, escalating from SIGTERM to SIGKILL.
-
-    Handles all edge cases: already-dead process, missing process group, etc.
-    """
-    if proc.returncode is not None:
-        logger.log(
-            _CONTAINER_LOG_LEVEL,
-            "[%s] Process pid=%d already exited with returncode=%d",
-            label,
-            proc.pid,
-            proc.returncode,
-        )
-        return
-
-    pgid = None
-    try:
-        pgid = os.getpgid(proc.pid)
-    except ProcessLookupError:
-        logger.log(_CONTAINER_LOG_LEVEL, "[%s] Process pid=%d vanished before we could get pgid", label, proc.pid)
-        return
-
-    # SIGTERM the whole group
-    try:
-        logger.log(_CONTAINER_LOG_LEVEL, "[%s] Sending SIGTERM to pgid=%d (pid=%d)", label, pgid, proc.pid)
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        logger.log(_CONTAINER_LOG_LEVEL, "[%s] Process group pgid=%d already gone after SIGTERM", label, pgid)
-        return
-
-    try:
-        await asyncio.wait_for(proc.communicate(), timeout=sigterm_timeout)
-    except TimeoutError:
-        logger.warning(
-            "[%s] Process pid=%d did not exit within %.1fs of SIGTERM, sending SIGKILL",
-            label,
-            proc.pid,
-            sigterm_timeout,
-        )
-    else:
-        logger.log(
-            _CONTAINER_LOG_LEVEL,
-            "[%s] Process pid=%d exited after SIGTERM with returncode=%d",
-            label,
-            proc.pid,
-            proc.returncode,
-        )
-        return
-
-    # SIGKILL the whole group
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        logger.log(_CONTAINER_LOG_LEVEL, "[%s] Process group pgid=%d already gone before SIGKILL", label, pgid)
-        return
-
-    try:
-        await asyncio.wait_for(proc.communicate(), timeout=5)
-        logger.log(
-            _CONTAINER_LOG_LEVEL,
-            "[%s] Process pid=%d exited after SIGKILL with returncode=%d",
-            label,
-            proc.pid,
-            proc.returncode,
-        )
-    except TimeoutError:
-        logger.exception("[%s] Process pid=%d still alive after SIGKILL — possible zombie", label, proc.pid)
-
-
-def _build_resource_limit_prefix(
-    memory_limit_mb: int | None,
-    max_pids: int | None,
-) -> list[str]:
-    """Build a prlimit command prefix for resource-limited execution.
-
-    Uses prlimit to set RLIMIT_AS (virtual address space) which is inherited
-    by all child processes through the env -> enroot -> bash -> python chain.
-    When a sandbox exceeds the limit, allocations fail with MemoryError rather
-    than consuming all node memory.
-
-    Returns an empty list if no limits are configured or prlimit is not available.
-    """
-    if memory_limit_mb is None and max_pids is None:
-        return []
-
-    if shutil.which("prlimit") is None:
-        logger.warning(
-            "prlimit not found on PATH; skipping resource limits (memory_limit_mb=%s, max_pids=%s)",
-            memory_limit_mb,
-            max_pids,
-        )
-        return []
-
-    prefix = ["prlimit"]
-    if memory_limit_mb is not None:
-        prefix.append(f"--as={memory_limit_mb * 1024 * 1024}")
-    if max_pids is not None:
-        prefix.append(f"--nproc={max_pids}")
-
-    prefix.append("--")
-    return prefix
-
-
 class ProblemInstance(BaseModel):
     id: UUID
     hypothesis: str
@@ -377,442 +138,6 @@ class ProblemInstance(BaseModel):
         if data.get("nb_primary_language") is None:
             data["nb_primary_language"] = str(NBLanguage.PYTHON)
         return data
-
-
-def _prep_workspace_dir(work_dir: str, workspace_path: str = "/data_workspace") -> None:
-    # Shared with the k8s kernel server (kernel_capsule_server) so the install
-    # model can't drift. Enroot has no in-pod cutoff proxy, so index_url is None.
-    write_workspace_config(Path(work_dir), runtime_path=workspace_path, index_url=None)
-
-
-@ray.remote(
-    scheduling_strategy="SPREAD",
-    max_concurrency=1,
-    runtime_env={
-        "py_executable": sys.executable,
-    },
-)
-class EnrootKernelServer:
-    def __init__(
-        self,
-        container_sqsh_path: Path,
-        execution_timeout: float,
-        safe_execute: bool = True,
-        sandbox_memory_limit_mb: int | None = None,
-        sandbox_max_pids: int | None = None,
-    ):
-        self.container_sqsh_path = container_sqsh_path
-        self.execution_timeout = execution_timeout
-        self.safe_execute = safe_execute
-        self.sandbox_memory_limit_mb = sandbox_memory_limit_mb
-        self.sandbox_max_pids = sandbox_max_pids
-        self._enroot_proc: asyncio.subprocess.Process | None = None
-        self._http_client: httpx.AsyncClient | None = None
-        self._kernel_client: HttpKernelClient | None = None
-        self._container_port: int | None = None
-        self._container_log_path: Path | None = None
-        self._container_log_file: Any | None = None
-        self._node_workdir: Path | None = None
-
-    def _proc_label(self) -> str:
-        """Short label for log messages identifying this container."""
-        port = self._container_port or "?"
-        pid = self._enroot_proc.pid if self._enroot_proc else "?"
-        return f"enroot(port={port}, pid={pid})"
-
-    def _require_node_workdir(self) -> Path:
-        if self._node_workdir is None:
-            raise RuntimeError("Node-local workspace is not initialized")
-        return self._node_workdir
-
-    def _normalize_node_workspace_path(self, directory: str) -> Path:
-        workspace_root = self._require_node_workdir().resolve()
-        requested = Path(directory)
-        workspace_alias = Path("/data_workspace")
-
-        if requested.is_absolute():
-            if requested == workspace_alias or workspace_alias in requested.parents:
-                candidate = workspace_root / requested.relative_to(workspace_alias)
-            elif requested == workspace_root or workspace_root in requested.parents:
-                candidate = requested
-            else:
-                raise ValueError("Path must stay within the workspace root")
-        else:
-            candidate = workspace_root / requested
-
-        candidate = candidate.resolve()
-        if candidate != workspace_root and workspace_root not in candidate.parents:
-            raise ValueError("Path must stay within the workspace root")
-        return candidate
-
-    @staticmethod
-    def _build_kernel_bash_script(
-        node_workdir: str, language: NBLanguage, port: int, startup_token: str, safe_execute: bool = True
-    ) -> str:
-        """Build the bash script that sets up the workspace and launches the kernel server."""
-        exports = bash_export_block("$WORKDIR")
-        script = dedent(f"""\
-            set -euo pipefail
-
-            WORKDIR="{node_workdir}"
-            trap 'rm -rf "$WORKDIR"' EXIT
-
-            mkdir -p $WORKDIR
-            cp -a /data_workspace/. $WORKDIR/
-
-            cd $WORKDIR
-
-            # pydeps / pip.conf / .install_shim (pip/conda/apt + R shim) / Rprofile /
-            # r_libs are written host-side by write_workspace_config() and copied in
-            # above; cp -a preserves execute bits but ensure them anyway.
-            if [ -d "$WORKDIR/.install_shim/bin" ]; then
-                chmod 755 "$WORKDIR/.install_shim/bin"/* 2>/dev/null || true
-            fi
-
-            __WORKSPACE_EXPORTS__
-            export target_platform=${{target_platform:-linux-64}}
-
-            source activate /app/kernel_env
-            exec /app/kernel_env/bin/python /envs/kernel_server.py \\
-                --work_dir $WORKDIR \\
-                --language {language.value} \\
-                --port {port} \\
-                --startup-token {startup_token} {"--safe-execute" if safe_execute else ""}
-        """).strip()
-        return script.replace("__WORKSPACE_EXPORTS__", exports)
-
-    @staticmethod
-    def _setup_enroot_env(startup_token: str) -> dict[str, str]:
-        """Create enroot runtime directories and return env dict."""
-        base = Path(f"/tmp/enroot_data/{startup_token}")  # noqa: S108
-        subdirs = ["runtime", "config", "cache", "data", "tmp"]
-        env_keys = [
-            "ENROOT_RUNTIME_PATH",
-            "ENROOT_CONFIG_PATH",
-            "ENROOT_CACHE_PATH",
-            "ENROOT_DATA_PATH",
-            "ENROOT_TEMP_PATH",
-        ]
-        env: dict[str, str] = {}
-        for subdir, key in zip(subdirs, env_keys, strict=True):
-            p = base / subdir
-            p.mkdir(parents=True, exist_ok=True)
-            os.chmod(p, 0o700)
-            env[key] = str(p)
-        return env
-
-    @staticmethod
-    def _build_enroot_cmd(
-        work_dir: Path,
-        node_workdir: Path,
-        kernel_server_path: Path,
-        bash: str,
-        enroot_env: dict[str, str],
-        container_sqsh_path: Path,
-        resource_prefix: list[str] | None = None,
-    ) -> list[str]:
-        """Assemble the full ``enroot start`` command, optionally prefixed with prlimit."""
-        env_args = [f"{k}={v}" for k, v in enroot_env.items()]
-        cmd = [
-            "env",
-            "-i",
-            "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
-            'HOME="$HOME"',
-            'USER="$USER"',
-            *env_args,
-            "enroot",
-            "start",
-            "--rw",
-            "--mount",
-            f"{work_dir}:/data_workspace",
-            "--mount",
-            f"{node_workdir.resolve()}:{node_workdir}",
-            "--mount",
-            f"{kernel_server_path.resolve()}:/envs/kernel_server.py",
-            str(container_sqsh_path.resolve()),
-            "/bin/bash",
-            "-lc",
-            bash,
-        ]
-        if resource_prefix:
-            return [*resource_prefix, *cmd]
-        return cmd
-
-    async def initialize(self, work_dir: Path, language: NBLanguage) -> None:
-        startup_token = str(uuid.uuid4())
-        node_workdir = Path(f"{cfg.CONTAINER_WORKSPACE_PREFIX}.{startup_token.split('-', maxsplit=1)[0]}")
-        self._node_workdir = node_workdir
-
-        _prep_workspace_dir(str(work_dir), workspace_path=str(node_workdir))
-        logger.warning("[ray-enroot] prepared node-local workspace %s for host work_dir=%s", node_workdir, work_dir)
-
-        kernel_server_path = Path(__file__).parent / "kernel_server.py"
-        assert kernel_server_path.is_file(), f"kernel server must be a valid path, found {kernel_server_path}"
-
-        enroot_env = self._setup_enroot_env(startup_token)
-
-        resource_prefix = _build_resource_limit_prefix(self.sandbox_memory_limit_mb, self.sandbox_max_pids)
-
-        online = False
-        attempt = 0
-        last_err: Exception | None = None
-        while not online:
-            attempt += 1
-            if attempt > MAX_CONTAINER_LAUNCH_RETRIES:
-                log_tail = await self._read_container_log_tail(500)
-                raise RuntimeError(
-                    f"Container failed to start after {MAX_CONTAINER_LAUNCH_RETRIES} attempts "
-                    f"(last_error={last_err!r})"
-                    f"{f' log_tail={log_tail!r}' if log_tail else ''}"
-                )
-            self._container_port = await get_free_port()
-
-            await asyncio.to_thread(node_workdir.mkdir, parents=True, exist_ok=True)
-            bash = self._build_kernel_bash_script(
-                str(node_workdir), language, self._container_port, startup_token, safe_execute=self.safe_execute
-            )
-            cmd = self._build_enroot_cmd(
-                work_dir,
-                node_workdir,
-                kernel_server_path,
-                bash,
-                enroot_env,
-                self.container_sqsh_path,
-                resource_prefix=resource_prefix,
-            )
-
-            async with CONTAINER_LAUNCH_SEM:
-                launch_t0 = time.perf_counter()
-                # Redirect container output to a log file instead of
-                # subprocess.PIPE to avoid pipe-buffer deadlock (the 64KB
-                # OS pipe buffer fills up when the kernel server produces
-                # verbose DEBUG / uvicorn access logs, blocking the
-                # container process on write() and freezing the kernel).
-                log_dir = work_dir / ".container_logs"
-                log_dir.mkdir(exist_ok=True)
-                self._container_log_path = log_dir / "container.log"
-                self._container_log_file = await asyncio.to_thread(
-                    open, self._container_log_path, "w", encoding="utf-8"
-                )
-                self._enroot_proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    start_new_session=True,
-                    stdout=self._container_log_file,
-                    stderr=subprocess.STDOUT,
-                )
-                logger.log(
-                    _CONTAINER_LOG_LEVEL,
-                    "[%s] Container launch attempt #%d started (work_dir=%s, token=%s)",
-                    self._proc_label(),
-                    attempt,
-                    work_dir,
-                    startup_token[:8],
-                )
-
-            # Create HTTP client (outside semaphore — no need to hold the
-            # concurrency slot while waiting for the container to come up)
-            self._http_client = httpx.AsyncClient(
-                base_url=f"http://localhost:{self._container_port}",
-                timeout=httpx.Timeout(self.execution_timeout + 10, connect=30.0),
-            )
-            self._kernel_client = HttpKernelClient(
-                self._http_client.request, execution_timeout=self.execution_timeout, label=self._proc_label()
-            )
-
-            # Wait for health check
-            try:
-                await self._wait_for_health(expected_startup_token=startup_token)
-                launch_ms = (time.perf_counter() - launch_t0) * 1000.0
-                logger.log(
-                    _CONTAINER_LOG_LEVEL,
-                    "[%s] Container online after %.1fms (attempt #%d)",
-                    self._proc_label(),
-                    launch_ms,
-                    attempt,
-                )
-                online = True
-            except Exception as e:
-                last_err = e
-                launch_ms = (time.perf_counter() - launch_t0) * 1000.0
-                await self._log_container_failure(attempt, launch_ms, e)
-                await self._cleanup_failed_startup()
-                if not isinstance(e, _PortCollisionError):
-                    backoff = min(_RETRY_BASE_SLEEP * 2 ** (attempt - 1), _RETRY_MAX_SLEEP)
-                    await asyncio.sleep(backoff)
-
-    async def _log_container_failure(self, attempt: int, launch_ms: float, error: Exception) -> None:
-        """Log detailed diagnostics when a container fails to start."""
-        label = self._proc_label()
-        proc = self._enroot_proc
-
-        diag_parts = [
-            f"attempt=#{attempt}",
-            f"elapsed={launch_ms:.0f}ms",
-            f"error={error!r}",
-        ]
-
-        if proc is not None:
-            rc = proc.returncode
-            diag_parts.append(f"process_alive={rc is None}")
-            if rc is not None:
-                diag_parts.append(f"returncode={rc}")
-
-        logger.warning("[%s] Container startup FAILED: %s", label, ", ".join(diag_parts))
-
-        # Log container output separately so tracebacks are readable
-        log_tail = await self._read_container_log_tail()
-        if log_tail:
-            logger.warning(
-                "[%s] Container log output (last %d chars):\n%s",
-                label,
-                len(log_tail),
-                log_tail,
-            )
-
-    async def _read_container_log_tail(self, max_chars: int = 2000) -> str:
-        """Read the tail of the container log file for diagnostics."""
-
-        def _read() -> str:
-            if self._container_log_path is None or not self._container_log_path.exists():
-                return ""
-            try:
-                if self._container_log_file and not self._container_log_file.closed:
-                    self._container_log_file.flush()
-                text = self._container_log_path.read_text()
-                return text[-max_chars:] if len(text) > max_chars else text
-            except Exception:
-                return ""
-
-        return await asyncio.to_thread(_read)
-
-    async def _close_container_log(self) -> None:
-        """Close the container log file handle."""
-        if self._container_log_file is not None:
-            f = self._container_log_file
-            self._container_log_file = None
-
-            def _do_close() -> None:
-                with contextlib.suppress(Exception):
-                    f.close()
-
-            await asyncio.to_thread(_do_close)
-
-    async def _cleanup_failed_startup(self) -> None:
-        """Best-effort cleanup for failed startup attempts before retrying."""
-        label = self._proc_label()
-
-        if self._container_port is not None:
-            async with used_ports_lock:
-                _USED_PORTS.discard(self._container_port)
-            self._container_port = None
-
-        if self._http_client is not None:
-            with contextlib.suppress(Exception):
-                await self._http_client.aclose()
-            self._http_client = None
-
-        if self._enroot_proc is not None:
-            await _kill_process_group(self._enroot_proc, label=label)
-            self._enroot_proc = None
-
-        await self._close_container_log()
-
-        if self._node_workdir is not None:
-            await asyncio.to_thread(shutil.rmtree, self._node_workdir, ignore_errors=True)
-
-    async def _wait_for_health(self, expected_startup_token: str | None = None) -> None:
-        """Wait for the kernel server to become healthy."""
-        assert self._http_client is not None
-        await _poll_kernel_health(
-            http_client=self._http_client,
-            enroot_proc=self._enroot_proc,
-            container_port=self._container_port,
-            expected_startup_token=expected_startup_token,
-            read_log_tail=self._read_container_log_tail,
-            label=self._proc_label(),
-        )
-
-    async def _execute_via_http(self, code: str, timeout: float | None = None, req_uuid: str = "") -> ExecutionResult:  # noqa: ASYNC109
-        """Execute code via the shared kernel HTTP client (timeout→error handling lives there)."""
-        assert self._kernel_client is not None
-        return await self._kernel_client.execute(code, timeout, req_uuid)
-
-    async def _reset_via_http(self) -> None:
-        """Reset the kernel via the shared kernel HTTP client."""
-        assert self._kernel_client is not None
-        await self._kernel_client.reset()
-
-    async def _list_dir_on_node(
-        self,
-        directory: str = ".",
-        max_files: int = 20,
-        show_hidden: bool = False,
-        req_uuid: str = "",
-    ) -> str:
-        """List contents of a directory with truncation protection.
-
-        Recursively lists files in a directory, with built-in protection against
-        overwhelming the context with too many files. Use this tool instead of
-        writing code to list directories to avoid context bloat.
-
-        Usage Examples:
-            list_dir()                      # List working directory
-            list_dir("data/")               # List specific folder
-            list_dir(max_files=50)          # Show more files
-            list_dir(show_hidden=True)      # Include hidden files
-
-        Args:
-            directory: Directory path to list (default: current working directory)
-            max_files: Maximum number of files to display (default: 20)
-            show_hidden: Whether to show hidden files starting with '.' (default: False)
-        """
-        try:
-            normalized = self._normalize_node_workspace_path(directory)
-        except ValueError:
-            return f"Path must stay within the workspace root: {directory}"
-        except Exception as e:
-            return f"Error listing directory: {e!s}"
-
-        return await asyncio.to_thread(
-            list_dir_tool,
-            str(normalized),
-            max_files=max_files,
-            show_hidden=show_hidden,
-        )
-
-    async def close(self):
-        label = self._proc_label()
-        logger.log(_CONTAINER_LOG_LEVEL, "[%s] Closing EnrootKernelServer", label)
-
-        if self._container_port is not None:
-            async with used_ports_lock:
-                _USED_PORTS.discard(self._container_port)
-
-        if self._http_client is not None:
-            try:
-                response = await self._http_client.post("/close")
-                response.raise_for_status()
-            except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.TimeoutException):
-                logger.log(
-                    _CONTAINER_LOG_LEVEL, "[%s] Graceful /close request failed (container may already be down)", label
-                )
-            except Exception:
-                logger.warning("[%s] Unexpected error on /close request", label, exc_info=True)
-            with contextlib.suppress(Exception):
-                await self._http_client.aclose()
-            self._http_client = None
-
-        if self._enroot_proc is not None:
-            await _kill_process_group(self._enroot_proc, label=label)
-            self._enroot_proc = None
-
-        await self._close_container_log()
-
-        if self._node_workdir is not None:
-            await asyncio.to_thread(shutil.rmtree, self._node_workdir, ignore_errors=True)
-            self._node_workdir = None
-
-        logger.log(_CONTAINER_LOG_LEVEL, "[%s] EnrootKernelServer closed", label)
 
 
 class InterpreterEnvState:
@@ -837,6 +162,8 @@ class InterpreterEnvState:
         save_dir: Path | None = None,
         sandbox_memory_limit_mb: int | None = None,
         sandbox_max_pids: int | None = None,
+        scheduler: SandboxScheduler | None = None,
+        enable_recovery: bool = False,
     ):
         self.work_dir = work_dir
         self.language = language
@@ -868,6 +195,10 @@ class InterpreterEnvState:
         )
         self.sandbox: Sandbox = make_sandbox(self._sandbox_config)
         self._started = False
+        # Optional placement/fallback scheduler (k8s path); recovery is dark-launched.
+        self._scheduler = scheduler
+        self._enable_recovery = enable_recovery
+        self._recovering = False
 
         # Initialize notebook structure for state tracking
         self.nb: NotebookNode = nbformat.v4.new_notebook()
@@ -889,9 +220,87 @@ class InterpreterEnvState:
         self.cell_timeout_override_requests: list[float] = []
 
     async def start(self):
-        """Start the execution backend."""
-        await self.sandbox.start()
+        """Start the execution backend (via the scheduler if one is configured)."""
+        if self._scheduler is not None:
+            self.sandbox = await self._scheduler.acquire(self._sandbox_config.ref, self._sandbox_config.resources)
+        else:
+            await self.sandbox.start()
         self._started = True
+
+    async def _execute_with_recovery(self, code: str, timeout: float | None, req_uuid: str) -> ExecutionResult:  # noqa: ASYNC109
+        """Execute via the sandbox; on a transport failure (not a cell timeout), swap+replay and retry once.
+
+        Surfaces the recovery to the agent by prepending a notice to the returned
+        ExecutionResult, so it knows its kernel state was rebuilt (and possibly clipped).
+        """
+        try:
+            return await self.sandbox.execute(code, timeout, req_uuid=req_uuid)
+        except _RECOVERABLE_TRANSPORT_ERRORS as e:
+            if not self._enable_recovery or self._recovering:
+                raise
+            logger.warning("sandbox transport failure (%s); recovering session", type(e).__name__)
+            cells_before = len(self.nb.cells)
+            recovered_len = await self.recover()
+            result = await self.sandbox.execute(code, timeout, req_uuid=req_uuid)
+
+            dropped = cells_before - recovered_len
+            if dropped > 0:
+                text = (
+                    f"[session recovered after a sandbox failure: replayed {recovered_len} cell(s); "
+                    f"{dropped} later cell(s) exceeded the replay budget and were dropped — the notebook "
+                    f"was clipped to {recovered_len} cells, so earlier state is restored but later cells are gone]"
+                )
+            else:
+                text = f"[session recovered after a sandbox failure: replayed {recovered_len} cell(s); state restored]"
+            notice = nbformat.v4.new_output(output_type="stream", name="stderr", text=text + "\n")
+            result.notebook_outputs = [notice, *result.notebook_outputs]
+            return result
+
+    async def recover(self) -> int:
+        """Swap in a fresh sandbox, replay the cell history, and return the recovered cell count.
+
+        Replay is capped at SANDBOX_REPLAY_BUDGET. If fewer cells are replayed than the notebook
+        held, the notebook is CLIPPED to the recovered length (and `_execution_count` adjusted) so
+        it stays consistent with the rebuilt kernel — the dropped cells' state is gone. Best-effort:
+        replay reconstructs deterministic state only; non-deterministic / non-idempotent cells (RNG,
+        wall-clock, file/network side-effects) are not faithfully restored.
+        """
+        self._recovering = True
+        try:
+            with contextlib.suppress(Exception):
+                await self.sandbox.close()
+            if self._scheduler is not None:
+                self.sandbox = await self._scheduler.acquire(self._sandbox_config.ref, self._sandbox_config.resources)
+            else:
+                self.sandbox = make_sandbox(self._sandbox_config)
+                await self.sandbox.start()
+            self._started = True
+
+            original_len = len(self.nb.cells)
+            replay_cells = self.nb.cells[:_REPLAY_BUDGET]
+            for cell in replay_cells:
+                if cell.get("cell_type") != "code":
+                    continue
+                with contextlib.suppress(Exception):
+                    await self.sandbox.execute(cell.source)
+
+            recovered_len = len(replay_cells)
+            if recovered_len < original_len:
+                # The rebuilt kernel only reflects the replayed cells — clip the notebook to match.
+                self.nb.cells = self.nb.cells[:recovered_len]
+                self._execution_count = recovered_len
+                logger.warning(
+                    "recovery dropped %d cell(s): notebook clipped %d -> %d (replay budget %d)",
+                    original_len - recovered_len,
+                    original_len,
+                    recovered_len,
+                    _REPLAY_BUDGET,
+                )
+            else:
+                logger.warning("recovered session: replayed %d cell(s)", recovered_len)
+            return recovered_len
+        finally:
+            self._recovering = False
 
     async def close(self):
         """Save the notebook, tear down the sandbox, and relocate the workspace."""
@@ -1037,7 +446,7 @@ class InterpreterEnvState:
             )
             _warned_unsafe_execution.add("unsafe_execution")
 
-        result = await self.sandbox.execute(code, timeout, req_uuid=req_uuid)
+        result = await self._execute_with_recovery(code, timeout, req_uuid)
 
         if cell_idx is None or cell_idx >= len(self.nb.cells):
             actual_idx = self._add_cell(code, result)
@@ -1395,9 +804,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         Recursively lists files in a directory, with built-in protection against
         overwhelming the context with too many files. Use this tool instead of
-        writing code to list directories to avoid context bloat. This is a tool
-        — do NOT call it as code (e.g., `list_dir()`) inside a `run_cell` call;
-        invoke it as a separate tool call.
+        writing code to list directories to avoid context bloat.
 
         Usage Examples:
             list_dir()                      # List working directory
@@ -1560,10 +967,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
     async def reset_kernel(self) -> str:
         """Reset the kernel to a clean state.
 
-        This clears all variables and execution state. This is a tool — do NOT
-        call it as code (e.g., `reset_kernel()`) inside a `run_cell` call;
-        invoke it as a separate tool call. After a `TimeoutError` in a prior
-        cell, this is the supported way to unlock a frozen kernel.
+        This clears all variables and execution state.
         """
         await self.state.sandbox.reset()
 
