@@ -62,7 +62,7 @@ from .prompts import (
     RUBRIC_SCORE_PROMPT,
     PromptingConfig,
 )
-from .sandbox import ResourceSpec, Sandbox, SandboxConfig, make_sandbox
+from .sandbox import HttpKernelClient, ResourceSpec, Sandbox, SandboxConfig, make_sandbox
 from .tools.filesystem import FilesystemTool, list_dir_tool
 from .utils import NBLanguage, view_notebook
 from .wager import (
@@ -408,6 +408,7 @@ class EnrootKernelServer:
         self.sandbox_max_pids = sandbox_max_pids
         self._enroot_proc: asyncio.subprocess.Process | None = None
         self._http_client: httpx.AsyncClient | None = None
+        self._kernel_client: HttpKernelClient | None = None
         self._container_port: int | None = None
         self._container_log_path: Path | None = None
         self._container_log_file: Any | None = None
@@ -614,6 +615,9 @@ class EnrootKernelServer:
                 base_url=f"http://localhost:{self._container_port}",
                 timeout=httpx.Timeout(self.execution_timeout + 10, connect=30.0),
             )
+            self._kernel_client = HttpKernelClient(
+                self._http_client.request, execution_timeout=self.execution_timeout, label=self._proc_label()
+            )
 
             # Wait for health check
             try:
@@ -729,67 +733,14 @@ class EnrootKernelServer:
         )
 
     async def _execute_via_http(self, code: str, timeout: float | None = None, req_uuid: str = "") -> ExecutionResult:  # noqa: ASYNC109
-        """Execute code via HTTP to the containerized kernel server.
-
-        Handles httpx.TimeoutException (including ReadTimeout) by converting to
-        an error ExecutionResult. This happens when the kernel server's internal
-        asyncio.timeout doesn't cancel the ZMQ recv promptly, causing the HTTP
-        read to time out before the kernel server responds.
-        """
-        assert self._http_client is not None
-
-        try:
-            response = await self._http_client.post(
-                "/execute",
-                json={"code": code, "timeout": timeout},
-            )
-            response.raise_for_status()
-        except httpx.TimeoutException as e:
-            effective_timeout = timeout if timeout is not None else self.execution_timeout
-            logger.warning(
-                "[%s] HTTP %s during /execute (requested kernel timeout=%.1fs): %s",
-                self._proc_label(),
-                type(e).__name__,
-                effective_timeout,
-                e,
-            )
-            timeout_output = nbformat.v4.new_output(
-                output_type="error",
-                ename="TimeoutError",
-                evalue=f"Code execution timed out after {effective_timeout}s (HTTP layer)",
-                traceback=[f"TimeoutError: Code execution timed out after {effective_timeout}s (HTTP layer)"],
-            )
-            return ExecutionResult(
-                notebook_outputs=[timeout_output],
-                error_occurred=True,
-                execution_time=effective_timeout,
-            )
-
-        data = response.json()
-
-        # Convert serialized outputs back to NotebookNode
-        notebook_outputs = [nbformat.from_dict(o) for o in data["notebook_outputs"]]
-
-        return ExecutionResult(
-            notebook_outputs=notebook_outputs,
-            error_occurred=data["error_occurred"],
-            execution_time=data.get("execution_time"),
-        )
+        """Execute code via the shared kernel HTTP client (timeout→error handling lives there)."""
+        assert self._kernel_client is not None
+        return await self._kernel_client.execute(code, timeout, req_uuid)
 
     async def _reset_via_http(self) -> None:
-        """Reset the kernel via HTTP."""
-        assert self._http_client is not None
-        try:
-            response = await self._http_client.post("/reset")
-            response.raise_for_status()
-        except httpx.TimeoutException as e:
-            logger.warning(
-                "[%s] HTTP %s during /reset: %s",
-                self._proc_label(),
-                type(e).__name__,
-                e,
-            )
-            raise RuntimeError(f"Kernel reset timed out: {e}") from e
+        """Reset the kernel via the shared kernel HTTP client."""
+        assert self._kernel_client is not None
+        await self._kernel_client.reset()
 
     async def _list_dir_on_node(
         self,

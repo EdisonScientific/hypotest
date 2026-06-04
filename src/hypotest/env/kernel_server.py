@@ -35,6 +35,11 @@ class DeadlineExceededError(Exception):
 
 logger = logging.getLogger(__name__)
 
+# Wire-protocol version for the kernel-server HTTP API. Bump on a breaking change
+# to /execute, /reset, /list_dir, /load_capsule, or /health; the client
+# (HttpKernelClient) reads it from /health to detect deploy skew.
+PROTOCOL_VERSION = 1
+
 
 # =============================================================================
 # Shared Types (imported by hypotest)
@@ -200,6 +205,32 @@ class HealthResponse(BaseModel):
     status: str
     startup_token: str
     kernel_ready: bool
+    protocol_version: int = PROTOCOL_VERSION
+
+
+class ListDirResponse(BaseModel):
+    """Response model for /list_dir endpoint."""
+
+    listing: str
+
+
+def _collect_dir_paths(path: Path, prefix: str = "", show_hidden: bool = False) -> list[str]:
+    """Recursively collect file paths relative to `path` (mirrors env.tools.filesystem)."""
+    paths: list[str] = []
+    try:
+        items = sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name))
+    except PermissionError:
+        rel = f"{prefix}{path.name}/" if prefix else f"{path.name}/"
+        return [f"# {rel} (permission denied)"]
+    for item in items:
+        if not show_hidden and item.name.startswith("."):
+            continue
+        rel = f"{prefix}{item.name}" if prefix else item.name
+        if item.is_dir():
+            paths.extend(_collect_dir_paths(item, prefix=f"{rel}/", show_hidden=show_hidden))
+        else:
+            paths.append(rel)
+    return paths
 
 
 class KernelServer:
@@ -392,6 +423,34 @@ class KernelServer:
             self._is_ready = False
             logger.info("Kernel shutdown complete")
 
+    def list_dir(self, directory: str = ".", max_files: int = 20, show_hidden: bool = False) -> str:
+        """List the workspace directory (confined to work_dir) with truncation protection."""
+        try:
+            max_files = int(max_files)
+        except (TypeError, ValueError):
+            max_files = 20
+        show_hidden = bool(show_hidden)
+
+        root = self.work_dir.resolve()
+        requested = Path(directory)
+        candidate = (requested if requested.is_absolute() else root / requested).resolve()
+        if candidate != root and root not in candidate.parents:
+            return f"Path must stay within the workspace root: {directory}"
+        if not candidate.exists() or not candidate.is_dir():
+            return f"Path is not a directory: {directory}"
+
+        paths = _collect_dir_paths(candidate, show_hidden=show_hidden)
+        if not paths:
+            return "Directory is empty."
+        if len(paths) > max_files:
+            shown = paths[:max_files]
+            return (
+                "Files in directory:\n"
+                + "\n".join(f"  {p}" for p in shown)
+                + f"\n  ({len(paths) - max_files} more files not shown)"
+            )
+        return "Files in directory:\n" + "\n".join(f"  {p}" for p in paths)
+
 
 def create_app(server: KernelServer) -> FastAPI:
     """Create the FastAPI application."""
@@ -408,6 +467,10 @@ def create_app(server: KernelServer) -> FastAPI:
     @app.get("/health")
     async def health() -> HealthResponse:
         return HealthResponse(status="OK", startup_token=server.startup_token, kernel_ready=server._is_ready)
+
+    @app.get("/list_dir")
+    async def list_dir(directory: str = ".", max_files: int = 20, show_hidden: bool = False) -> ListDirResponse:
+        return ListDirResponse(listing=server.list_dir(directory, max_files, show_hidden))
 
     @app.post("/close")
     async def close() -> dict[str, bool]:
