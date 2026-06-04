@@ -1,4 +1,4 @@
-.PHONY: image image-core server-image server-image-core server help
+.PHONY: image image-core kernel-image kernel-image-core server-image server-image-core server help
 
 # Supply-chain cutoff: no package published after this date is installed.
 # Measured at build time; override to pin a known-good date, e.g.
@@ -11,6 +11,7 @@ PLATFORM ?= linux/amd64
 
 KERNEL_IMAGE ?= interpreter-env
 SERVER_IMAGE ?= hypotest-server
+KERNEL_SERVER_IMAGE ?= hypotest-kernel
 
 export DOCKER_BUILDKIT = 1
 
@@ -22,6 +23,8 @@ help:
 	@echo "  make image-core            - Lightweight kernel base ($(KERNEL_IMAGE):core, native arch) for local testing."
 	@echo "  make server-image          - Bundled dataset-server image ($(SERVER_IMAGE):latest, amd64) on the full base."
 	@echo "  make server-image-core     - Bundled dataset-server image ($(SERVER_IMAGE):core, native arch) on the core base."
+	@echo "  make kernel-image          - Lean capsule-loading kernel server ($(KERNEL_SERVER_IMAGE):latest, amd64) for sandbox pods."
+	@echo "  make kernel-image-core     - Lean kernel server ($(KERNEL_SERVER_IMAGE):core, native arch) for local testing."
 	@echo ""
 	@echo "Run:"
 	@echo "  make server CONFIG=<path>  - Launch the dataset server on the host (uv)."
@@ -58,6 +61,25 @@ server-image-core: image-core
 		--build-arg BASE_IMAGE=$(KERNEL_IMAGE):core \
 		--build-arg BUILD_CUTOFF_DATE=$(BUILD_CUTOFF_DATE) \
 		-t $(SERVER_IMAGE):core .
+
+# Lean kernel-server image (amd64, production) on the full kernel base — the image
+# the sandbox infra runs (agent-sandbox pods / enroot). hypotest is installed
+# --no-deps (no dataset-server/agent stack); see Dockerfile.kernel.
+kernel-image: image
+	docker build \
+		--platform $(PLATFORM) \
+		-f Dockerfile.kernel \
+		--build-arg BASE_IMAGE=$(KERNEL_IMAGE):full \
+		--build-arg BUILD_CUTOFF_DATE=$(BUILD_CUTOFF_DATE) \
+		-t $(KERNEL_SERVER_IMAGE):latest .
+
+# Lean kernel-server image on the lightweight core base (local arm64 / Mac).
+kernel-image-core: image-core
+	docker build \
+		-f Dockerfile.kernel \
+		--build-arg BASE_IMAGE=$(KERNEL_IMAGE):core \
+		--build-arg BUILD_CUTOFF_DATE=$(BUILD_CUTOFF_DATE) \
+		-t $(KERNEL_SERVER_IMAGE):core .
 
 server:
 	@test -n "$(CONFIG)" || (echo "Error: CONFIG is required. Usage: make server CONFIG=path/to/config.yaml" && exit 1)

@@ -1,0 +1,78 @@
+# syntax=docker/dockerfile:1.4
+# Lean kernel-server image: the capsule-loading kernel server
+# (hypotest.kernel_capsule_server) — the image the sandbox infra runs in its pods
+# (agent-sandbox / k8s) and behind the enroot .sqsh.
+#
+# It serves the kernel API (/execute, /reset, /health, /list_dir, /close) plus
+# POST /load_capsule {"capsule_uuid": "<uuid>"}, which pulls the most-recent
+# capsule for that UUID from --capsule-source (or the CAPSULE_SOURCE env) into the
+# work dir and resets the kernel.
+#
+# Built FROM the interpreter-env exec base, so the scientific stack
+# (numpy/pandas/R/bio/torch) is byte-identical to what the agent runs everywhere
+# else — parity is by construction, this image adds NO scientific libs. On top it
+# installs ONLY the kernel server's dependency cone: the hypotest package WITHOUT
+# its dependencies (`--no-deps`) + boto3 for S3 capsule pulls. fastapi, uvicorn,
+# pydantic, jupyter_client and nbformat already come from the base. So the sandbox
+# image carries none of the dataset-server / agent stack (ldp, litellm, fhaviary,
+# fhlmi, datasets, ray, aiodocker), keeping its deps + attack surface minimal and
+# decoupling it from the dataset server's dependency churn.
+#
+#   BASE_IMAGE  interpreter-env:full (default, amd64 production)
+#               interpreter-env:core (lightweight, arm64 local testing)
+#
+# Built via the Makefile (`make kernel-image` / `make kernel-image-core`), which
+# builds the base first and threads the build-date cutoff.
+
+ARG BASE_IMAGE=interpreter-env:full
+ARG BUILD_CUTOFF_DATE
+
+FROM ${BASE_IMAGE}
+
+ARG BUILD_CUTOFF_DATE
+
+# Install hypotest WITHOUT its dependency cone (--no-deps), then add just boto3
+# (s3_sync's only extra runtime dep; imported lazily). The kernel server's other
+# imports — fastapi, uvicorn, pydantic, jupyter_client, nbformat — already live in
+# kernel_env from the base, so nothing here touches the conda-pinned scientific
+# libs (the parity guarantee). boto3 pulls only botocore/urllib3/etc. — nothing
+# that depends on numpy/scipy — so the scientific ABI is untouched.
+WORKDIR /app/hypotest
+COPY pyproject.toml README.md LICENSE uv.lock ./
+COPY src ./src
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eux; \
+    CUTOFF="${BUILD_CUTOFF_DATE:-$(date -u +%Y-%m-%d)}"; \
+    uv pip install --python /app/kernel_env/bin/python --no-deps .; \
+    uv pip install --python /app/kernel_env/bin/python --exclude-newer "${CUTOFF}" boto3
+
+WORKDIR /workspace
+EXPOSE 8000
+
+# Runtime supply-chain cutoff for agent installs IN this pod (the agent's code
+# runs in this kernel and may pip/conda install). Same mechanism as the bundled
+# dataset-server image: the entrypoint starts the filtering proxy and these config
+# files route conda + pip through it; apt is pinned in the base; R via Rprofile if
+# present (full base). cutoff_proxy.py is inherited from the base image.
+ENV CUTOFF_DATE=${BUILD_CUTOFF_DATE}
+ENV CONDA_REPODATA_USE_ZST=false
+ENV CONDA_REPODATA_FNS=repodata.json
+RUN cat > /app/miniconda/.condarc <<'EOF'
+channel_alias: http://127.0.0.1:8723
+channels:
+  - conda-forge
+default_channels:
+  - http://127.0.0.1:8723/conda-forge
+EOF
+RUN printf '%s\n' '[global]' 'index-url = http://127.0.0.1:8723/simple' > /etc/pip.conf
+RUN if [ -d /app/kernel_env/lib/R/etc ]; then \
+        printf 'options(repos = c(CRAN = "https://packagemanager.posit.co/cran/%s"))\n' \
+            "${BUILD_CUTOFF_DATE:-$(date -u +%Y-%m-%d)}" >> /app/kernel_env/lib/R/etc/Rprofile.site; \
+    fi
+COPY docker/entrypoint.sh /opt/entrypoint.sh
+
+# The entrypoint starts the cutoff proxy, then execs the kernel server. The sandbox
+# deployment (SandboxTemplate / Deployment) supplies --capsule-source (or the
+# CAPSULE_SOURCE env) and may override --port / --language / --safe-execute.
+ENTRYPOINT ["sh", "/opt/entrypoint.sh"]
+CMD ["/app/kernel_env/bin/python", "-m", "hypotest.kernel_capsule_server", "--port", "8000", "--safe-execute"]

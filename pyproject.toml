@@ -70,7 +70,7 @@ dev = [
     "vcrpy>=8",  # Pin for dropping unused requests support
 ]
 k8s = [
-    "k8s-agent-sandbox",
+    "k8s-agent-sandbox[async]",  # async extra: AsyncSandboxClient/AsyncSandboxConnector need it
 ]
 ray = [
     "ray",
@@ -128,6 +128,8 @@ ignore_missing_imports = true
 module = [
     "boto3",
     "datasets",
+    "k8s_agent_sandbox",
+    "k8s_agent_sandbox.*",
 ]
 
 [tool.pylint]

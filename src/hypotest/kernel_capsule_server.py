@@ -113,7 +113,12 @@ def main() -> None:
     parser.add_argument("--work_dir", type=Path, default=Path("/workspace"))
     parser.add_argument("--language", type=str, default="python", choices=["python", "r"])
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--capsule-source", type=str, required=True, help="local folder or s3://bucket/prefix")
+    parser.add_argument(
+        "--capsule-source",
+        type=str,
+        default=os.getenv("CAPSULE_SOURCE"),
+        help="local folder or s3://bucket/prefix (defaults to the CAPSULE_SOURCE env var)",
+    )
     parser.add_argument("--startup-token", type=str, default="")
     parser.add_argument("--safe-execute", action="store_true")
     parser.add_argument(
@@ -123,6 +128,8 @@ def main() -> None:
         help="pip index for agent installs (the runtime cutoff proxy); empty string disables it",
     )
     args = parser.parse_args()
+    if not args.capsule_source:
+        parser.error("--capsule-source is required (pass the flag or set the CAPSULE_SOURCE env var)")
 
     language = NBLanguage.PYTHON if args.language == "python" else NBLanguage.R
     asyncio.run(
