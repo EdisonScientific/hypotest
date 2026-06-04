@@ -47,7 +47,7 @@ async def test_fallback_to_enroot_when_all_k8s_at_capacity(tmp_path, monkeypatch
 
     monkeypatch.setattr(K8sSandbox, "_allocate", _no_capacity)
 
-    specs = [K8sSandboxSpec(warmpool="a"), K8sSandboxSpec(warmpool="b")]
+    specs = [K8sSandboxSpec(template="py-sandbox", warmpool="a"), K8sSandboxSpec(template="py-sandbox", warmpool="b")]
     # The fallback config is local here so it starts in-process; in production it is a real enroot config.
     scheduler = K8sFallbackScheduler(_local_config(tmp_path), specs, _local_config(tmp_path))
     sandbox = await scheduler.acquire(CapsuleRef(), ResourceSpec())
@@ -68,7 +68,9 @@ async def test_returns_k8s_sandbox_when_capacity_available(tmp_path, monkeypatch
         return fake
 
     monkeypatch.setattr(K8sSandbox, "_allocate", _alloc)
-    scheduler = K8sFallbackScheduler(_local_config(tmp_path), [K8sSandboxSpec(warmpool="a")], _local_config(tmp_path))
+    scheduler = K8sFallbackScheduler(
+        _local_config(tmp_path), [K8sSandboxSpec(template="py-sandbox", warmpool="a")], _local_config(tmp_path)
+    )
     sandbox = await scheduler.acquire(CapsuleRef(), ResourceSpec())
     try:
         assert isinstance(sandbox, K8sSandbox)

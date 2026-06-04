@@ -15,6 +15,7 @@ import pytest_asyncio
 from aviary.core import Message, ToolCall, ToolRequestMessage, ToolResponseMessage
 from lmi import LiteLLMModel
 
+from hypotest.dataset_server import DatasetConfig
 from hypotest.env import config as cfg
 from hypotest.env.config import ExecutionConfig
 from hypotest.env.interpreter_env import (
@@ -24,6 +25,7 @@ from hypotest.env.interpreter_env import (
     ProblemInstance,
 )
 from hypotest.env.kernel_server import NBLanguage
+from hypotest.env.sandbox import K8sFallbackScheduler, K8sSandboxSpec
 from hypotest.env.sandbox.base import _build_resource_limit_prefix
 from hypotest.env.sandbox.enroot import EnrootKernelServer
 
@@ -998,3 +1000,40 @@ class TestBuildEnrootCmdWithPrefix:
         )
         assert cmd[:3] == prefix
         assert "enroot" in cmd
+
+
+class TestSandboxConfigWiring:
+    """The sandbox knobs (use_ray / enable_recovery / k8s_sandbox_specs) flow operator-config -> state."""
+
+    def test_dataset_config_spread_carries_sandbox_knobs(self):
+        # get_new_env_by_idx builds InterpreterEnvConfig via **DatasetConfig.model_dump(); the new
+        # knobs (and use_ray, which reset() previously dropped) must survive that spread.
+        dc = DatasetConfig(
+            capsule_dir="cap",
+            problem_jsonl="p.jsonl",
+            use_ray=False,
+            enable_recovery=True,
+            k8s_sandbox_specs=[{"template": "py-tmpl", "warmpool": "wp"}],
+        )
+        config = InterpreterEnvConfig(language=NBLanguage.PYTHON, **dc.model_dump())
+        assert config.use_ray is False
+        assert config.enable_recovery is True
+        assert [s.template for s in config.k8s_sandbox_specs] == ["py-tmpl"]
+
+    def test_state_builds_k8s_scheduler_from_specs(self, tmp_path):
+        state = InterpreterEnvState(
+            work_dir=tmp_path,
+            language=NBLanguage.PYTHON,
+            use_docker=False,
+            k8s_specs=[K8sSandboxSpec(template="py-tmpl")],
+        )
+        assert isinstance(state._scheduler, K8sFallbackScheduler)
+
+    def test_state_has_no_scheduler_by_default(self, tmp_path):
+        state = InterpreterEnvState(work_dir=tmp_path, language=NBLanguage.PYTHON, use_docker=False)
+        assert state._scheduler is None
+
+    def test_use_ray_threads_into_sandbox_config(self, tmp_path):
+        # Regression: reset() used to drop use_ray, so a config use_ray=False was silently ignored.
+        state = InterpreterEnvState(work_dir=tmp_path, language=NBLanguage.PYTHON, use_docker=False, use_ray=False)
+        assert state._sandbox_config.use_ray is False

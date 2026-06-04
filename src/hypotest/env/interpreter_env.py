@@ -55,7 +55,15 @@ from .prompts import (
     RUBRIC_SCORE_PROMPT,
     PromptingConfig,
 )
-from .sandbox import ResourceSpec, Sandbox, SandboxConfig, SandboxScheduler, make_sandbox
+from .sandbox import (
+    K8sFallbackScheduler,
+    K8sSandboxSpec,
+    ResourceSpec,
+    Sandbox,
+    SandboxConfig,
+    SandboxScheduler,
+    make_sandbox,
+)
 from .tools.filesystem import FilesystemTool
 from .utils import NBLanguage, view_notebook
 from .wager import (
@@ -162,7 +170,7 @@ class InterpreterEnvState:
         save_dir: Path | None = None,
         sandbox_memory_limit_mb: int | None = None,
         sandbox_max_pids: int | None = None,
-        scheduler: SandboxScheduler | None = None,
+        k8s_specs: list[K8sSandboxSpec] | None = None,
         enable_recovery: bool = False,
     ):
         self.work_dir = work_dir
@@ -195,8 +203,13 @@ class InterpreterEnvState:
         )
         self.sandbox: Sandbox = make_sandbox(self._sandbox_config)
         self._started = False
-        # Optional placement/fallback scheduler (k8s path); recovery is dark-launched.
-        self._scheduler = scheduler
+        # Optional k8s placement: load-balance across agent-sandbox warmpools, falling back to the
+        # configured backend. When set, start()/recover() acquire through it instead of make_sandbox.
+        # K8sSandbox ignores the use_* selectors and the fallback goes through make_sandbox, so both
+        # arms share self._sandbox_config. Recovery stays dark-launched behind enable_recovery.
+        self._scheduler: SandboxScheduler | None = (
+            K8sFallbackScheduler(self._sandbox_config, k8s_specs, self._sandbox_config) if k8s_specs else None
+        )
         self._enable_recovery = enable_recovery
         self._recovering = False
 
@@ -477,6 +490,12 @@ class InterpreterEnvConfig(BaseModel):
     cell_timeout_override_mode: Literal["off", "on"] = "off"
     cell_timeout_min: float = 60.0
     cell_timeout_max: float = 1200.0
+    # Session recovery (swap a fresh sandbox + replay the cell history on a transport failure);
+    # dark-launched, opt-in. See InterpreterEnvState.recover().
+    enable_recovery: bool = False
+    # Opt-in k8s (agent-sandbox) placement: each spec is a warmpool/template target the scheduler
+    # load-balances across, falling back to the configured (enroot) backend. Empty = disabled.
+    k8s_sandbox_specs: list[K8sSandboxSpec] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _migrate_enable_faithfulness_gate(self) -> "InterpreterEnvConfig":
@@ -599,9 +618,12 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             save_dir=self.save_dir,
             use_docker=self.config.use_docker,
             use_enroot=self.config.use_enroot,
+            use_ray=self.config.use_ray,
             container_sqsh_path=self.config.container_sqsh_path,
             sandbox_memory_limit_mb=self.execution_config.sandbox_memory_limit_mb,
             sandbox_max_pids=self.execution_config.sandbox_max_pids,
+            enable_recovery=self.config.enable_recovery,
+            k8s_specs=self.config.k8s_sandbox_specs or None,
         )
         logger.warning("[reset:%s] starting container", reset_id)
         await self.state.start()

@@ -25,7 +25,7 @@ def _ok_handler(method, endpoint, **kwargs):
 
 def _k8s(tmp_path, fake, ref=None):
     config = SandboxConfig(work_dir=tmp_path, language=NBLanguage.PYTHON, ref=ref or CapsuleRef())
-    sandbox = K8sSandbox(config, K8sSandboxSpec(warmpool="wp"))
+    sandbox = K8sSandbox(config, K8sSandboxSpec(template="py-sandbox", warmpool="wp"))
 
     # bypass the real SDK; return the injected fake AsyncSandbox
     async def _alloc():  # noqa: RUF029

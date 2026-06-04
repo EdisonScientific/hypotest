@@ -22,6 +22,7 @@ from hypotest import s3_sync
 from hypotest.env.config import ExecutionConfig
 from hypotest.env.interpreter_env import InterpreterEnv, InterpreterEnvConfig, ProblemInstance
 from hypotest.env.kernel_server import NBLanguage
+from hypotest.env.sandbox import K8sSandboxSpec
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,12 @@ class DatasetConfig(BaseModel):
     use_docker: bool = False
     use_enroot: bool = True
     container_sqsh_path: str | None = None
+    # Session recovery (swap a fresh sandbox + replay the cell history on a transport failure);
+    # dark-launched, opt-in.
+    enable_recovery: bool = False
+    # Opt-in k8s (agent-sandbox) placement targets; the scheduler load-balances across them and
+    # falls back to the enroot backend. Empty = disabled (use the use_*/container_sqsh_path backend).
+    k8s_sandbox_specs: list[K8sSandboxSpec] = Field(default_factory=list)
     force_python: bool = True
     normalize_reward: bool = True
     enable_faithfulness_gate: bool = False
