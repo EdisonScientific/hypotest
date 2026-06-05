@@ -1,0 +1,155 @@
+# Example: the lean hypotest kernel server (Dockerfile.kernel -> hypotest-kernel)
+# as a kubernetes-sigs/agent-sandbox SandboxTemplate + warm pool — the form
+# K8sSandbox claims from on the primary (k8s) path.
+#
+# K8sSandbox._allocate() calls the agent-sandbox SDK:
+#   AsyncSandboxClient(...).create_sandbox(
+#       template="hypotest-kernel-template", warmpool="hypotest-kernel-pool",
+#       namespace="default", sandbox_ready_timeout=..., shutdown_after_seconds=...)
+# and the connector reaches the kernel server on server_port=8000 (the
+# K8sSandboxSpec default). Mirror these names + port in the dataset-server config
+# (k8s_sandbox_specs — see the bottom of this file).
+#
+# Prereqs:
+#   - The agent-sandbox controller + CRDs installed (kubernetes-sigs/agent-sandbox).
+#   - Build + push the lean kernel image on a native amd64 box:
+#       make kernel-image                      # hypotest-kernel:latest (amd64)
+#       docker tag hypotest-kernel:latest <registry>/hypotest-kernel:<tag>
+#       docker push <registry>/hypotest-kernel:<tag>
+#   - Fill in image: + the Secret, then `kubectl apply -f`.
+#
+# Egress: the cluster network policy / egress allowlist must permit the S3 endpoint
+# (capsule pulls) and conda.anaconda.org + pypi.org + files.pythonhosted.org (agent
+# installs via the in-pod cutoff proxy), plus DNS. The SandboxTemplate spec also
+# accepts a `networkPolicy:` block (see agent-sandbox's secure-sandboxtemplate
+# example) if you enforce it CRD-side.
+---
+# gVisor RuntimeClass — CLUSTER-LEVEL, one-time. `runtimeClassName: gvisor` (in the
+# SandboxTemplate below) references a RuntimeClass *object* named "gvisor"; that is
+# separate from the runsc binary being installed on the nodes. If you hit
+# `RuntimeClass "gvisor" not found`, the binary is present but this object is missing
+# — apply it once per cluster (skip if your cluster admin already manages it).
+# `handler` MUST match the gVisor runtime name configured in containerd/CRI-O (usually
+# "runsc"); verify with `containerd config dump | grep -A3 runtimes`.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc
+# If runsc is only on some nodes, pin scheduling to them:
+# scheduling:
+#   nodeSelector:
+#     <your-gvisor-node-label>: "true"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hypotest-s3-creds
+  namespace: default
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: hypotest-kernel-template
+  namespace: default
+spec:
+  podTemplate:
+    spec:
+      # gVisor is the syscall-level isolation boundary for untrusted agent code.
+      # Requires the `gvisor` RuntimeClass on the cluster (see agent-sandbox
+      # examples/quickstart/gvisor.md); `kata-qemu` is an alternative. Comment out
+      # only if you rely on namespace isolation alone.
+      runtimeClassName: gvisor
+      restartPolicy: OnFailure
+      containers:
+        - name: kernel
+          image: <registry>/hypotest-kernel:<tag>
+          # No command/args: the image ENTRYPOINT starts the runtime package-cutoff
+          # proxy, then its CMD runs `kernel_capsule_server --port 8000 --safe-execute`,
+          # reading the capsule source from CAPSULE_SOURCE below. (Set args here to
+          # change --language or drop --safe-execute.)
+          ports:
+            - containerPort: 8000  # MUST equal K8sSandboxSpec.server_port
+          env:
+            - name: CAPSULE_SOURCE
+              value: s3://train-data-05312026-agent-sandbox/capsules
+            - name: AWS_ENDPOINT_URL
+              value: https://pdx.s8k.io
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+          envFrom:
+            - secretRef:
+                name: hypotest-s3-creds
+          # The agent-sandbox controller gates SandboxReady (what create_sandbox waits
+          # for) on this — it passes once the kernel server is up.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 0
+            periodSeconds: 2
+          # Restart a wedged kernel. initialDelaySeconds clears the kernel's startup
+          # (jupyter launch ~5-15s) so liveness can't kill a still-starting pod; raise
+          # it (or add a startupProbe) if cold starts run long.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 15
+          resources:
+            # No separate workspace volume (like the upstream template): the kernel
+            # writes the pulled capsule to /workspace on the container fs, bounded by
+            # ephemeral-storage — size for the largest capsule (tail is multi-GB;
+            # ~13.7GB observed). Mount an emptyDir/PVC at /workspace instead if you
+            # want a dedicated or persistent volume.
+            requests:
+              cpu: "1"
+              memory: 4Gi
+              ephemeral-storage: 20Gi
+            limits:
+              cpu: "4"
+              memory: 16Gi
+              ephemeral-storage: 60Gi
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: hypotest-kernel-pool
+  namespace: default
+spec:
+  updateStrategy:
+    type: Recreate
+  replicas: 4  # pre-warmed kernel pods for fast claim; size to expected concurrency
+  sandboxTemplateRef:
+    # Must exactly match the SandboxTemplate metadata.name above.
+    name: hypotest-kernel-template
+---
+# Matching dataset-server config — k8s_sandbox_specs wires the K8sFallbackScheduler
+# (try these warmpools, fall back to the enroot backend). Drop into server.yaml:
+#
+# dataset:
+#   use_enroot: true                       # the fallback backend when k8s has no capacity
+#   use_ray: true
+#   container_sqsh_path: /path/to/interpreter-env.sqsh
+#   k8s_sandbox_specs:
+#     - template: hypotest-kernel-template  # SandboxTemplate metadata.name
+#       warmpool: hypotest-kernel-pool      # SandboxWarmPool metadata.name
+#       namespace: default
+#       # connection picks how the connector reaches the pod's HTTP:
+#       #   incluster — orchestrator runs as a pod IN this cluster (pod IP / svc DNS)
+#       #   direct    — remote client (train job on another cluster, a laptop) -> the
+#       #               sandbox-router; set api_url to the router, reachable from the client
+#       #   gateway   — via a Gateway API gateway (set gateway_name/gateway_namespace)
+#       connection: direct
+#       api_url: http://<ROUTER_IP>:<ROUTER_PORT>   # the sandbox-router (direct mode only)
+#       server_port: 8000                   # MUST equal containerPort above (sent as X-Sandbox-Port)
+#       ttl_seconds: 3600                   # controller-side GC backstop
+#   # NOTE: regardless of `connection`, the SDK ALSO needs k8s API access to create/delete the
+#   # sandbox claim — in-cluster service account if the server runs as a pod here, else a
+#   # kubeconfig (KUBECONFIG) pointed at this cluster's API (:6443). `connection` only governs
+#   # the HTTP path to the pod, not the claim.
