@@ -78,3 +78,28 @@ async def test_returns_k8s_sandbox_when_capacity_available(tmp_path, monkeypatch
     finally:
         await sandbox.close()
     assert fake.terminated  # close() terminated the claimed pod
+
+
+@pytest.mark.asyncio
+async def test_scheduler_round_robins_across_clusters(tmp_path, monkeypatch, make_fake_sandbox):
+    """Two specs = two clusters, and round-robin spreads consecutive acquires across them.
+
+    Each K8sSandbox carries its own per-cluster spec (kubeconfig/context).
+    """
+
+    async def _alloc(self):  # noqa: RUF029
+        return make_fake_sandbox(_healthy)
+
+    monkeypatch.setattr(K8sSandbox, "_allocate", _alloc)
+    specs = [
+        K8sSandboxSpec(template="py", warmpool="a", kubeconfig="/kube/a.yaml", context="a"),
+        K8sSandboxSpec(template="py", warmpool="b", kubeconfig="/kube/b.yaml", context="b"),
+    ]
+    scheduler = K8sFallbackScheduler(_local_config(tmp_path), specs, _local_config(tmp_path))
+    s1 = await scheduler.acquire(CapsuleRef(), ResourceSpec())
+    s2 = await scheduler.acquire(CapsuleRef(), ResourceSpec())
+    try:
+        assert {s1._spec.context, s2._spec.context} == {"a", "b"}  # both clusters used across acquires
+    finally:
+        await s1.close()
+        await s2.close()

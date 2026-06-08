@@ -55,6 +55,8 @@ class DatasetConfig(BaseModel):
     # Opt-in k8s (agent-sandbox) placement targets; the scheduler load-balances across them and
     # falls back to the enroot backend. Empty = disabled (use the use_*/container_sqsh_path backend).
     k8s_sandbox_specs: list[K8sSandboxSpec] = Field(default_factory=list)
+    # k8s backend: pull each task's capsule into the pod via /load_capsule (off for pure-exec tests).
+    pull_capsule_in_pod: bool = True
     force_python: bool = True
     normalize_reward: bool = True
     enable_faithfulness_gate: bool = False
@@ -212,7 +214,13 @@ class Dataset(TaskDataset[InterpreterEnv]):
         else:
             problem_dir = Path(mkdtemp())
 
-        if self.capsule_dir is None:  # lazy s3: pull this task's capsule straight into the work dir
+        if self.config.k8s_sandbox_specs and self.config.pull_capsule_in_pod:
+            # The k8s pod pulls the capsule in-pod from its CAPSULE_SOURCE (/load_capsule), so the
+            # orchestrator-side copy here is wasted (and an s3 capsule_dir would need orchestrator S3
+            # creds). Skip it. NOTE: a non-k8s fallback (enroot/local) would then run without local
+            # capsule data — acceptable because in-pod pull was explicitly requested.
+            logger.warning("k8s in-pod capsule pull active; skipping orchestrator-side capsule copy for %s", problem.id)
+        elif self.capsule_dir is None:  # lazy s3: pull this task's capsule straight into the work dir
             self._pull_capsule_from_s3(problem, problem_dir)
         else:
             capsule_path = self.capsule_dir / problem.input_data_path

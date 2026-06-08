@@ -110,6 +110,7 @@ enable_error_code = [
 ]
 error_summary = false
 exclude = [
+    "(^|/)vendor/",
     "^\\.?venv",
 ]
 platform = "linux"
@@ -229,6 +230,7 @@ ignore = [
 ]
 
 [tool.ruff]
+extend-exclude = ["vendor"]
 line-length = 120
 unsafe-fixes = true
 
@@ -476,3 +478,4 @@ trailing_comma_inline_array = true
 
 [tool.uv.sources]
 hypotest = {workspace = true}
+k8s-agent-sandbox = {editable = true, path = "vendor/agent-sandbox/clients/python/agentic-sandbox-client"}

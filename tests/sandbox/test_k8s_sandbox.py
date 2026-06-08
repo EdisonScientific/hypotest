@@ -1,4 +1,11 @@
-"""Unit tests for K8sSandbox — via a stub connector (the real agent-sandbox SDK is never imported)."""
+"""Unit tests for K8sSandbox.
+
+Most tests bypass `_allocate` and ride a stub connector (no SDK, no cluster). The exception is
+`test_allocate_passes_per_spec_kubeconfig_context`, which drives the real `_allocate` with the SDK's
+`AsyncSandboxClient` faked at its import site to assert the multi-cluster wiring.
+"""
+
+from importlib.util import find_spec
 
 import httpx
 import pytest
@@ -81,3 +88,45 @@ async def test_start_failure_terminates_pod(tmp_path, monkeypatch, make_fake_san
     with pytest.raises(NoCapacityError):
         await sandbox.start()
     assert fake.terminated
+
+
+@pytest.mark.skipif(find_spec("k8s_agent_sandbox") is None, reason="agent-sandbox SDK not installed")
+@pytest.mark.asyncio
+async def test_allocate_passes_per_spec_kubeconfig_context(tmp_path, monkeypatch):
+    """_allocate must thread the spec's kubeconfig/context into AsyncSandboxClient.
+
+    That is the whole multi-cluster switch: each placement targets its OWN cluster's control plane.
+    Without it, every claim would be created against the ambient / in-cluster kubeconfig.
+    """
+    import k8s_agent_sandbox  # noqa: PLC0415
+
+    captured: dict = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def create_sandbox(self, template, **kwargs):
+            captured["template"] = template
+            captured["create_kwargs"] = kwargs
+            return object()
+
+    monkeypatch.setattr(k8s_agent_sandbox, "AsyncSandboxClient", _FakeClient)
+
+    config = SandboxConfig(work_dir=tmp_path, language=NBLanguage.PYTHON, ref=CapsuleRef())
+    spec = K8sSandboxSpec(
+        template="py-sandbox",
+        warmpool="wp",
+        connection="direct",
+        api_url="http://cluster-a:31050",
+        kubeconfig="/kube/cluster-a.yaml",
+        context="cluster-a",
+    )
+    await K8sSandbox(config, spec)._allocate()
+
+    assert captured["kubeconfig"] == "/kube/cluster-a.yaml"
+    assert captured["context"] == "cluster-a"
+    assert captured["template"] == "py-sandbox"
+    assert captured["create_kwargs"]["warmpool"] == "wp"  # placement args flow through too
+    assert captured["create_kwargs"]["namespace"] == "default"
+    assert captured["connection_config"].api_url == "http://cluster-a:31050"  # data plane = same cluster

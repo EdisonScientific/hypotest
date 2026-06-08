@@ -56,6 +56,7 @@ from .prompts import (
     PromptingConfig,
 )
 from .sandbox import (
+    CapsuleRef,
     K8sFallbackScheduler,
     K8sSandboxSpec,
     ResourceSpec,
@@ -172,6 +173,7 @@ class InterpreterEnvState:
         sandbox_max_pids: int | None = None,
         k8s_specs: list[K8sSandboxSpec] | None = None,
         enable_recovery: bool = False,
+        capsule_ref: CapsuleRef | None = None,
     ):
         self.work_dir = work_dir
         self.language = language
@@ -197,6 +199,9 @@ class InterpreterEnvState:
             extra_envs=self.extra_envs,
             container_sqsh_path=container_sqsh_path,
             resources=ResourceSpec(mem_mb=sandbox_memory_limit_mb, max_pids=sandbox_max_pids),
+            # Capsule identity for the k8s backend's in-pod /load_capsule; other backends deliver
+            # the capsule via work_dir/mount and ignore it (K8sSandbox.start no-ops if uuid is None).
+            ref=capsule_ref or CapsuleRef(),
             use_docker=use_docker,
             use_enroot=use_enroot,
             use_ray=use_ray if RAY_INSTALLED else False,
@@ -496,6 +501,9 @@ class InterpreterEnvConfig(BaseModel):
     # Opt-in k8s (agent-sandbox) placement: each spec is a warmpool/template target the scheduler
     # load-balances across, falling back to the configured (enroot) backend. Empty = disabled.
     k8s_sandbox_specs: list[K8sSandboxSpec] = Field(default_factory=list)
+    # For the k8s backend: pull the task's capsule into the pod via /load_capsule on start. Off for
+    # pure-exec / no-data smoke tests. Other backends deliver the capsule via work_dir/mount.
+    pull_capsule_in_pod: bool = True
 
     @model_validator(mode="after")
     def _migrate_enable_faithfulness_gate(self) -> "InterpreterEnvConfig":
@@ -624,6 +632,14 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             sandbox_max_pids=self.execution_config.sandbox_max_pids,
             enable_recovery=self.config.enable_recovery,
             k8s_specs=self.config.k8s_sandbox_specs or None,
+            # The k8s backend pulls this capsule in-pod via /load_capsule (the pod pulls from its
+            # CAPSULE_SOURCE). Mirror the dataset's capsule resolution: prefer input_data_path, else
+            # the problem id. Gated by pull_capsule_in_pod so pure-exec/no-data smokes can disable it.
+            capsule_ref=(
+                CapsuleRef(uuid=self.problem.input_data_path or str(self.problem.id))
+                if self.config.pull_capsule_in_pod
+                else None
+            ),
         )
         logger.warning("[reset:%s] starting container", reset_id)
         await self.state.start()
