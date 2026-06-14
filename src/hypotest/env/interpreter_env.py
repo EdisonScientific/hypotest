@@ -19,6 +19,8 @@ import time
 import uuid
 import warnings
 from collections.abc import Awaitable, Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from tempfile import mkdtemp
 from textwrap import dedent
@@ -70,7 +72,7 @@ from .prompts import (
     PromptingConfig,
 )
 from .tools.filesystem import FilesystemTool, list_dir_tool
-from .utils import NBLanguage, render_notebook_for_rubric
+from .utils import NBLanguage, render_notebook_for_rubric, view_notebook
 
 RAY_INSTALLED = True
 try:
@@ -103,6 +105,42 @@ _warned_unsafe_execution: set[str] = set()
 _BACKGROUND_CLEANUP_TASKS: set[asyncio.Task[None]] = set()
 
 
+def _positive_int_from_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return max(1, value)
+
+
+_IO_THREAD_WORKERS = _positive_int_from_env("HYPOTEST_IO_THREADS", 4)
+_IO_THREAD_CONCURRENCY = min(
+    _positive_int_from_env("HYPOTEST_IO_CONCURRENCY", _IO_THREAD_WORKERS),
+    _IO_THREAD_WORKERS,
+)
+_CLEANUP_THREAD_CONCURRENCY = min(
+    _positive_int_from_env("HYPOTEST_CLEANUP_CONCURRENCY", 2),
+    _IO_THREAD_CONCURRENCY,
+)
+_IO_THREAD_POOL = ThreadPoolExecutor(
+    max_workers=_IO_THREAD_WORKERS,
+    thread_name_prefix="hypotest-io",
+)
+_IO_THREAD_SEM = asyncio.Semaphore(_IO_THREAD_CONCURRENCY)
+_CLEANUP_THREAD_SEM = asyncio.Semaphore(_CLEANUP_THREAD_CONCURRENCY)
+
+
+async def _run_in_io_thread(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    async with _IO_THREAD_SEM:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_IO_THREAD_POOL, partial(func, *args, **kwargs))
+
+
+async def _run_cleanup_in_io_thread(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    async with _CLEANUP_THREAD_SEM:
+        return await _run_in_io_thread(func, *args, **kwargs)
+
+
 def _make_cleanup_path(path: Path) -> Path:
     return path.with_name(f".cleanup-{path.name}-{uuid.uuid4().hex}")
 
@@ -122,7 +160,7 @@ def _detach_dir_for_cleanup(path: Path) -> Path | None:
 def _schedule_dir_cleanup(path: Path) -> None:
     async def _cleanup() -> None:
         try:
-            await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)
+            await _run_cleanup_in_io_thread(shutil.rmtree, path, ignore_errors=True)
         except Exception:
             logger.warning("Background cleanup failed for %s", path, exc_info=True)
 
@@ -697,7 +735,7 @@ class EnrootKernelServer:
                 )
             self._container_port = await get_free_port()
 
-            await asyncio.to_thread(node_workdir.mkdir, parents=True, exist_ok=True)
+            await _run_in_io_thread(node_workdir.mkdir, parents=True, exist_ok=True)
             bash = self._build_kernel_bash_script(
                 str(node_workdir), language, self._container_port, startup_token, safe_execute=self.safe_execute
             )
@@ -721,7 +759,7 @@ class EnrootKernelServer:
                 log_dir = work_dir / ".container_logs"
                 log_dir.mkdir(exist_ok=True)
                 self._container_log_path = log_dir / "container.log"
-                self._container_log_file = await asyncio.to_thread(
+                self._container_log_file = await _run_in_io_thread(
                     open, self._container_log_path, "w", encoding="utf-8"
                 )
                 self._enroot_proc = await asyncio.create_subprocess_exec(
@@ -836,7 +874,7 @@ class EnrootKernelServer:
             except Exception:
                 return ""
 
-        return await asyncio.to_thread(_read)
+        return await _run_in_io_thread(_read)
 
     async def _close_container_log(self) -> None:
         """Close the container log file handle."""
@@ -848,7 +886,7 @@ class EnrootKernelServer:
                 with contextlib.suppress(Exception):
                     f.close()
 
-            await asyncio.to_thread(_do_close)
+            await _run_in_io_thread(_do_close)
 
     async def _cleanup_failed_startup(self) -> None:
         """Best-effort cleanup for failed startup attempts before retrying."""
@@ -871,7 +909,7 @@ class EnrootKernelServer:
         await self._close_container_log()
 
         if self._node_workdir is not None:
-            await asyncio.to_thread(shutil.rmtree, self._node_workdir, ignore_errors=True)
+            await _run_cleanup_in_io_thread(shutil.rmtree, self._node_workdir, ignore_errors=True)
 
     async def _wait_for_health(self, expected_startup_token: str | None = None) -> None:
         """Wait for the kernel server to become healthy."""
@@ -979,7 +1017,7 @@ class EnrootKernelServer:
         except Exception as e:
             return f"Error listing directory: {e!s}"
 
-        result = await asyncio.to_thread(
+        result = await _run_in_io_thread(
             list_dir_tool,
             str(normalized),
             max_files=max_files,
@@ -1021,7 +1059,7 @@ class EnrootKernelServer:
 
         if self._node_workdir is not None:
             _diag("hypotest_enroot_actor_node_workdir_cleanup_start", label=label, node_workdir=str(self._node_workdir))
-            await asyncio.to_thread(shutil.rmtree, self._node_workdir, ignore_errors=True)
+            await _run_cleanup_in_io_thread(shutil.rmtree, self._node_workdir, ignore_errors=True)
             self._node_workdir = None
             _diag("hypotest_enroot_actor_node_workdir_cleanup_done", label=label)
         _diag(
@@ -1388,7 +1426,7 @@ class InterpreterEnvState:
                 # for detailed rationale on why we avoid subprocess.PIPE here).
                 (self.work_dir / ".container_logs").mkdir(exist_ok=True)
                 self._container_log_path = self.work_dir / ".container_logs" / "container.log"
-                self._container_log_file = await asyncio.to_thread(
+                self._container_log_file = await _run_in_io_thread(
                     open, self._container_log_path, "w", encoding="utf-8"
                 )
                 self._enroot_proc = await asyncio.create_subprocess_exec(
@@ -1467,7 +1505,7 @@ class InterpreterEnvState:
             except Exception:
                 return ""
 
-        return await asyncio.to_thread(_read)
+        return await _run_in_io_thread(_read)
 
     async def _close_container_log(self) -> None:
         """Close the container log file handle."""
@@ -1479,7 +1517,7 @@ class InterpreterEnvState:
                 with contextlib.suppress(Exception):
                     f.close()
 
-            await asyncio.to_thread(_do_close)
+            await _run_in_io_thread(_do_close)
 
     async def _cleanup_failed_startup(self) -> None:
         """Best-effort cleanup for failed startup attempts before retrying."""
@@ -1900,6 +1938,7 @@ class InterpreterEnvConfig(BaseModel):
     replace_image_payloads_with_placeholders: bool = True
     include_images_in_rubric_model: bool = True
     max_rubric_images: int = 20
+    rubric_notebook_serialization: Literal["auto", "multimodal", "legacy"] = "auto"
 
     @model_validator(mode="after")
     def _migrate_enable_faithfulness_gate(self) -> "InterpreterEnvConfig":
@@ -2625,9 +2664,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             work_dir=str(self.work_dir),
             prompt_chars=len(prompt),
             image_count=len(rubric_images),
-            timeout_s=3 * 60,
+            timeout_s=10 * 60,
         )
-        resp = await self._call_rubric_model(prompt, rubric_images, timeout=3 * 60)
+        resp = await self._call_rubric_model(prompt, rubric_images, timeout=10 * 60)
         _diag(
             "hypotest_score_rubric_model_call_done",
             env_id=getattr(self, "_nemo_env_id", None),
@@ -2676,9 +2715,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             work_dir=str(self.work_dir),
             prompt_chars=len(prompt),
             image_count=len(rubric_images),
-            timeout_s=3 * 60,
+            timeout_s=10 * 60,
         )
-        resp = await self._call_rubric_model(prompt, rubric_images, timeout=3 * 60)
+        resp = await self._call_rubric_model(prompt, rubric_images, timeout=10 * 60)
         _diag(
             "hypotest_score_faithfulness_model_call_done",
             env_id=getattr(self, "_nemo_env_id", None),
@@ -2732,9 +2771,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 work_dir=str(self.work_dir),
                 prompt_chars=len(prompt),
                 image_count=len(rubric_images),
-                timeout_s=3 * 60,
+                timeout_s=10 * 60,
             )
-            resp = await self._call_rubric_model(prompt, rubric_images, timeout=3 * 60)
+            resp = await self._call_rubric_model(prompt, rubric_images, timeout=10 * 60)
             _diag(
                 "hypotest_score_hybrid_model_call_done",
                 env_id=getattr(self, "_nemo_env_id", None),
@@ -2817,12 +2856,20 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             wager_mode=self.config.wager_mode,
         )
         assert self.rubric_model is not None
-        nb_content, rubric_images = render_notebook_for_rubric(
-            self.state.nb.cells,
-            self.language.value,
-            include_images=self.config.include_images_in_rubric_model,
-            max_images=self.config.max_rubric_images,
-        )
+        rubric_notebook_serialization = self.config.rubric_notebook_serialization
+        if rubric_notebook_serialization == "auto":
+            rubric_notebook_serialization = "multimodal" if self.config.include_images_in_rubric_model else "legacy"
+
+        if rubric_notebook_serialization == "legacy":
+            nb_content, _ = view_notebook(self.state.nb.cells, self.language.value)
+            rubric_images: list[Mapping[str, Any]] = []
+        else:
+            nb_content, rubric_images = render_notebook_for_rubric(
+                self.state.nb.cells,
+                self.language.value,
+                include_images=self.config.include_images_in_rubric_model,
+                max_images=self.config.max_rubric_images,
+            )
         _diag(
             "hypotest_score_solution_notebook_rendered",
             env_id=getattr(self, "_nemo_env_id", None),
@@ -2830,6 +2877,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             work_dir=str(self.work_dir),
             notebook_chars=len(nb_content),
             image_count=len(rubric_images),
+            notebook_serialization=rubric_notebook_serialization,
         )
 
         mode = self.config.faithfulness_mode

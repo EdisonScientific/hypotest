@@ -55,6 +55,7 @@ class DatasetConfig(BaseModel):
     replace_image_payloads_with_placeholders: bool = True
     include_images_in_rubric_model: bool = True
     max_rubric_images: int = 20
+    rubric_notebook_serialization: Literal["auto", "multimodal", "legacy"] = "auto"
     save_dir: Path | None = None
 
     execution_config: ExecutionConfig = Field(default_factory=ExecutionConfig)

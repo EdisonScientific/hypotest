@@ -6,10 +6,12 @@ import os
 import pathlib
 import tempfile
 from collections.abc import AsyncGenerator
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 from uuid import UUID
 
+import nbformat
 import pytest
 import pytest_asyncio
 from aviary.core import Message, ToolCall, ToolRequestMessage, ToolResponseMessage
@@ -233,7 +235,7 @@ class TestInterpreterEnv:
     @requires_matplotlib
     @pytest.mark.asyncio
     async def test_interpreter_env_run_cell_with_images(self, interpreter_env: InterpreterEnv):
-        """Test run_cell returns Message when images are present."""
+        """Test run_cell omits image payloads from policy-facing output by default."""
         await interpreter_env.reset()
 
         code = """
@@ -243,15 +245,49 @@ plt.show()
 """
         result = await interpreter_env.run_cell(code)
 
-        assert isinstance(result, Message)
-        assert isinstance(result.content, str)
-        assert result.content_is_json_str is True
+        assert isinstance(result, str)
+        assert "[Cell #0]" in result
+        assert "[Image generated]" in result
+        assert "omitted from policy context" in result
+        assert "data:image" not in result
+        assert "base64" not in result
 
-        parsed = json.loads(result.content)
-        assert isinstance(parsed, list)
-        content_types = {item.get("type") for item in parsed}
-        assert "text" in content_types
-        assert "image_url" in content_types
+    @requires_matplotlib
+    @pytest.mark.asyncio
+    async def test_interpreter_env_run_cell_with_images_config_off_returns_multimodal(
+        self,
+        default_problem: ProblemInstance,
+    ):
+        """Test config can preserve legacy multimodal image tool responses."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env = InterpreterEnv(
+                problem=default_problem,
+                work_dir=pathlib.Path(tmp),
+                config=InterpreterEnvConfig(
+                    language=NBLanguage.PYTHON,
+                    replace_image_payloads_with_placeholders=False,
+                ),
+            )
+            await env.reset()
+            try:
+                code = """
+import matplotlib.pyplot as plt
+plt.plot([1, 2, 3], [1, 2, 3])
+plt.show()
+"""
+                result = await env.run_cell(code)
+
+                assert isinstance(result, Message)
+                assert isinstance(result.content, str)
+                assert result.content_is_json_str is True
+
+                parsed = json.loads(result.content)
+                assert isinstance(parsed, list)
+                content_types = {item.get("type") for item in parsed}
+                assert "text" in content_types
+                assert "image_url" in content_types
+            finally:
+                await env.close()
 
     @pytest.mark.asyncio
     async def test_interpreter_env_reset_kernel(self, interpreter_env: InterpreterEnv):
@@ -397,23 +433,17 @@ class TestInterpreterEnvRunCell:
     @requires_matplotlib
     @pytest.mark.asyncio
     async def test_run_cell_with_images(self, interpreter_env: InterpreterEnv):
-        """Test that run_cell returns Message with images when plot is generated."""
+        """Test that run_cell returns image placeholders by default."""
         plot_code = "import matplotlib.pyplot as plt\nplt.plot([1, 2, 3], [1, 2, 3])\nplt.show()"
 
         result = await interpreter_env.run_cell(code=plot_code)
 
-        assert isinstance(result, Message)
-        assert isinstance(result.content, str)
-        assert result.content_is_json_str is True
-
-        parsed = json.loads(result.content)
-        assert isinstance(parsed, list)
-        content_types = {item.get("type") for item in parsed}
-        assert "text" in content_types
-        assert "image_url" in content_types
-
-        text_item = next(item for item in parsed if item.get("type") == "text")
-        assert "[Cell #0]" in text_item.get("text", "")
+        assert isinstance(result, str)
+        assert "[Cell #0]" in result
+        assert "[Image generated]" in result
+        assert "omitted from policy context" in result
+        assert "data:image" not in result
+        assert "base64" not in result
 
     @pytest.mark.asyncio
     async def test_run_cell_registered_as_tool(self, interpreter_env: InterpreterEnv):
@@ -493,7 +523,7 @@ class TestMultimodalToolOutputs:
     @requires_matplotlib
     @pytest.mark.asyncio
     async def test_step_run_cell_with_plot_returns_correct_multimodal_format(self, interpreter_env: InterpreterEnv):
-        """Test run_cell with plot returns properly formatted multimodal response."""
+        """Test run_cell with plot returns scrubbed policy-facing response by default."""
         plot_code = """
 import matplotlib.pyplot as plt
 plt.plot([1, 2, 3], [1, 2, 3])
@@ -509,20 +539,57 @@ plt.show()
         assert response.name == "run_cell"
 
         assert isinstance(response.content, str)
-        assert response.content_is_json_str is True
+        assert response.content_is_json_str is False
+        assert "[Cell #" in response.content
+        assert "[Image generated]" in response.content
+        assert "omitted from policy context" in response.content
+        assert "data:image" not in response.content
+        assert "base64" not in response.content
 
-        parsed = json.loads(response.content)
-        assert isinstance(parsed, list)
+    @requires_matplotlib
+    @pytest.mark.asyncio
+    async def test_step_run_cell_with_plot_config_off_returns_image_url(
+        self,
+        default_problem: ProblemInstance,
+    ):
+        """Test config can preserve image_url blocks in tool responses."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env = InterpreterEnv(
+                problem=default_problem,
+                work_dir=pathlib.Path(tmp),
+                config=InterpreterEnvConfig(
+                    language=NBLanguage.PYTHON,
+                    replace_image_payloads_with_placeholders=False,
+                ),
+            )
+            await env.reset()
+            try:
+                plot_code = """
+import matplotlib.pyplot as plt
+plt.plot([1, 2, 3], [1, 2, 3])
+plt.title('Test Plot')
+plt.show()
+"""
+                action = create_tool_request("run_cell", code=plot_code)
 
-        content_types = {item.get("type") for item in parsed}
-        assert "text" in content_types
-        assert "image_url" in content_types
+                obs, _reward, _done, _truncated = await env.step(action)
 
-        text_item = next(item for item in parsed if item.get("type") == "text")
-        assert "[Cell #" in text_item.get("text", "")
+                response = obs[0]
+                assert isinstance(response, ToolResponseMessage)
+                assert response.name == "run_cell"
+                assert isinstance(response.content, str)
+                assert response.content_is_json_str is True
 
-        image_item = next(item for item in parsed if item.get("type") == "image_url")
-        assert image_item.get("image_url", {}).get("url", "").startswith("data:image/")
+                parsed = json.loads(response.content)
+                assert isinstance(parsed, list)
+                content_types = {item.get("type") for item in parsed}
+                assert "text" in content_types
+                assert "image_url" in content_types
+
+                image_item = next(item for item in parsed if item.get("type") == "image_url")
+                assert image_item.get("image_url", {}).get("url", "").startswith("data:image/")
+            finally:
+                await env.close()
 
     @pytest.mark.asyncio
     async def test_step_run_cell_text_only_returns_string_content(self, interpreter_env: InterpreterEnv):
@@ -866,6 +933,146 @@ class TestRubricGrading:
 * 1 point: Correct conclusion is reached""",
         max_points=3,
     )
+
+    @pytest.mark.asyncio
+    async def test_rubric_grading_passes_notebook_images_as_multimodal_messages(self):
+        """Test rubric scoring sends images as Message image parts, not prompt text."""
+
+        class FakeRubricModel:
+            def __init__(self):
+                self.calls: list[Any] = []
+
+            async def call_single(self, messages, **kwargs):  # noqa: ANN001, ARG002
+                self.calls.append(messages)
+                return SimpleNamespace(text="<score>1</score>")
+
+        problem = ProblemInstance(
+            id=UUID("12345678-1234-5678-1234-567812345679"),
+            hypothesis="Plot has useful information",
+            protocol="Generate and inspect a plot",
+            answer=True,
+            rubric="* 1 point: Plot is considered",
+            max_points=1,
+        )
+        fake_model = FakeRubricModel()
+        test_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = pathlib.Path(tmp)
+            env = InterpreterEnv(
+                problem=problem,
+                work_dir=work_dir,
+                rubric_model=fake_model,  # type: ignore[arg-type]
+                config=InterpreterEnvConfig(language=NBLanguage.PYTHON, normalize_reward=False),
+            )
+            env.state = InterpreterEnvState(
+                work_dir=work_dir,
+                language=NBLanguage.PYTHON,
+                use_docker=False,
+            )
+            env.state.nb.cells.append(
+                nbformat.v4.new_code_cell(
+                    source="display(plot)",
+                    outputs=[
+                        nbformat.v4.new_output(
+                            output_type="display_data",
+                            data={"text/plain": "<Figure>", "image/png": test_png},
+                            metadata={},
+                        )
+                    ],
+                    execution_count=1,
+                )
+            )
+
+            correct = await env._score_solution("True")
+
+            assert correct is True
+            assert len(fake_model.calls) == 1
+            sent = fake_model.calls[0]
+            assert isinstance(sent, list)
+            assert isinstance(sent[0], Message)
+            assert sent[0].content_is_json_str is True
+
+            parsed = json.loads(sent[0].content)
+            assert any(item.get("type") == "text" for item in parsed)
+            image_item = next(item for item in parsed if item.get("type") == "image_url")
+            assert image_item["image_url"]["url"].startswith("data:image/png;base64,")
+
+            text_item = next(item for item in parsed if item.get("type") == "text")
+            assert '<image id="cell-0-output-0-image-1"' in text_item["text"]
+            assert "data:image" not in text_item["text"]
+            assert "base64" not in text_item["text"]
+
+            score_info = json.loads(env.score_info_path.read_text())
+            score_info_text = json.dumps(score_info)
+            assert "data:image" not in score_info_text
+            assert test_png not in score_info_text
+            assert score_info["rubric_images"][0]["id"] == "cell-0-output-0-image-1"
+
+    @pytest.mark.asyncio
+    async def test_rubric_grading_legacy_serialization_uses_text_only_prompt(self):
+        """Test legacy rubric serialization preserves the old text-only image marker behavior."""
+
+        class FakeRubricModel:
+            def __init__(self):
+                self.calls: list[Any] = []
+
+            async def call_single(self, messages, **kwargs):  # noqa: ANN001, ARG002
+                self.calls.append(messages)
+                return SimpleNamespace(text="<score>1</score>")
+
+        problem = ProblemInstance(
+            id=UUID("12345678-1234-5678-1234-567812345680"),
+            hypothesis="Plot has useful information",
+            protocol="Generate and inspect a plot",
+            answer=True,
+            rubric="* 1 point: Plot is considered",
+            max_points=1,
+        )
+        fake_model = FakeRubricModel()
+        test_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = pathlib.Path(tmp)
+            env = InterpreterEnv(
+                problem=problem,
+                work_dir=work_dir,
+                rubric_model=fake_model,  # type: ignore[arg-type]
+                config=InterpreterEnvConfig(
+                    language=NBLanguage.PYTHON,
+                    normalize_reward=False,
+                    include_images_in_rubric_model=False,
+                ),
+            )
+            env.state = InterpreterEnvState(
+                work_dir=work_dir,
+                language=NBLanguage.PYTHON,
+                use_docker=False,
+            )
+            env.state.nb.cells.append(
+                nbformat.v4.new_code_cell(
+                    source="display(plot)",
+                    outputs=[
+                        nbformat.v4.new_output(
+                            output_type="display_data",
+                            data={"image/png": test_png},
+                            metadata={},
+                        )
+                    ],
+                    execution_count=1,
+                )
+            )
+
+            correct = await env._score_solution("True")
+
+            assert correct is True
+            assert len(fake_model.calls) == 1
+            sent = fake_model.calls[0]
+            assert isinstance(sent, str)
+            assert "<1>" in sent
+            assert "<image id=" not in sent
+            assert "data:image" not in sent
+            assert "base64" not in sent
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
