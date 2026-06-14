@@ -172,6 +172,7 @@ class InterpreterEnvState:
         sandbox_memory_limit_mb: int | None = None,
         sandbox_max_pids: int | None = None,
         k8s_specs: list[K8sSandboxSpec] | None = None,
+        sandbox_job_id: str | None = None,
         enable_recovery: bool = False,
         capsule_ref: CapsuleRef | None = None,
     ):
@@ -202,6 +203,7 @@ class InterpreterEnvState:
             # Capsule identity for the k8s backend's in-pod /load_capsule; other backends deliver
             # the capsule via work_dir/mount and ignore it (K8sSandbox.start no-ops if uuid is None).
             ref=capsule_ref or CapsuleRef(),
+            job_id=sandbox_job_id,
             use_docker=use_docker,
             use_enroot=use_enroot,
             use_ray=use_ray if RAY_INSTALLED else False,
@@ -501,6 +503,9 @@ class InterpreterEnvConfig(BaseModel):
     # Opt-in k8s (agent-sandbox) placement: each spec is a warmpool/template target the scheduler
     # load-balances across, falling back to the configured (enroot) backend. Empty = disabled.
     k8s_sandbox_specs: list[K8sSandboxSpec] = Field(default_factory=list)
+    # Opaque job identity stamped on k8s claims (hashed) for the clean-on-startup sweep; flows to
+    # SandboxConfig.job_id. None => claims are unattributed (sweep is a no-op).
+    sandbox_job_id: str | None = None
     # For the k8s backend: pull the task's capsule into the pod via /load_capsule on start. Off for
     # pure-exec / no-data smoke tests. Other backends deliver the capsule via work_dir/mount.
     pull_capsule_in_pod: bool = True
@@ -632,6 +637,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             sandbox_max_pids=self.execution_config.sandbox_max_pids,
             enable_recovery=self.config.enable_recovery,
             k8s_specs=self.config.k8s_sandbox_specs or None,
+            sandbox_job_id=self.config.sandbox_job_id,
             # The k8s backend pulls this capsule in-pod via /load_capsule (the pod pulls from its
             # CAPSULE_SOURCE). Mirror the dataset's capsule resolution: prefer input_data_path, else
             # the problem id. Gated by pull_capsule_in_pod so pure-exec/no-data smokes can disable it.

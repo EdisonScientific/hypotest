@@ -55,6 +55,9 @@ class DatasetConfig(BaseModel):
     # Opt-in k8s (agent-sandbox) placement targets; the scheduler load-balances across them and
     # falls back to the enroot backend. Empty = disabled (use the use_*/container_sqsh_path backend).
     k8s_sandbox_specs: list[K8sSandboxSpec] = Field(default_factory=list)
+    # Opaque job identity (e.g. the W&B run-group) stamped on claims for the clean-on-startup sweep;
+    # see Dataset.sweep_stale_claims. None disables labeling+sweep. Scope it per orchestrator instance.
+    sandbox_job_id: str | None = None
     # k8s backend: pull each task's capsule into the pod via /load_capsule (off for pure-exec tests).
     pull_capsule_in_pod: bool = True
     force_python: bool = True
@@ -248,6 +251,22 @@ class Dataset(TaskDataset[InterpreterEnv]):
     def __len__(self) -> int:
         return len(self.problems)
 
+    async def sweep_stale_claims(self) -> int:
+        """Delete this job's leftover k8s SandboxClaims from a prior (crashed) run — clean-on-startup.
+
+        No-op unless both `sandbox_job_id` and `k8s_sandbox_specs` are set. Job-scoped, so it never
+        touches a concurrent job's claims; the controller TTL backstops anything missed. Call once at
+        orchestrator startup (launch_server does; other hosts should call it after construction).
+        """
+        if not (self.config.sandbox_job_id and self.config.k8s_sandbox_specs):
+            return 0
+        from hypotest.env.sandbox.k8s import sweep_stale_claims  # noqa: PLC0415
+
+        n = await sweep_stale_claims(self.config.k8s_sandbox_specs, self.config.sandbox_job_id)
+        if n:
+            logger.info("startup sweep: deleted %d stale claim(s) for job_id=%r", n, self.config.sandbox_job_id)
+        return n
+
 
 HypotestDataset = Dataset
 HypotestDatasetConfig = DatasetConfig
@@ -323,6 +342,7 @@ async def launch_server():
         )
 
     dataset = Dataset(config.dataset)
+    await dataset.sweep_stale_claims()  # reap this job's orphaned claims from a prior run before serving
     server = TaskDatasetServer(dataset, port=config.port, api_key=config.api_key)
 
     ip_address = socket.gethostbyname(socket.gethostname())

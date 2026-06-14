@@ -5,6 +5,7 @@ Most tests bypass `_allocate` and ride a stub connector (no SDK, no cluster). Th
 `AsyncSandboxClient` faked at its import site to assert the multi-cluster wiring.
 """
 
+import hashlib
 from importlib.util import find_spec
 
 import httpx
@@ -113,7 +114,7 @@ async def test_allocate_passes_per_spec_kubeconfig_context(tmp_path, monkeypatch
 
     monkeypatch.setattr(k8s_agent_sandbox, "AsyncSandboxClient", _FakeClient)
 
-    config = SandboxConfig(work_dir=tmp_path, language=NBLanguage.PYTHON, ref=CapsuleRef())
+    config = SandboxConfig(work_dir=tmp_path, language=NBLanguage.PYTHON, ref=CapsuleRef(), job_id="run-grp-1")
     spec = K8sSandboxSpec(
         template="py-sandbox",
         warmpool="wp",
@@ -130,3 +131,65 @@ async def test_allocate_passes_per_spec_kubeconfig_context(tmp_path, monkeypatch
     assert captured["create_kwargs"]["warmpool"] == "wp"  # placement args flow through too
     assert captured["create_kwargs"]["namespace"] == "default"
     assert captured["connection_config"].api_url == "http://cluster-a:31050"  # data plane = same cluster
+    labels = captured["create_kwargs"]["labels"]  # claim stamped for attribution + the startup sweep
+    assert labels["hypotest-managed-by"] == "hypotest"
+    assert labels["hypotest-job"] == hashlib.sha256(b"run-grp-1").hexdigest()[:32]
+
+
+@pytest.mark.asyncio
+async def test_aclose_clients_closes_and_clears_cache():
+    """aclose_clients() (the server-shutdown hook) closes every cached client and empties the cache."""
+    from hypotest.env.sandbox import k8s as k8smod  # noqa: PLC0415
+
+    closed = []
+
+    class _FakeClient:
+        async def close(self):
+            closed.append(True)
+
+    k8smod._CLIENT_CACHE["cluster-x"] = _FakeClient()
+    k8smod._CLIENT_CACHE["cluster-y"] = _FakeClient()
+    await k8smod.aclose_clients()
+    assert len(closed) == 2  # both cached clients were closed
+    assert len(k8smod._CLIENT_CACHE) == 0  # cache emptied
+
+
+def test_ttl_seconds_defaults_to_90min():
+    """The controller-side GC backstop must be ON by default — orphans leak forever if it's None."""
+    assert K8sSandboxSpec(template="x").ttl_seconds == 5400
+
+
+@pytest.mark.asyncio
+async def test_sweep_stale_claims_is_job_scoped(monkeypatch):
+    """The startup sweep lists+deletes only claims labeled with THIS job's hash, once per (cluster, ns)."""
+    from hypotest.env.sandbox import k8s as k8smod  # noqa: PLC0415
+
+    listed = []
+    deleted = []
+
+    class _Helper:
+        async def list_sandbox_claims(self, namespace, label_selector=None):
+            listed.append((namespace, label_selector))
+            return ["claim-a", "claim-b"]
+
+        async def delete_sandbox_claim(self, name, namespace):
+            deleted.append((name, namespace))
+
+    class _Client:
+        k8s_helper = _Helper()
+
+    async def _fake_get_client(spec):  # noqa: RUF029
+        return _Client()
+
+    monkeypatch.setattr(k8smod, "_get_client", _fake_get_client)
+
+    specs = [
+        K8sSandboxSpec(template="t", warmpool="wp", connection="direct", api_url="http://a", namespace="default"),
+        K8sSandboxSpec(template="t", warmpool="wp", connection="direct", api_url="http://a", namespace="default"),
+        K8sSandboxSpec(template="t", warmpool="wp", connection="direct", api_url="http://b", namespace="ns2"),
+    ]
+    n = await k8smod.sweep_stale_claims(specs, "run-grp-1")
+    sel = f"hypotest-job={hashlib.sha256(b'run-grp-1').hexdigest()[:32]}"
+    assert listed == [("default", sel), ("ns2", sel)]  # deduped to one list per unique (cluster, ns)
+    assert n == 4  # 2 claims x 2 clusters
+    assert await k8smod.sweep_stale_claims(specs, "") == 0  # no job id -> no-op
