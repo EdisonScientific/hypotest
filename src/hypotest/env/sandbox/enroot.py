@@ -234,7 +234,7 @@ class EnrootKernelServer:
         _prep_workspace_dir(str(work_dir), workspace_path=str(node_workdir))
         logger.warning("[ray-enroot] prepared node-local workspace %s for host work_dir=%s", node_workdir, work_dir)
 
-        kernel_server_path = Path(__file__).parent / "kernel_server.py"
+        kernel_server_path = Path(__file__).parent.parent / "kernel_server.py"
         assert kernel_server_path.is_file(), f"kernel server must be a valid path, found {kernel_server_path}"
 
         enroot_env = self._setup_enroot_env(startup_token)

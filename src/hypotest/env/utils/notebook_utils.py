@@ -3,14 +3,14 @@
 import asyncio
 import logging
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import nbformat
 from aiodocker.containers import DockerContainer
 
 from hypotest.env import config as cfg
 
-from .img_utils import encode_image_to_base64
+from .img_utils import encode_image_to_base64_with_mime
 
 if TYPE_CHECKING:
     from jupyter_client.asynchronous.client import AsyncKernelClient
@@ -29,6 +29,15 @@ JUPYTER_TABLE_OUTPUT_TYPES_TO_IGNORE = {
     "text/markdown",
     "application/vnd.jupyter.widget-view+json",
 }
+
+
+class NotebookRubricImage(TypedDict):
+    id: str
+    cell_idx: int
+    output_idx: int
+    image_idx: int
+    mime_type: str
+    data_url: str
 
 
 def limit_notebook_output(output: str | list[str]) -> str:
@@ -64,6 +73,7 @@ def process_cell_output(
     md: list[str],
     images: list[str],
     cell_streams: list[str],
+    include_images: bool = True,
 ) -> None:
     """Process a single output from a notebook cell."""
     if output.output_type == "stream":
@@ -81,10 +91,12 @@ def process_cell_output(
         if data_type == "text/plain":
             md.append(limit_notebook_output(output.data[data_type]))
         elif data_type in JUPYTER_IMAGE_OUTPUT_TYPES:
+            if not include_images:
+                md.append("<image output omitted from context>")
+                return
             try:
-                image_format = data_type.split("/")[-1]
-                image_prefix = f"data:image/{image_format};base64,"
-                images.append(image_prefix + encode_image_to_base64(output.data[data_type]))
+                mime_type, encoded = encode_image_to_base64_with_mime(output.data[data_type], data_type)
+                images.append(f"data:{mime_type};base64,{encoded}")
             except RuntimeError:
                 logger.exception("Error encoding image.")
                 md.append(
@@ -98,12 +110,17 @@ def process_cell_output(
             md.append(limit_notebook_output(output.data[data_type]))
 
 
-def view_notebook(cells: list[nbformat.NotebookNode], language: str) -> tuple[str, list[str]]:
+def view_notebook(
+    cells: list[nbformat.NotebookNode],
+    language: str,
+    include_images: bool = True,
+) -> tuple[str, list[str]]:
     """Process notebook cells and convert them to markdown format with images.
 
     Args:
         cells: List of notebook cells to process
         language: Programming language of the notebook code cells
+        include_images: Whether to return image data URLs in the image list.
 
     Returns:
         tuple containing:
@@ -124,7 +141,129 @@ def view_notebook(cells: list[nbformat.NotebookNode], language: str) -> tuple[st
                 cell_streams: list[str] = []
 
                 for output in outputs:
-                    process_cell_output(output, md, images, cell_streams)
+                    process_cell_output(output, md, images, cell_streams, include_images=include_images)
+
+                if cell_streams:
+                    combined_stream = "\n".join(cell_streams)
+                    md.append(limit_notebook_output(combined_stream))
+                md.append("```")
+        elif cell.cell_type in {"markdown", "raw"}:
+            md.append(str(cell.source))
+
+    return "\n".join(md), images
+
+
+def _format_rubric_image_placeholder(image: NotebookRubricImage) -> str:
+    return (
+        f'<image id="{image["id"]}" '
+        f'cell="{image["cell_idx"]}" '
+        f'output="{image["output_idx"]}" '
+        f'mime_type="{image["mime_type"]}">'
+    )
+
+
+def _process_rubric_output(
+    output: nbformat.NotebookNode,
+    *,
+    cell_idx: int,
+    output_idx: int,
+    md: list[str],
+    images: list[NotebookRubricImage],
+    cell_streams: list[str],
+    include_images: bool,
+    max_images: int,
+) -> None:
+    output_type = output.get("output_type", "")
+    if output_type == "stream":
+        cell_streams.append(output.get("text", ""))
+        return
+
+    if output_type == "error":
+        traceback = output.get("traceback", [])
+        traceback_str = "\n".join(traceback) if isinstance(traceback, list) else traceback
+        md.append(limit_notebook_output(traceback_str))
+        return
+
+    if output_type not in {"execute_result", "display_data"}:
+        return
+
+    data: dict[str, Any] = output.get("data", {})
+    text_plain = data.get("text/plain")
+    if text_plain:
+        md.append(limit_notebook_output(text_plain))
+
+    image_idx = 0
+    for data_type in sorted(JUPYTER_IMAGE_OUTPUT_TYPES):
+        if data_type not in data:
+            continue
+        image_idx += 1
+        image_id = f"cell-{cell_idx}-output-{output_idx}-image-{image_idx}"
+        if not include_images:
+            md.append(f'<image id="{image_id}" omitted="context">')
+            continue
+        if len(images) >= max_images:
+            md.append(f'<image id="{image_id}" omitted="max_images_exceeded">')
+            continue
+
+        try:
+            mime_type, encoded = encode_image_to_base64_with_mime(data[data_type], data_type)
+        except RuntimeError:
+            logger.exception("Error encoding image for rubric.")
+            md.append(f'<image id="{image_id}" omitted="encoding_failed">')
+            continue
+
+        image: NotebookRubricImage = {
+            "id": image_id,
+            "cell_idx": cell_idx,
+            "output_idx": output_idx,
+            "image_idx": image_idx,
+            "mime_type": mime_type,
+            "data_url": f"data:{mime_type};base64,{encoded}",
+        }
+        images.append(image)
+        md.append(_format_rubric_image_placeholder(image))
+
+    for data_type, value in data.items():
+        if data_type in JUPYTER_IMAGE_OUTPUT_TYPES or data_type == "text/plain":
+            continue
+        if data_type in JUPYTER_TABLE_OUTPUT_TYPES_TO_IGNORE:
+            continue
+        if isinstance(value, str):
+            md.append(limit_notebook_output(value))
+
+
+def render_notebook_for_rubric(
+    cells: list[nbformat.NotebookNode],
+    language: str,
+    *,
+    include_images: bool = True,
+    max_images: int = 20,
+) -> tuple[str, list[NotebookRubricImage]]:
+    """Render notebook text plus ordered image data for multimodal rubric calls."""
+    md: list[str] = []
+    images: list[NotebookRubricImage] = []
+
+    for cell_idx, cell in enumerate(cells):
+        md.append(f"### Cell {cell_idx}:")
+        if cell.cell_type == "code":
+            md.extend((f"```{language}", str(cell.source), "```"))
+
+            outputs = cell.get("outputs", [])
+            if outputs:
+                md.extend([f"### Output {cell_idx}:", "```"])
+                cell_streams: list[str] = []
+
+                for output_idx, output in enumerate(outputs):
+                    _process_rubric_output(
+                        output,
+                        cell_idx=cell_idx,
+                        output_idx=output_idx,
+                        md=md,
+                        images=images,
+                        cell_streams=cell_streams,
+                        include_images=include_images,
+                        max_images=max_images,
+                    )
 
                 if cell_streams:
                     combined_stream = "\n".join(cell_streams)

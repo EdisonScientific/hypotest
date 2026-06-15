@@ -16,6 +16,7 @@ import uuid
 import warnings
 from pathlib import Path
 from tempfile import mkdtemp
+from collections.abc import Mapping
 from typing import Any, Literal, cast
 from uuid import UUID
 
@@ -66,7 +67,7 @@ from .sandbox import (
     make_sandbox,
 )
 from .tools.filesystem import FilesystemTool
-from .utils import NBLanguage, view_notebook
+from .utils import NBLanguage, render_notebook_for_rubric, view_notebook
 from .wager import (
     WAGER_BETA_DEFAULT,
     WAGER_GAMMA_DEFAULT,
@@ -228,9 +229,9 @@ class InterpreterEnvState:
 
         self.raw_score: int = 0
         self.score: float = 0.0
-        self.score_metadata: dict[str, str | int] = {}
+        self.score_metadata: dict[str, Any] = {}
         self.faithfulness_passed: bool | None = None
-        self.faithfulness_metadata: dict[str, str] = {}
+        self.faithfulness_metadata: dict[str, Any] = {}
         self.rubric_reward_raw: float = 0.0
         self.hybrid_reward_value: float = 0.0
         self.hybrid_metadata: dict[str, Any] = {}
@@ -497,6 +498,10 @@ class InterpreterEnvConfig(BaseModel):
     cell_timeout_override_mode: Literal["off", "on"] = "off"
     cell_timeout_min: float = 60.0
     cell_timeout_max: float = 1200.0
+    replace_image_payloads_with_placeholders: bool = True
+    include_images_in_rubric_model: bool = True
+    max_rubric_images: int = 20
+    rubric_notebook_serialization: Literal["auto", "multimodal", "legacy"] = "auto"
     # Session recovery (swap a fresh sandbox + replay the cell history on a transport failure);
     # dark-launched, opt-in. See InterpreterEnvState.recover().
     enable_recovery: bool = False
@@ -968,7 +973,16 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         # Build response with cell number
         cell_info = f"[Cell #{actual_cell_idx}] "
 
-        if result.has_images():
+        image_count = result.count_images()
+        if image_count:
+            if self.config.replace_image_payloads_with_placeholders:
+                image_word = "image output" if image_count == 1 else "image outputs"
+                return (
+                    cell_info
+                    + result.get_truncated_text()
+                    + f"\n[{image_count} {image_word} omitted from policy context]"
+                )
+
             # Format images as data URLs for Message. Aviary validates the image
             # via PIL on construction; a figure with >178M pixels trips
             # PIL.Image.DecompressionBombError. Reshape that to a cell-level
@@ -976,9 +990,15 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             # every other kernel error, so the framework's generic
             # "Encountered exception during tool call:" wrapper doesn't fire.
             try:
-                image_urls = [
-                    f"data:{mime_type};base64,{base64_data}" for mime_type, base64_data in result.get_images()
-                ]
+                images = result.get_images()
+                if not images:
+                    image_word = "image output" if image_count == 1 else "image outputs"
+                    return (
+                        cell_info
+                        + result.get_truncated_text()
+                        + f"\n[{image_count} {image_word} could not be encoded]"
+                    )
+                image_urls = [f"data:{mime_type};base64,{base64_data}" for mime_type, base64_data in images]
                 return Message.create_message(
                     role="tool",
                     text=cell_info + result.get_truncated_text(),
@@ -1027,8 +1047,43 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
     def score_info_path(self) -> Path:
         return self.work_dir / "score_info.json"
 
+    @staticmethod
+    def _rubric_image_metadata(rubric_images: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """Return image metadata safe for score_info.json; never include data URLs."""
+        metadata: list[dict[str, Any]] = []
+        for image in rubric_images:
+            item = {k: v for k, v in image.items() if k != "data_url"}
+            data_url = str(image.get("data_url", ""))
+            item["data_url_chars"] = len(data_url)
+            metadata.append(item)
+        return metadata
+
+    async def _call_rubric_model(
+        self,
+        prompt: str,
+        rubric_images: list[Mapping[str, Any]],
+        *,
+        timeout: float,
+    ) -> Any:
+        assert self.rubric_model is not None
+        if not rubric_images:
+            return await self.rubric_model.call_single(prompt, timeout=timeout)
+
+        image_urls = [str(image["data_url"]) for image in rubric_images]
+        message = Message.create_message(
+            role="user",
+            text=prompt,
+            images=cast(list[np.ndarray | str], image_urls),
+        )
+        return await self.rubric_model.call_single([message], timeout=timeout)
+
     @tenacity.retry(stop=tenacity.stop_after_attempt(3), retry=tenacity.retry_if_exception_type(ValueError))
-    async def _evaluate_rubric(self, solution: str, nb_content: str) -> int:
+    async def _evaluate_rubric(
+        self,
+        solution: str,
+        nb_content: str,
+        rubric_images: list[Mapping[str, Any]],
+    ) -> int:
         """Evaluate the solution against the rubric. Returns raw integer score."""
         assert self.rubric_model is not None
 
@@ -1040,7 +1095,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             proposed_solution=solution,
         )
 
-        resp = await self.rubric_model.call_single(prompt, timeout=3 * 60)
+        self.state.score_metadata["rubric_images"] = self._rubric_image_metadata(rubric_images)
+        resp = await self._call_rubric_model(prompt, rubric_images, timeout=10 * 60)
         if not resp.text:
             raise ValueError("No response from rubric model")
         self.state.score_metadata["response"] = resp.text
@@ -1051,7 +1107,12 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             raise ValueError("Failed to parse score from response") from e
 
     @tenacity.retry(stop=tenacity.stop_after_attempt(3), retry=tenacity.retry_if_exception_type(ValueError))
-    async def _evaluate_faithfulness_gate(self, solution: str, nb_content: str) -> bool:
+    async def _evaluate_faithfulness_gate(
+        self,
+        solution: str,
+        nb_content: str,
+        rubric_images: list[Mapping[str, Any]],
+    ) -> bool:
         """Evaluate whether the conclusion is supported by notebook state. Returns True if faithful."""
         assert self.rubric_model is not None
 
@@ -1066,8 +1127,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             additional_criteria=additional,
         )
         self.state.faithfulness_metadata["prompt"] = prompt
+        self.state.faithfulness_metadata["rubric_images"] = self._rubric_image_metadata(rubric_images)
 
-        resp = await self.rubric_model.call_single(prompt, timeout=3 * 60)
+        resp = await self._call_rubric_model(prompt, rubric_images, timeout=10 * 60)
         if not resp.text:
             raise ValueError("No response from faithfulness gate")
         self.state.faithfulness_metadata["response"] = resp.text
@@ -1078,7 +1140,12 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             return False
         raise ValueError("Failed to parse verdict from faithfulness gate response")
 
-    async def _evaluate_hybrid_gate(self, solution: str, nb_content: str) -> dict[str, Any]:
+    async def _evaluate_hybrid_gate(
+        self,
+        solution: str,
+        nb_content: str,
+        rubric_images: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
         """Per-item hybrid faithfulness judge. Fail-open on any error.
 
         The judge reads the raw rubric text and is responsible for numbering
@@ -1100,7 +1167,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         )
 
         try:
-            resp = await self.rubric_model.call_single(prompt, timeout=3 * 60)
+            resp = await self._call_rubric_model(prompt, rubric_images, timeout=10 * 60)
         except Exception as e:
             self.logger.exception("Hybrid judge call failed — failing open")
             return {
@@ -1111,6 +1178,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 "concl_max_pts": 0,
                 "item_weights": [],
                 "prompt": prompt,
+                "rubric_images": self._rubric_image_metadata(rubric_images),
                 "response": "",
                 "judge_call_failed": True,
                 "parse_failed": False,
@@ -1128,6 +1196,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 "concl_max_pts": 0,
                 "item_weights": [],
                 "prompt": prompt,
+                "rubric_images": self._rubric_image_metadata(rubric_images),
                 "response": "",
                 "judge_call_failed": True,
                 "parse_failed": False,
@@ -1158,6 +1227,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             **parsed,
             "item_weights": item_weights,
             "prompt": prompt,
+            "rubric_images": self._rubric_image_metadata(rubric_images),
             "response": resp.text,
             "judge_call_failed": False,
             "parse_failed": not parsed["per_item"],
@@ -1166,14 +1236,29 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
     async def _score_solution(self, solution: str) -> bool:
         assert self.rubric_model is not None
-        nb_content, _ = view_notebook(self.state.nb.cells, self.language.value)
+        rubric_notebook_serialization = self.config.rubric_notebook_serialization
+        if rubric_notebook_serialization == "auto":
+            rubric_notebook_serialization = "multimodal" if self.config.include_images_in_rubric_model else "legacy"
+
+        if rubric_notebook_serialization == "legacy":
+            nb_content, _ = view_notebook(self.state.nb.cells, self.language.value)
+            rubric_images: list[Mapping[str, Any]] = []
+        else:
+            nb_content, rubric_images = render_notebook_for_rubric(
+                self.state.nb.cells,
+                self.language.value,
+                include_images=self.config.include_images_in_rubric_model,
+                max_images=self.config.max_rubric_images,
+            )
 
         mode = self.config.faithfulness_mode
         faith_result: dict[str, Any] | None = None
 
         if mode == "binary":
-            rubric_task = asyncio.ensure_future(self._evaluate_rubric(solution, nb_content))
-            gate_task = asyncio.ensure_future(self._evaluate_faithfulness_gate(solution, nb_content))
+            rubric_task = asyncio.ensure_future(self._evaluate_rubric(solution, nb_content, rubric_images))
+            gate_task = asyncio.ensure_future(
+                self._evaluate_faithfulness_gate(solution, nb_content, rubric_images)
+            )
             try:
                 raw_score = await rubric_task
             except Exception:
@@ -1186,8 +1271,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 self.state.faithfulness_passed = None
 
         elif mode in {"shadow", "hybrid"}:
-            rubric_task = asyncio.ensure_future(self._evaluate_rubric(solution, nb_content))
-            hybrid_task = asyncio.ensure_future(self._evaluate_hybrid_gate(solution, nb_content))
+            rubric_task = asyncio.ensure_future(self._evaluate_rubric(solution, nb_content, rubric_images))
+            hybrid_task = asyncio.ensure_future(self._evaluate_hybrid_gate(solution, nb_content, rubric_images))
             try:
                 raw_score = await rubric_task
             except Exception:
@@ -1206,7 +1291,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 }
 
         else:  # "off"
-            raw_score = await self._evaluate_rubric(solution, nb_content)
+            raw_score = await self._evaluate_rubric(solution, nb_content, rubric_images)
 
         try:
             self.state.raw_score = raw_score

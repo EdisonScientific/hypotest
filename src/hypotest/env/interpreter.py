@@ -93,12 +93,30 @@ class ExecutionResult(BaseModel):
             for img_type in utils.JUPYTER_IMAGE_OUTPUT_TYPES:
                 if img_type in data:
                     try:
-                        encoded = utils.encode_image_to_base64(data[img_type])
-                        images.append((img_type, encoded))
+                        mime_type, encoded = utils.encode_image_to_base64_with_mime(data[img_type], img_type)
+                        images.append((mime_type, encoded))
                     except RuntimeError:
                         logger.exception("Error encoding image.")
 
         return images
+
+    @staticmethod
+    def _output_has_image(output: NotebookNode) -> bool:
+        """Return whether an output contains image data without encoding it."""
+        output_type = output.get("output_type", "")
+        if output_type not in {MessageType.EXECUTE_RESULT, MessageType.DISPLAY_DATA}:
+            return False
+        data = output.get("data", {})
+        return bool(utils.JUPYTER_IMAGE_OUTPUT_TYPES.intersection(data.keys()))
+
+    @staticmethod
+    def _count_images_in_output(output: NotebookNode) -> int:
+        """Count image MIME entries in an output without materializing payloads."""
+        output_type = output.get("output_type", "")
+        if output_type not in {MessageType.EXECUTE_RESULT, MessageType.DISPLAY_DATA}:
+            return 0
+        data = output.get("data", {})
+        return sum(1 for img_type in utils.JUPYTER_IMAGE_OUTPUT_TYPES if img_type in data)
 
     def get_text_outputs(self) -> list[str]:
         """Extract formatted text from all notebook outputs.
@@ -125,7 +143,11 @@ class ExecutionResult(BaseModel):
 
     def has_images(self) -> bool:
         """Check if execution result contains images."""
-        return any(self._extract_images_from_output(output) for output in self.notebook_outputs)
+        return any(self._output_has_image(output) for output in self.notebook_outputs)
+
+    def count_images(self) -> int:
+        """Count image outputs without base64 encoding or validation."""
+        return sum(self._count_images_in_output(output) for output in self.notebook_outputs)
 
     def get_truncated_text(self) -> str:
         """Get the combined text, truncated to the output limit."""

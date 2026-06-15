@@ -70,6 +70,10 @@ class DatasetConfig(BaseModel):
     cell_timeout_override_mode: Literal["off", "on"] = "off"
     cell_timeout_min: float = 60.0
     cell_timeout_max: float = 1200.0
+    replace_image_payloads_with_placeholders: bool = True
+    include_images_in_rubric_model: bool = True
+    max_rubric_images: int = 20
+    rubric_notebook_serialization: Literal["auto", "multimodal", "legacy"] = "auto"
     save_dir: Path | None = None
     data_dir: Path | None = None  # local staging for s3:// sources (default: a temp dir)
 
