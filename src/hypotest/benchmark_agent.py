@@ -54,21 +54,37 @@ async def main() -> None:
     semaphore = asyncio.Semaphore(config.num_parallel)
     rm = RolloutManager(agent)
 
+    completed: dict[int, tuple[Trajectory, float]] = {}
+    write_lock = asyncio.Lock()
+
+    def dump_results() -> None:
+        ordered = [completed[i] for i in sorted(completed)]
+        rewards = {t.traj_id: r for t, r in ordered}
+        trajectories = [t for t, _ in ordered]
+        # Write to a sibling temp file and atomically replace, so an interrupted run leaves a
+        # complete file rather than a truncated/corrupt one.
+        for path, payload in (
+            (config.results_dir / "rewards.json", json.dumps(rewards, indent=2).encode()),
+            (config.results_dir / "trajectories.pkl", pickle.dumps(trajectories)),
+        ):
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_bytes(payload)
+            os.replace(tmp, path)
+
     async def rollout(idx: int) -> tuple[Trajectory, float]:
         async with semaphore:
             env = client.get_new_env_by_idx(idx)
             trajectory, *_ = await rm.sample_trajectories(environments=[env])
             trajectory.traj_id = f"task_{idx}"
-            # assume only terminal reward
-            return trajectory, trajectory.steps[-1].reward
+        # assume only terminal reward
+        result = (trajectory, trajectory.steps[-1].reward)
+        async with write_lock:
+            completed[idx] = result
+            dump_results()
+        return result
 
     results = await tqdm.gather(*[rollout(i) for i in range(len(client))], ncols=0, desc="Rollouts")
-    trajectories, rewards = zip(*results, strict=True)
-
-    (config.results_dir / "rewards.json").write_text(
-        json.dumps({t.traj_id: r for t, r in zip(trajectories, rewards, strict=True)}, indent=2)
-    )
-    (config.results_dir / "trajectories.pkl").write_bytes(pickle.dumps(trajectories))
+    rewards = [r for _, r in results]
     avg_reward = sum(rewards) / len(rewards)
     frac_solved = sum(1 for r in rewards if r == 1.0) / len(rewards)
     print(f"Average reward: {avg_reward:.2f}")

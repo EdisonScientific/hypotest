@@ -62,6 +62,10 @@ class ExecutionConfig(BaseModel):
     # safety
     safe_execute: bool = os.getenv("SAFE_EXECUTE_SANDBOX", "").lower() == "true"
 
+    # Send notebook image outputs (plots) to the model. Disable to avoid large multimodal
+    # payloads with models that are slow or unreliable on images.
+    include_images: bool = True
+
     # Capabilities
     has_gpu: bool = False
 
