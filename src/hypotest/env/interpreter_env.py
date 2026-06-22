@@ -1496,7 +1496,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         # Build response with cell number
         cell_info = f"[Cell #{actual_cell_idx}] "
 
-        if result.has_images():
+        if result.has_images() and self.execution_config.include_images:
             # Format images as data URLs for Message
             image_urls = [f"data:{mime_type};base64,{base64_data}" for mime_type, base64_data in result.get_images()]
 
@@ -1506,7 +1506,11 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 images=cast(list[np.ndarray | str], image_urls),
             )
 
-        return cell_info + result.get_truncated_text()
+        text = cell_info + result.get_truncated_text()
+        if result.has_images():
+            # Tell the model a figure was produced so it doesn't re-run the cell expecting to see it.
+            text += f"\n[{len(result.get_images())} image(s) generated, not shown]"
+        return text
 
     async def reset_kernel(self) -> str:
         """Reset the kernel to a clean state.
