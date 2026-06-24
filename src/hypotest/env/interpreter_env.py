@@ -230,6 +230,11 @@ class InterpreterEnvState:
         self.raw_score: int = 0
         self.score: float = 0.0
         self.score_metadata: dict[str, Any] = {}
+        self.rubric_model_raw_response: str = ""
+        self.rubric_model_failed: bool = False
+        self.rubric_model_fail_type: str = ""
+        self.rubric_model_error_type: str = ""
+        self.zero_reward: bool = False
         self.faithfulness_passed: bool | None = None
         self.faithfulness_metadata: dict[str, Any] = {}
         self.rubric_reward_raw: float = 0.0
@@ -1047,6 +1052,60 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
     def score_info_path(self) -> Path:
         return self.work_dir / "score_info.json"
 
+    def _record_rubric_model_success(self, response_text: str) -> None:
+        self.state.rubric_model_raw_response = response_text
+        self.state.rubric_model_failed = False
+        self.state.rubric_model_fail_type = ""
+        self.state.rubric_model_error_type = ""
+
+    def _record_rubric_model_failure(
+        self,
+        fail_type: str,
+        *,
+        response_text: str | None = None,
+        error: BaseException | str | None = None,
+    ) -> None:
+        if response_text is not None:
+            self.state.rubric_model_raw_response = response_text
+        self.state.rubric_model_failed = True
+        self.state.rubric_model_fail_type = fail_type
+        if isinstance(error, BaseException):
+            self.state.rubric_model_error_type = type(error).__name__
+        else:
+            self.state.rubric_model_error_type = "" if error is None else str(error)
+
+    @staticmethod
+    def _parse_rubric_score(response_text: str) -> int:
+        return int(response_text.split("<score>")[1].split("</score>")[0])
+
+    def get_result_metadata(self) -> dict[str, JsonValue]:
+        fail_type = self.state.rubric_model_fail_type if self.state.rubric_model_failed else ""
+        raw_response = self.state.rubric_model_raw_response or str(self.state.score_metadata.get("response", "") or "")
+        score = float(self.state.score)
+        zero_reward = score == 0.0
+        parsed_score: int | None = None
+        if raw_response:
+            with contextlib.suppress(Exception):
+                parsed_score = self._parse_rubric_score(raw_response)
+        rubric_points_awarded = parsed_score if parsed_score is not None else self.state.raw_score
+        return {
+            "rubric_model_raw_response": raw_response,
+            "rubric_model_parsed_score": parsed_score,
+            "rubric_model_failed": self.state.rubric_model_failed,
+            "rubric_model_fail_type": fail_type,
+            "rubric_model_error_type": self.state.rubric_model_error_type,
+            "rubric_model_fail_request_error": fail_type == "request_error",
+            "rubric_model_fail_parse_error": fail_type == "parse_error",
+            "rubric_model_fail_empty_response": fail_type == "empty_response",
+            "raw_score": self.state.raw_score,
+            "score": score,
+            "is_pass_rollout": float(score == 1.0),
+            "is_pass90_rollout": float(score >= 0.9),
+            "rubric_reward_raw": float(self.state.rubric_reward_raw),
+            "zero_reward": zero_reward,
+            "positive_rubric_score_zero_reward": rubric_points_awarded > 0 and zero_reward,
+        }
+
     @staticmethod
     def _rubric_image_metadata(rubric_images: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
         """Return image metadata safe for score_info.json; never include data URLs."""
@@ -1096,15 +1155,26 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         )
 
         self.state.score_metadata["rubric_images"] = self._rubric_image_metadata(rubric_images)
-        resp = await self._call_rubric_model(prompt, rubric_images, timeout=10 * 60)
-        if not resp.text:
+        try:
+            resp = await self._call_rubric_model(prompt, rubric_images, timeout=10 * 60)
+        except Exception as e:
+            self._record_rubric_model_failure("request_error", error=e)
+            raise
+
+        response_text = str(getattr(resp, "text", "") or "")
+        self.state.rubric_model_raw_response = response_text
+        if not response_text:
+            self._record_rubric_model_failure("empty_response", response_text=response_text)
             raise ValueError("No response from rubric model")
-        self.state.score_metadata["response"] = resp.text
+        self.state.score_metadata["response"] = response_text
 
         try:
-            return int(resp.text.split("<score>")[1].split("</score>")[0])
+            score = self._parse_rubric_score(response_text)
         except Exception as e:
+            self._record_rubric_model_failure("parse_error", response_text=response_text, error=e)
             raise ValueError("Failed to parse score from response") from e
+        self._record_rubric_model_success(response_text)
+        return score
 
     @tenacity.retry(stop=tenacity.stop_after_attempt(3), retry=tenacity.retry_if_exception_type(ValueError))
     async def _evaluate_faithfulness_gate(
@@ -1379,14 +1449,21 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
             self.state.score = applied
             self.state.total_reward += applied
+            self.state.zero_reward = float(self.state.score) == 0.0
             return correct
 
         finally:
+            self.state.zero_reward = float(self.state.score) == 0.0
             score_info = {
                 **self.state.score_metadata,
                 "score": self.state.score,
                 "raw_score": self.state.raw_score,
                 "max_score": self.problem.max_score,
+                "rubric_model_raw_response": self.state.rubric_model_raw_response,
+                "rubric_model_failed": self.state.rubric_model_failed,
+                "rubric_model_fail_type": self.state.rubric_model_fail_type,
+                "rubric_model_error_type": self.state.rubric_model_error_type,
+                "zero_reward": self.state.zero_reward,
                 "faithfulness_passed": self.state.faithfulness_passed,
                 "faithfulness_mode": self.config.faithfulness_mode,
                 "rubric_reward_raw": self.state.rubric_reward_raw,
@@ -1410,17 +1487,20 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         Args:
             answer: Your final response to the research question
         """
-        if self.state.done:
+        if self.state.done or self.state.answer is not None:
             return "Episode already finished."
 
         self.state.answer = answer
-        self.state.done = True
 
         if self.rubric_model is None:
             self.logger.warning("No rubric_model configured, skipping scoring")
+            self.state.done = True
             return answer
 
-        correct = await self._score_solution(answer)
+        try:
+            correct = await self._score_solution(answer)
+        finally:
+            self.state.done = True
         return CORRECT_MSG if correct else INCORRECT_MSG
 
     # ========== Time Management ==========
@@ -1464,6 +1544,11 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 "raw_score": self.state.raw_score,
                 "score": self.state.score,
                 "score_metadata": self.state.score_metadata,
+                "rubric_model_raw_response": self.state.rubric_model_raw_response,
+                "rubric_model_failed": self.state.rubric_model_failed,
+                "rubric_model_fail_type": self.state.rubric_model_fail_type,
+                "rubric_model_error_type": self.state.rubric_model_error_type,
+                "zero_reward": self.state.zero_reward,
                 "total_reward": self.state.total_reward,
                 "faithfulness_passed": self.state.faithfulness_passed,
                 "faithfulness_metadata": self.state.faithfulness_metadata,

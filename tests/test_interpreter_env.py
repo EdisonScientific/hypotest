@@ -1,5 +1,6 @@
 """Tests for the InterpreterEnv class."""
 
+import asyncio
 import base64
 import json
 import os
@@ -935,6 +936,71 @@ class TestRubricGrading:
 * 1 point: Correct conclusion is reached""",
         max_points=3,
     )
+
+    @pytest.mark.asyncio
+    async def test_submit_answer_marks_done_only_after_rubric_scoring_finishes(self):
+        """Terminal state must not become visible before the scalar reward is final."""
+
+        class SlowRubricModel:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def call_single(self, messages, **kwargs):  # noqa: ANN001, ARG002
+                self.started.set()
+                await self.release.wait()
+                return SimpleNamespace(text="<score>1</score>")
+
+        problem = ProblemInstance(
+            id=UUID("12345678-1234-5678-1234-567812345681"),
+            hypothesis="Numbers greater than 10 are large",
+            protocol="Submit an answer",
+            answer=True,
+            rubric="* 1 point: Correct answer is reached",
+            max_points=1,
+        )
+        fake_model = SlowRubricModel()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = pathlib.Path(tmp)
+            env = InterpreterEnv(
+                problem=problem,
+                work_dir=work_dir,
+                rubric_model=fake_model,  # type: ignore[arg-type]
+                config=InterpreterEnvConfig(language=NBLanguage.PYTHON, normalize_reward=False),
+            )
+            env.state = InterpreterEnvState(
+                work_dir=work_dir,
+                language=NBLanguage.PYTHON,
+                use_docker=False,
+                use_ray=False,
+            )
+
+            task = asyncio.create_task(env.submit_answer("True"))
+            try:
+                await asyncio.wait_for(fake_model.started.wait(), timeout=1)
+
+                assert env.state.answer == "True"
+                assert env.state.done is False
+                assert env.state.score == 0.0
+
+                fake_model.release.set()
+                result = await asyncio.wait_for(task, timeout=1)
+
+                assert result == "Correct answer!"
+                assert env.state.done is True
+                assert env.state.raw_score == 1
+                assert env.state.score == 1.0
+
+                metadata = env.get_result_metadata()
+                assert metadata["rubric_model_parsed_score"] == 1
+                assert metadata["raw_score"] == 1
+                assert metadata["score"] == 1.0
+                assert metadata["zero_reward"] is False
+                assert metadata["positive_rubric_score_zero_reward"] is False
+            finally:
+                if not task.done():
+                    task.cancel()
 
     @pytest.mark.asyncio
     async def test_rubric_grading_passes_notebook_images_as_multimodal_messages(self):
