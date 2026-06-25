@@ -71,9 +71,9 @@ class DatasetConfig(BaseModel):
     cell_timeout_min: float = 60.0
     cell_timeout_max: float = 1200.0
     replace_image_payloads_with_placeholders: bool = True
-    include_images_in_rubric_model: bool = True
+    include_images_in_rubric_model: bool = False
     max_rubric_images: int = 20
-    rubric_notebook_serialization: Literal["auto", "multimodal", "legacy"] = "auto"
+    rubric_notebook_serialization: Literal["auto", "multimodal", "legacy"] = "legacy"
     save_dir: Path | None = None
     data_dir: Path | None = None  # local staging for s3:// sources (default: a temp dir)
 
@@ -304,14 +304,19 @@ async def launch_server():
     parser.add_argument("config", type=FilePath, nargs="?")
     parser.add_argument("--port", type=int, default=DEFAULT_SERVER_PORT)
     parser.add_argument("--api-key", type=str, default=os.getenv("HYPOTEST_API_KEY"))
-    parser.add_argument("--problem-jsonl", type=str)
+    parser.add_argument("--problem-jsonl", type=FilePath)
     parser.add_argument("--hf-dataset", type=str)
-    parser.add_argument("--capsule-dir", type=str)
+    parser.add_argument("--capsule-dir", type=DirectoryPath)
     parser.add_argument("--rubric-model", type=str)
     parser.add_argument("--reasoning-effort", type=str, default="medium")
     parser.add_argument("--rubric-model-api-base", type=str, default=os.getenv("HYPOTEST_RUBRIC_MODEL_API_BASE"))
     parser.add_argument("--rubric-model-api-key", type=str, default=os.getenv("HYPOTEST_RUBRIC_MODEL_API_KEY"))
     parser.add_argument("--use-docker", action="store_true")
+    parser.add_argument("--use-ray", action="store_true")
+    parser.add_argument("--use-enroot", action="store_true")
+    parser.add_argument("--container-sqsh", type=FilePath)
+    parser.add_argument("--timeout", type=int, default=60 * 60)
+    parser.add_argument("--cell-timeout", type=int, default=10 * 60)
 
     args = parser.parse_args()
 
@@ -339,7 +344,10 @@ async def launch_server():
                     ],
                 },
                 use_docker=args.use_docker,
-                execution_config={"cell_execution_timeout": 600},
+                use_ray=args.use_ray,
+                use_enroot=args.use_enroot,
+                container_sqsh_path=args.container_sqsh,
+                execution_config={"job_timeout": args.timeout, "cell_execution_timeout": args.cell_timeout},
             ),
             port=args.port,
             api_key=args.api_key,
