@@ -16,7 +16,7 @@ from aviary.core import TaskDataset, TaskDatasetServer
 from datasets import Dataset as HFDataset
 from datasets import load_dataset
 from lmi import LiteLLMModel
-from pydantic import BaseModel, ConfigDict, Field, FilePath, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, FilePath, DirectoryPath, field_validator, model_validator
 
 from hypotest import s3_sync
 from hypotest.env.config import ExecutionConfig
@@ -31,8 +31,8 @@ class DatasetConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # Local path, or s3://bucket/prefix (pulled on start, or lazily per task — see capsule_pull).
-    problem_jsonl: str | None = None
-    capsule_dir: str
+    problem_jsonl: FilePath | str | None = None
+    capsule_dir: DirectoryPath | str
     hf_dataset: str | None = None
     # For an s3:// capsule_dir: "lazy" pulls each task's capsule on demand in
     # get_new_env_by_idx (default; avoids pulling the whole multi-100GB prefix per
@@ -48,7 +48,7 @@ class DatasetConfig(BaseModel):
     use_ray: bool = True
     use_docker: bool = False
     use_enroot: bool = True
-    container_sqsh_path: str | None = None
+    container_sqsh_path: FilePath | str | None = None
     # Session recovery (swap a fresh sandbox + replay the cell history on a transport failure);
     # dark-launched, opt-in.
     enable_recovery: bool = False
