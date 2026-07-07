@@ -8,7 +8,7 @@ import socket
 from collections import Counter
 from pathlib import Path
 from tempfile import mkdtemp
-from typing import Any, Literal, Self, cast
+from typing import Any, Literal, Self
 from uuid import UUID
 
 import yaml
@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, FilePath, field_validator, mo
 
 from hypotest import s3_sync
 from hypotest.env.config import ExecutionConfig
+from hypotest.env.determinism import EnvSeeds
 from hypotest.env.interpreter_env import InterpreterEnv, InterpreterEnvConfig, ProblemInstance
 from hypotest.env.kernel_server import NBLanguage
 from hypotest.env.sandbox import K8sSandboxSpec
@@ -40,9 +41,12 @@ class DatasetConfig(BaseModel):
     capsule_pull: Literal["lazy", "eager"] = "lazy"
 
     rubric_model: str = "openai/gpt-5"
-    rubric_model_config: dict[str, str | list[Any]] = Field(
-        default_factory=lambda: cast(dict[str, str | list[Any]], {"reasoning_effort": "medium"})
-    )
+    rubric_model_config: dict[str, Any] = Field(default_factory=lambda: {"reasoning_effort": "medium"})
+
+    # Best-effort deterministic rollouts. `seed` is a base seed: independent
+    # kernel, scheduler, and rubric seeds are derived statelessly per env index.
+    deterministic: bool = False
+    seed: int = 0
 
     work_dir: Path | None = None
     use_ray: bool = True
@@ -214,6 +218,12 @@ class Dataset(TaskDataset[InterpreterEnv]):
     def get_new_env_by_idx(self, idx: int) -> InterpreterEnv:
         problem = self.problems[idx]
         run_id = self._reserve_run_id(problem)
+        env_config = self.config.model_dump()
+        env_config["env_idx"] = idx
+
+        if self.config.deterministic:
+            rubric_seed = EnvSeeds.derive(self.config.seed, idx).rubric
+            env_config["rubric_seed"] = rubric_seed
 
         if self.config.work_dir:
             problem_dir = Path(self.config.work_dir) / run_id
@@ -249,7 +259,7 @@ class Dataset(TaskDataset[InterpreterEnv]):
             rubric_model=self.rubric_model,
             work_dir=problem_dir,
             save_dir=save_dir,
-            config=InterpreterEnvConfig(language=language, **self.config.model_dump()),
+            config=InterpreterEnvConfig(language=language, **env_config),
         )
 
     def __len__(self) -> int:
@@ -312,6 +322,8 @@ async def launch_server():
     parser.add_argument("--rubric-model-api-base", type=str, default=os.getenv("HYPOTEST_RUBRIC_MODEL_API_BASE"))
     parser.add_argument("--rubric-model-api-key", type=str, default=os.getenv("HYPOTEST_RUBRIC_MODEL_API_KEY"))
     parser.add_argument("--use-docker", action="store_true")
+    parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
 
     args = parser.parse_args()
 
@@ -339,6 +351,8 @@ async def launch_server():
                     ],
                 },
                 use_docker=args.use_docker,
+                deterministic=args.deterministic,
+                seed=args.seed,
                 execution_config={"cell_execution_timeout": 600},
             ),
             port=args.port,

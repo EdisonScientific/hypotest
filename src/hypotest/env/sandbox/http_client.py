@@ -116,14 +116,21 @@ class HttpKernelClient:
             )
         return _parse_execute_response(response)
 
-    async def reset(self) -> None:
+    async def reset(self, seed: int | None = None) -> None:
         """Reset the kernel via POST /reset."""
+        kwargs: dict[str, Any] = {}
+        if seed is not None:
+            kwargs["json"] = {"seed": seed}
         try:
-            response = await self._request("POST", "/reset")
+            response = await self._request("POST", "/reset", **kwargs)
             response.raise_for_status()
         except httpx.TimeoutException as e:
             logger.warning("[%s] HTTP %s during /reset: %s", self._label, type(e).__name__, e)
             raise RuntimeError(f"Kernel reset timed out: {e}") from e
+        if seed is not None and response.json().get("seed") != seed:
+            raise ProtocolVersionError(
+                f"kernel server did not confirm deterministic reset seed {seed} (deploy skew)"
+            )
 
     async def list_dir(self, directory: str = ".", max_files: int = 20, show_hidden: bool = False) -> str:
         """List the workspace via GET /list_dir (endpoint added in PR d)."""
@@ -135,21 +142,29 @@ class HttpKernelClient:
         response.raise_for_status()
         return response.json()["listing"]
 
-    async def load_capsule(self, uuid: str) -> int:
+    async def load_capsule(self, uuid: str, seed: int | None = None) -> int:
         """Pull the most-recent capsule for `uuid` in-pod via POST /load_capsule.
 
         Returns the number of objects placed.
         """
         # Capsule pulls (S3, can be >100MB) routinely exceed the connector's default 60s wire
         # timeout; bound them by the execution budget instead so large capsules don't fail to load.
+        payload: dict[str, str | int] = {"capsule_uuid": uuid}
+        if seed is not None:
+            payload["seed"] = seed
         response = await self._request(
             "POST",
             "/load_capsule",
-            json={"capsule_uuid": uuid},
+            json=payload,
             timeout=httpx.Timeout(self._execution_timeout, connect=10.0),
         )
         response.raise_for_status()
-        return response.json()["objects"]
+        data = response.json()
+        if seed is not None and data.get("seed") != seed:
+            raise ProtocolVersionError(
+                f"kernel server did not confirm deterministic capsule seed {seed} (deploy skew)"
+            )
+        return data["objects"]
 
     async def health(self) -> bool:
         """Return whether GET /health reports ready, rejecting protocol skew."""

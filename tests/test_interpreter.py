@@ -492,6 +492,8 @@ class TestInterpreter:
                 result = await interpreter.execute_code("import time; time.sleep(5)", execution_timeout=0.1)
                 assert result.error_occurred
                 assert "timed out" in result.get_combined_text()
+                assert result.execution_time is not None
+                assert result.execution_time >= 0.1
             finally:
                 await interpreter.close()
 

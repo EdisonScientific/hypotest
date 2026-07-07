@@ -4,9 +4,9 @@
 # (agent-sandbox / k8s) and behind the enroot .sqsh.
 #
 # It serves the kernel API (/execute, /reset, /health, /list_dir, /close) plus
-# POST /load_capsule {"capsule_uuid": "<uuid>"}, which pulls the most-recent
-# capsule for that UUID from --capsule-source (or the CAPSULE_SOURCE env) into the
-# work dir and resets the kernel.
+# POST /load_capsule {"capsule_uuid": "<uuid>", "seed": <optional-int>}, which
+# pulls the most-recent capsule for that UUID from --capsule-source (or the
+# CAPSULE_SOURCE env) into the work dir and resets the kernel.
 #
 # Built FROM the interpreter-env exec base, so the scientific stack
 # (numpy/pandas/R/bio/torch) is byte-identical to what the agent runs everywhere

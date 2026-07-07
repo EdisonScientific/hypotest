@@ -80,12 +80,39 @@ async def test_load_capsule_uses_generous_wire_timeout(stub_request):
 
     def handler(method, endpoint, **kwargs):
         captured.update(kwargs)
-        return httpx.Response(200, json={"objects": 3})
+        return httpx.Response(200, json={"objects": 3, "seed": 123})
 
     client = HttpKernelClient(stub_request(handler), execution_timeout=600)
-    await client.load_capsule("uuid-1")
+    await client.load_capsule("uuid-1", seed=123)
     assert isinstance(captured["timeout"], httpx.Timeout)
     assert captured["timeout"].read == 600.0
+    assert captured["json"] == {"capsule_uuid": "uuid-1", "seed": 123}
+
+
+@pytest.mark.asyncio
+async def test_reset_forwards_seed(stub_request):
+    captured: dict[str, object] = {}
+
+    def handler(method, endpoint, **kwargs):
+        captured.update(kwargs)
+        return httpx.Response(200, json={"success": True, "seed": 456})
+
+    await HttpKernelClient(stub_request(handler)).reset(seed=456)
+    assert captured["json"] == {"seed": 456}
+
+
+@pytest.mark.asyncio
+async def test_seeded_calls_reject_server_that_does_not_echo_seed(stub_request):
+    def handler(method, endpoint, **kwargs):
+        if endpoint == "/reset":
+            return httpx.Response(200, json={"success": True})
+        return httpx.Response(200, json={"objects": 1})
+
+    client = HttpKernelClient(stub_request(handler))
+    with pytest.raises(ProtocolVersionError, match="did not confirm deterministic reset seed"):
+        await client.reset(seed=1)
+    with pytest.raises(ProtocolVersionError, match="did not confirm deterministic capsule seed"):
+        await client.load_capsule("uuid-1", seed=1)
 
 
 @pytest.mark.asyncio

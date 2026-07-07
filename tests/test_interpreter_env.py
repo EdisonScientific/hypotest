@@ -1264,6 +1264,12 @@ class TestBuildEnrootCmdWithPrefix:
         assert cmd[0] == "env"
         assert "enroot" in cmd
 
+    def test_kernel_script_forwards_seed(self):
+        script = EnrootKernelServer._build_kernel_bash_script(
+            "/node/work", NBLanguage.PYTHON, 8000, "token", seed=321
+        )
+        assert "--seed 321" in script
+
     def test_with_prefix(self):
         prefix = ["prlimit", "--as=8589934592", "--"]
         cmd = EnrootKernelServer._build_enroot_cmd(
@@ -1286,11 +1292,15 @@ class TestSandboxConfigWiring:
             problem_jsonl="p.jsonl",
             use_ray=False,
             enable_recovery=True,
+            deterministic=True,
+            seed=42,
             k8s_sandbox_specs=[{"template": "py-tmpl", "warmpool": "wp"}],
         )
         config = InterpreterEnvConfig(language=NBLanguage.PYTHON, **dc.model_dump())
         assert config.use_ray is False
         assert config.enable_recovery is True
+        assert config.deterministic is True
+        assert config.seed == 42
         assert [s.template for s in config.k8s_sandbox_specs] == ["py-tmpl"]
 
     def test_state_builds_k8s_scheduler_from_specs(self, tmp_path):

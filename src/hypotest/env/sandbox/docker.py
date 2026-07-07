@@ -44,6 +44,7 @@ class DockerSandbox(Sandbox):
         self.language = config.language
         self._execution_timeout = config.execution_timeout
         self._safe_execute = config.safe_execute
+        self._seed = config.seed
         self._docker_client: aiodocker.Docker | None = None
         self._container: Any = None
         self._container_port: int | None = None
@@ -75,6 +76,8 @@ class DockerSandbox(Sandbox):
         ]
         if self._safe_execute:
             cmd_list += ["--safe-execute"]
+        if self._seed is not None:
+            cmd_list += ["--seed", str(self._seed)]
 
         docker_config = {
             "Image": cfg.NB_ENVIRONMENT_DOCKER_IMAGE,
@@ -113,7 +116,7 @@ class DockerSandbox(Sandbox):
 
     async def reset(self) -> None:
         assert self._client is not None
-        await self._client.reset()
+        await self._client.reset(self._seed)
 
     async def list_dir(self, directory: str = ".", max_files: int = 20, show_hidden: bool = False) -> str:
         return self._filesystem.list_dir(directory, max_files, show_hidden)

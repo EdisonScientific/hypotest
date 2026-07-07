@@ -9,14 +9,16 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
+import random
 import shutil
 import time
 import uuid
 import warnings
+from collections.abc import Mapping
 from pathlib import Path
 from tempfile import mkdtemp
-from collections.abc import Mapping
 from typing import Any, Literal, cast
 from uuid import UUID
 
@@ -41,6 +43,7 @@ from pydantic import BaseModel, Field, JsonValue, model_validator
 from . import config as cfg
 from .code_safety import check_code_safety
 from .config import ExecutionConfig
+from .determinism import EnvSeeds
 from .hybrid_gate import (
     HYBRID_GATE_PROMPT,
     hybrid_reward,
@@ -66,6 +69,7 @@ from .sandbox import (
     SandboxScheduler,
     make_sandbox,
 )
+from .step_context import model_turns_from_action_info
 from .tools.filesystem import FilesystemTool
 from .utils import NBLanguage, render_notebook_for_rubric, view_notebook
 from .wager import (
@@ -176,6 +180,8 @@ class InterpreterEnvState:
         sandbox_job_id: str | None = None,
         enable_recovery: bool = False,
         capsule_ref: CapsuleRef | None = None,
+        seed: int | None = None,
+        scheduler_seed: int | None = None,
     ):
         self.work_dir = work_dir
         self.language = language
@@ -208,6 +214,7 @@ class InterpreterEnvState:
             use_docker=use_docker,
             use_enroot=use_enroot,
             use_ray=use_ray if RAY_INSTALLED else False,
+            seed=seed,
         )
         self.sandbox: Sandbox = make_sandbox(self._sandbox_config)
         self._started = False
@@ -215,8 +222,16 @@ class InterpreterEnvState:
         # configured backend. When set, start()/recover() acquire through it instead of make_sandbox.
         # K8sSandbox ignores the use_* selectors and the fallback goes through make_sandbox, so both
         # arms share self._sandbox_config. Recovery stays dark-launched behind enable_recovery.
+        scheduler_rng = random.Random(scheduler_seed) if scheduler_seed is not None else None
         self._scheduler: SandboxScheduler | None = (
-            K8sFallbackScheduler(self._sandbox_config, k8s_specs, self._sandbox_config) if k8s_specs else None
+            K8sFallbackScheduler(
+                self._sandbox_config,
+                k8s_specs,
+                self._sandbox_config,
+                rng=scheduler_rng,
+            )
+            if k8s_specs
+            else None
         )
         self._enable_recovery = enable_recovery
         self._recovering = False
@@ -258,6 +273,8 @@ class InterpreterEnvState:
 
         Surfaces the recovery to the agent by prepending a notice to the returned
         ExecutionResult, so it knows its kernel state was rebuilt (and possibly clipped).
+        Episode-time accounting happens above this method, once per ``req_uuid``;
+        individual attempts and recovery replay are never charged independently.
         """
         try:
             return await self.sandbox.execute(code, timeout, req_uuid=req_uuid)
@@ -288,8 +305,8 @@ class InterpreterEnvState:
         Replay is capped at SANDBOX_REPLAY_BUDGET. If fewer cells are replayed than the notebook
         held, the notebook is CLIPPED to the recovered length (and `_execution_count` adjusted) so
         it stays consistent with the rebuilt kernel — the dropped cells' state is gone. Best-effort:
-        replay reconstructs deterministic state only; non-deterministic / non-idempotent cells (RNG,
-        wall-clock, file/network side-effects) are not faithfully restored.
+        replay reconstructs deterministic state only. Seeded RNG state is reproducible in deterministic
+        mode; wall-clock values, external I/O, and other non-idempotent effects are not faithfully restored.
         """
         self._recovering = True
         try:
@@ -519,6 +536,12 @@ class InterpreterEnvConfig(BaseModel):
     # For the k8s backend: pull the task's capsule into the pod via /load_capsule on start. Off for
     # pure-exec / no-data smoke tests. Other backends deliver the capsule via work_dir/mount.
     pull_capsule_in_pod: bool = True
+    # `seed` is the dataset-level base seed. Component seeds are derived from it
+    # and env_idx without consuming a mutable RNG, so streams remain independent.
+    deterministic: bool = False
+    seed: int = 0
+    env_idx: int = 0
+    rubric_seed: int | None = None
 
     @model_validator(mode="after")
     def _migrate_enable_faithfulness_gate(self) -> "InterpreterEnvConfig":
@@ -584,6 +607,18 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.step_count = 0
         self.include_env_state_msg = include_env_state_msg
         self.state: InterpreterEnvState
+        self.kernel_seed: int | None = None
+        self.scheduler_seed: int | None = None
+        self._kernel_execution_seconds = 0.0
+        self._simulated_generation_seconds = 0.0
+        self._policy_generation_count = 0
+        self._policy_generation_output_tokens = 0
+        self._duplicate_generation_accounting_suppressed = 0
+        self._accounted_generation_ids: set[str] = set()
+        self._unreported_execution_time_count = 0
+        self._unreported_execution_observed_seconds = 0.0
+        self._duplicate_execution_accounting_suppressed = 0
+        self._accounted_execution_ids: set[str] = set()
         # prompting_config is set during reset() after language resolution
         self.prompting_config: PromptingConfig
 
@@ -623,6 +658,14 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         kernel_env_path = Path(cfg.KERNEL_ENV_PATH)
         kernel_site_packages = kernel_env_path / "lib" / "python3.12" / "site-packages"
 
+        if self.config.deterministic:
+            deterministic_seeds = EnvSeeds.derive(self.config.seed, self.config.env_idx)
+            self.kernel_seed = deterministic_seeds.kernel
+            self.scheduler_seed = deterministic_seeds.scheduler
+        else:
+            self.kernel_seed = None
+            self.scheduler_seed = None
+
         self.state = InterpreterEnvState(
             work_dir=self.work_dir,
             language=self.language,
@@ -656,13 +699,16 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 if self.config.pull_capsule_in_pod
                 else None
             ),
+            seed=self.kernel_seed,
+            scheduler_seed=self.scheduler_seed,
         )
         logger.warning("[reset:%s] starting container", reset_id)
         await self.state.start()
         logger.warning("[reset:%s] container started, building tools", reset_id)
 
-        # Record start time for timeout tracking
-        self.start_time = time.perf_counter()
+        # Begin episode-time accounting after backend startup, preserving the
+        # historical wall-clock boundary while resetting all active-time totals.
+        self._reset_episode_time_accounting()
 
         messages = []
         if self.prompting_config.system_prompt:
@@ -825,6 +871,10 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
     async def step(self, action: ToolRequestMessage) -> tuple[Messages, float, bool, bool]:
         """Execute a step in the environment."""
+        # One or more model generations may precede an environment step. In
+        # kernel-execution mode, charge them before a tool computes its dynamic
+        # execution timeout.
+        self._record_policy_generation(action)
         self.step_count += 1
         obs = cast(
             Messages,
@@ -968,7 +1018,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 cell_idx = None
 
         # Execute code and update notebook atomically
-        result, actual_cell_idx = await self.state.execute_and_add_cell(
+        result, actual_cell_idx = await self._execute_and_account_cell(
             code,
             cell_idx=cell_idx,
             timeout=effective_timeout,
@@ -1088,7 +1138,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             with contextlib.suppress(Exception):
                 parsed_score = self._parse_rubric_score(raw_response)
         rubric_points_awarded = parsed_score if parsed_score is not None else self.state.raw_score
-        return {
+        metadata: dict[str, JsonValue] = {
             "rubric_model_raw_response": raw_response,
             "rubric_model_parsed_score": parsed_score,
             "rubric_model_failed": self.state.rubric_model_failed,
@@ -1104,7 +1154,17 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             "rubric_reward_raw": float(self.state.rubric_reward_raw),
             "zero_reward": zero_reward,
             "positive_rubric_score_zero_reward": rubric_points_awarded > 0 and zero_reward,
+            "time_accounting": self.get_time_accounting_metadata(),
         }
+        if self.config.deterministic:
+            metadata |= {
+                "deterministic": True,
+                "env_idx": self.config.env_idx,
+                "kernel_seed": self.kernel_seed,
+                "scheduler_seed": self.scheduler_seed,
+                "rubric_seed": self.config.rubric_seed,
+            }
+        return metadata
 
     @staticmethod
     def _rubric_image_metadata(rubric_images: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -1125,8 +1185,12 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         timeout: float,
     ) -> Any:
         assert self.rubric_model is not None
+        request_kwargs: dict[str, Any] = {"timeout": timeout}
+        if self.config.rubric_seed is not None:
+            request_kwargs["seed"] = self.config.rubric_seed
+
         if not rubric_images:
-            return await self.rubric_model.call_single(prompt, timeout=timeout)
+            return await self.rubric_model.call_single(prompt, **request_kwargs)
 
         image_urls = [str(image["data_url"]) for image in rubric_images]
         message = Message.create_message(
@@ -1134,7 +1198,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             text=prompt,
             images=cast(list[np.ndarray | str], image_urls),
         )
-        return await self.rubric_model.call_single([message], timeout=timeout)
+        return await self.rubric_model.call_single([message], **request_kwargs)
 
     @tenacity.retry(stop=tenacity.stop_after_attempt(3), retry=tenacity.retry_if_exception_type(ValueError))
     async def _evaluate_rubric(
@@ -1473,7 +1537,17 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 "wager": self.state.wager,
                 "wager_reward_shadow": self.state.wager_reward_shadow,
                 "wager_metadata": self.state.wager_metadata,
+                "time_accounting": self.get_time_accounting_metadata(),
             }
+            if self.config.deterministic:
+                score_info |= {
+                    "deterministic": True,
+                    "env_idx": self.config.env_idx,
+                    "base_seed": self.config.seed,
+                    "kernel_seed": self.kernel_seed,
+                    "scheduler_seed": self.scheduler_seed,
+                    "rubric_seed": self.config.rubric_seed,
+                }
             with self.score_info_path.open("w") as f:
                 json.dump(score_info, f, indent=2, default=str)
 
@@ -1505,10 +1579,169 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
     # ========== Time Management ==========
 
+    def _reset_episode_time_accounting(self) -> None:
+        """Reset wall, kernel-execution, and simulated-generation counters."""
+        self.start_time = time.perf_counter()
+        self._kernel_execution_seconds = 0.0
+        self._simulated_generation_seconds = 0.0
+        self._policy_generation_count = 0
+        self._policy_generation_output_tokens = 0
+        self._duplicate_generation_accounting_suppressed = 0
+        self._accounted_generation_ids.clear()
+        self._unreported_execution_time_count = 0
+        self._unreported_execution_observed_seconds = 0.0
+        self._duplicate_execution_accounting_suppressed = 0
+        self._accounted_execution_ids.clear()
+
+    def _record_policy_generation(self, action: ToolRequestMessage | None = None) -> float:
+        """Charge model turns preceding an environment step and return their seconds."""
+        accounting = self.execution_config.time_accounting
+        latency = (
+            accounting.generation_latency
+            if isinstance(accounting, cfg.KernelExecutionTimeAccountingConfig)
+            else None
+        )
+        turns = model_turns_from_action_info(action.info if action is not None else None)
+
+        if isinstance(latency, cfg.TokenThroughputGenerationLatencyConfig):
+            if not turns:
+                raise ValueError("token_throughput generation latency requires NeMo Gym model-turn metadata")
+            missing_usage = [turn.response_id for turn in turns if turn.usage is None]
+            if missing_usage:
+                raise ValueError(
+                    "token_throughput generation latency requires output-token usage for responses: "
+                    + ", ".join(missing_usage)
+                )
+
+        # Legacy callers do not provide turn metadata. Preserve one generation
+        # per environment step for all pre-existing accounting modes.
+        candidates = turns or [None]
+        unique_turns = []
+        seen_in_request: set[str] = set()
+        for turn in candidates:
+            response_id = None if turn is None else turn.response_id
+            if response_id is not None and (
+                response_id in self._accounted_generation_ids or response_id in seen_in_request
+            ):
+                self._duplicate_generation_accounting_suppressed += 1
+                self.logger.warning("Suppressed duplicate generation-time charge for response %s", response_id)
+                continue
+            if response_id is not None:
+                seen_in_request.add(response_id)
+            unique_turns.append(turn)
+
+        self._accounted_generation_ids.update(seen_in_request)
+        self._policy_generation_count += len(unique_turns)
+        output_tokens = sum(
+            turn.usage.output_tokens
+            for turn in unique_turns
+            if turn is not None and turn.usage is not None
+        )
+        self._policy_generation_output_tokens += output_tokens
+
+        if isinstance(latency, cfg.GenerationLatencyEstimateConfig):
+            seconds = float(latency.seconds_per_generation) * len(unique_turns)
+        elif isinstance(latency, cfg.TokenThroughputGenerationLatencyConfig):
+            seconds = output_tokens / float(latency.output_tokens_per_second)
+        else:
+            seconds = 0.0
+        self._simulated_generation_seconds += seconds
+        return seconds
+
+    def _record_kernel_execution(
+        self,
+        reported_seconds: float | None,
+        observed_seconds: float,
+        *,
+        logical_execution_id: str,
+    ) -> float:
+        """Record one logical cell once, never charging client-side wait/retry time."""
+        if logical_execution_id in self._accounted_execution_ids:
+            self._duplicate_execution_accounting_suppressed += 1
+            self.logger.warning("Suppressed duplicate execution-time charge for request %s", logical_execution_id)
+            return 0.0
+        self._accounted_execution_ids.add(logical_execution_id)
+
+        if reported_seconds is None or not math.isfinite(reported_seconds) or reported_seconds < 0:
+            observed = observed_seconds if math.isfinite(observed_seconds) and observed_seconds > 0 else 0.0
+            self._unreported_execution_time_count += 1
+            self._unreported_execution_observed_seconds += observed
+            self.logger.warning(
+                "Execution backend returned invalid execution_time=%r; not charging %.3fs of client-observed wait time",
+                reported_seconds,
+                observed,
+            )
+            return 0.0
+
+        seconds = float(reported_seconds)
+        self._kernel_execution_seconds += seconds
+        return seconds
+
+    async def _execute_and_account_cell(
+        self,
+        code: str,
+        *,
+        cell_idx: int | None,
+        timeout: float | None,
+        req_uuid: str = "",
+    ) -> tuple[ExecutionResult, int]:
+        """Execute one cell and add its kernel-reported duration to the episode clock."""
+        logical_execution_id = req_uuid or str(uuid.uuid4())
+        observed_start = time.perf_counter()
+        result, actual_cell_idx = await self.state.execute_and_add_cell(
+            code,
+            cell_idx=cell_idx,
+            timeout=timeout,
+            req_uuid=logical_execution_id,
+        )
+        self._record_kernel_execution(
+            result.execution_time,
+            time.perf_counter() - observed_start,
+            logical_execution_id=logical_execution_id,
+        )
+        return result, actual_cell_idx
+
+    def get_elapsed_time(self) -> float:
+        """Return elapsed episode time under the configured accounting policy."""
+        accounting = self.execution_config.time_accounting
+        if isinstance(accounting, cfg.WallClockTimeAccountingConfig):
+            return 0.0 if self.start_time is None else max(0.0, time.perf_counter() - self.start_time)
+        return self._kernel_execution_seconds + self._simulated_generation_seconds
+
+    def get_time_accounting_metadata(self) -> dict[str, Any]:
+        """Return auditable wall and accounted-time totals for rollout artifacts."""
+        accounting = self.execution_config.time_accounting
+        wall_elapsed = 0.0 if self.start_time is None else max(0.0, time.perf_counter() - self.start_time)
+        elapsed = (
+            wall_elapsed
+            if isinstance(accounting, cfg.WallClockTimeAccountingConfig)
+            else self._kernel_execution_seconds + self._simulated_generation_seconds
+        )
+        generation_latency = (
+            accounting.generation_latency.model_dump(mode="json")
+            if isinstance(accounting, cfg.KernelExecutionTimeAccountingConfig)
+            else None
+        )
+        return {
+            "mode": accounting.mode,
+            "budget_seconds": self.execution_config.job_timeout,
+            "elapsed_seconds": elapsed,
+            "remaining_seconds": self.execution_config.job_timeout - elapsed,
+            "wall_clock_elapsed_seconds": wall_elapsed,
+            "kernel_execution_seconds": self._kernel_execution_seconds,
+            "simulated_generation_seconds": self._simulated_generation_seconds,
+            "policy_generation_count": self._policy_generation_count,
+            "policy_generation_output_tokens": self._policy_generation_output_tokens,
+            "duplicate_generation_accounting_suppressed": self._duplicate_generation_accounting_suppressed,
+            "unreported_execution_time_count": self._unreported_execution_time_count,
+            "unreported_execution_observed_seconds": self._unreported_execution_observed_seconds,
+            "duplicate_execution_accounting_suppressed": self._duplicate_execution_accounting_suppressed,
+            "generation_latency": generation_latency,
+        }
+
     def get_remaining_time(self) -> int:
         """Get remaining execution time in seconds."""
-        elapsed = 0 if self.start_time is None else time.perf_counter() - self.start_time
-        return int(self.execution_config.job_timeout - elapsed)
+        return int(self.execution_config.job_timeout - self.get_elapsed_time())
 
     def get_time_management_message(self) -> Message | None:
         """Get a time management message if thresholds are reached."""
@@ -1567,6 +1800,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 "work_dir": self.work_dir,
                 "input_data": self.input_data,
                 "output_data": self.output_data,
+                "time_accounting": self.get_time_accounting_metadata(),
             },
         )
 

@@ -1,7 +1,8 @@
 import os
 from pathlib import Path
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "30"))
 
@@ -49,8 +50,66 @@ FORCE_MSG = (
 WARN_MSG = "Warning: {remaining} seconds remaining. Plan to submit your current findings as an answer soon."
 
 
+class _TimeConfig(BaseModel):
+    """Strict immutable base for the episode-time configuration union."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class NoGenerationLatencyConfig(_TimeConfig):
+    """Do not charge simulated policy-generation latency."""
+
+    mode: Literal["none"] = "none"
+
+
+class GenerationLatencyEstimateConfig(_TimeConfig):
+    """Charge one supplied latency estimate for each environment step.
+
+    ``rolling_mean`` and ``rolling_p95`` record the provenance of a snapshot
+    supplied by generation-server metrics; all three modes charge the given
+    constant rather than inventing a distribution from aggregate statistics.
+    """
+
+    mode: Literal["fixed", "rolling_mean", "rolling_p95"]
+    seconds_per_generation: float = Field(gt=0, allow_inf_nan=False)
+
+
+class TokenThroughputGenerationLatencyConfig(_TimeConfig):
+    """Charge latency from server-reported output tokens at fixed throughput."""
+
+    mode: Literal["token_throughput"]
+    output_tokens_per_second: float = Field(gt=0, allow_inf_nan=False)
+
+
+GenerationLatencyConfig = Annotated[
+    NoGenerationLatencyConfig | GenerationLatencyEstimateConfig | TokenThroughputGenerationLatencyConfig,
+    Field(discriminator="mode"),
+]
+
+
+class WallClockTimeAccountingConfig(_TimeConfig):
+    """Preserve historical accounting based on wall-clock time since reset."""
+
+    mode: Literal["wall_clock"] = "wall_clock"
+
+
+class KernelExecutionTimeAccountingConfig(_TimeConfig):
+    """Count kernel-reported execution plus optional simulated generation time."""
+
+    mode: Literal["kernel_execution"] = "kernel_execution"
+    generation_latency: GenerationLatencyConfig = Field(default_factory=NoGenerationLatencyConfig)
+
+
+TimeAccountingConfig = Annotated[
+    WallClockTimeAccountingConfig | KernelExecutionTimeAccountingConfig,
+    Field(discriminator="mode"),
+]
+
+
 class ExecutionConfig(BaseModel):
     """Execution environment configuration - varies by deployment profile."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     # Timing
     # ! THRESHOLD = SECONDS BEFORE TIMEOUT
@@ -58,6 +117,7 @@ class ExecutionConfig(BaseModel):
     warn_submit_threshold: int = 20 * 60
     force_submit_threshold: int = 10 * 60
     cell_execution_timeout: int = 15 * 60
+    time_accounting: TimeAccountingConfig = Field(default_factory=WallClockTimeAccountingConfig)
 
     # safety
     safe_execute: bool = os.getenv("SAFE_EXECUTE_SANDBOX", "").lower() == "true"

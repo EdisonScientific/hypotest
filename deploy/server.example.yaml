@@ -25,10 +25,22 @@ dataset:
   use_ray: false
   force_python: true
 
+  # Best-effort reproducibility: derive independent kernel, placement, and
+  # rubric-model seeds from (seed, env_idx).
+  deterministic: true
+  seed: 1234
+
   execution_config:
     # Enables the code-safety filter (the guardrail for the in-process model).
     safe_execute: true
     cell_execution_timeout: 600
+    # Ignore rollout-server queue latency. Charge kernel execution plus one
+    # supplied rolling generation-latency estimate per policy step.
+    time_accounting:
+      mode: kernel_execution
+      generation_latency:
+        mode: rolling_p95
+        seconds_per_generation: 12.5
 
 # Value, or the NAME of an env var holding the key (resolved via os.getenv).
 api_key: HYPOTEST_SERVER_API_KEY

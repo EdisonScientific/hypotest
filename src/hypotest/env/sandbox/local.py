@@ -28,6 +28,7 @@ class LocalSandbox(Sandbox):
             execution_timeout=config.execution_timeout,
             use_host_env_vars=config.use_host_env_vars,
             extra_envs=config.extra_envs or None,
+            seed=config.seed,
         )
         self._filesystem = FilesystemTool(config.work_dir)
 

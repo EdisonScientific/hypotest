@@ -21,18 +21,18 @@ def _ok_handler(method, endpoint, **kwargs):
     if endpoint == "/health":
         return httpx.Response(200, json={"protocol_version": 1})
     if endpoint == "/load_capsule":
-        return httpx.Response(200, json={"objects": 3})
+        return httpx.Response(200, json={"objects": 3, "seed": kwargs.get("json", {}).get("seed")})
     if endpoint == "/execute":
         return httpx.Response(200, json={"notebook_outputs": [], "error_occurred": False, "execution_time": 0.0})
     if endpoint == "/reset":
-        return httpx.Response(200, json={"success": True})
+        return httpx.Response(200, json={"success": True, "seed": kwargs.get("json", {}).get("seed")})
     if endpoint == "/list_dir":
         return httpx.Response(200, json={"listing": "a.txt"})
     return httpx.Response(404)
 
 
-def _k8s(tmp_path, fake, ref=None):
-    config = SandboxConfig(work_dir=tmp_path, language=NBLanguage.PYTHON, ref=ref or CapsuleRef())
+def _k8s(tmp_path, fake, ref=None, seed=None):
+    config = SandboxConfig(work_dir=tmp_path, language=NBLanguage.PYTHON, ref=ref or CapsuleRef(), seed=seed)
     sandbox = K8sSandbox(config, K8sSandboxSpec(template="py-sandbox", warmpool="wp"))
 
     # bypass the real SDK; return the injected fake AsyncSandbox
@@ -61,6 +61,38 @@ async def test_start_skips_load_capsule_without_uuid(tmp_path, make_fake_sandbox
     sandbox = _k8s(tmp_path, fake, ref=CapsuleRef())
     await sandbox.start()
     assert "/load_capsule" not in [e for _, e in fake.connector.calls]
+    await sandbox.close()
+
+
+@pytest.mark.asyncio
+async def test_start_configures_seed_on_capsule_load(tmp_path, make_fake_sandbox):
+    captured: dict[str, object] = {}
+
+    def handler(method, endpoint, **kwargs):
+        if endpoint == "/load_capsule":
+            captured.update(kwargs)
+        return _ok_handler(method, endpoint, **kwargs)
+
+    fake = make_fake_sandbox(handler)
+    sandbox = _k8s(tmp_path, fake, ref=CapsuleRef(uuid="cap-1"), seed=789)
+    await sandbox.start()
+    assert captured["json"] == {"capsule_uuid": "cap-1", "seed": 789}
+    await sandbox.close()
+
+
+@pytest.mark.asyncio
+async def test_start_configures_seed_without_capsule(tmp_path, make_fake_sandbox):
+    captured: dict[str, object] = {}
+
+    def handler(method, endpoint, **kwargs):
+        if endpoint == "/reset":
+            captured.update(kwargs)
+        return _ok_handler(method, endpoint, **kwargs)
+
+    fake = make_fake_sandbox(handler)
+    sandbox = _k8s(tmp_path, fake, seed=790)
+    await sandbox.start()
+    assert captured["json"] == {"seed": 790}
     await sandbox.close()
 
 

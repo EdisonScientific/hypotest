@@ -382,6 +382,9 @@ class SandboxConfig:
     use_docker: bool = False
     use_enroot: bool = False
     use_ray: bool = True
+    # Per-environment kernel RNG seed. None preserves the historical,
+    # entropy-seeded behavior.
+    seed: int | None = None
 
 
 class Sandbox(ABC):

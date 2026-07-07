@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import re
 import time
 import uuid
@@ -34,6 +35,45 @@ class DeadlineExceededError(Exception):
 
 
 logger = logging.getLogger(__name__)
+
+
+def deterministic_kernel_env(seed: int) -> dict[str, str]:
+    """Environment variables that must be fixed before the kernel process starts."""
+    return {
+        "PYTHONHASHSEED": str(seed),
+        "HYPOTEST_SEED": str(seed),
+        # Required by deterministic CUDA matrix operations when CUDA is used.
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    }
+
+
+def rng_bootstrap_code(language: NBLanguage, seed: int) -> str:
+    """Return hidden startup code that seeds common RNGs without a notebook cell."""
+    if language == NBLanguage.R:
+        return (
+            'RNGkind(kind = "Mersenne-Twister", normal.kind = "Inversion", sample.kind = "Rejection")\n'
+            f"set.seed({seed})"
+        )
+
+    return f"""
+def _hypotest_seed_all_rngs():
+    import random
+
+    try:
+        import numpy
+    except ImportError:
+        numpy = None
+
+    # Import first, then seed: module import side effects cannot advance the
+    # initialized streams before the policy's first cell.
+    random.seed({seed})
+    if numpy is not None:
+        numpy.random.seed({seed})
+
+_hypotest_seed_all_rngs()
+del _hypotest_seed_all_rngs
+""".strip()
+
 
 # Wire-protocol version for the kernel-server HTTP API. Bump on a breaking change
 # to /execute, /reset, /list_dir, /load_capsule, or /health; the client
@@ -197,6 +237,15 @@ class ResetResponse(BaseModel):
     """Response model for /reset endpoint."""
 
     success: bool
+    # Echo the seed actually retained by the server. Deterministic clients
+    # validate it so a stale additive-only server cannot ignore their seed.
+    seed: int | None = None
+
+
+class ResetRequest(BaseModel):
+    """Optional deterministic seed update for /reset."""
+
+    seed: int | None = None
 
 
 class HealthResponse(BaseModel):
@@ -243,12 +292,14 @@ class KernelServer:
         default_timeout: float = 600,
         startup_token: str = "",
         safe_execute: bool = True,
+        seed: int | None = None,
     ):
         self.work_dir = work_dir
         self.language = language
         self.default_timeout = default_timeout
         self.startup_token = startup_token
         self.safe_execute = safe_execute
+        self.seed = seed
 
         self._kernel_manager: AsyncKernelManager | None = None
         self._client: AsyncKernelClient | None = None
@@ -269,13 +320,24 @@ class KernelServer:
         self._kernel_manager = AsyncKernelManager(
             kernel_name=kernel_name, transport="ipc", connection_file=str(kernel_connect_file)
         )
-        await self._kernel_manager.start_kernel(cwd=str(self.work_dir))
+        kernel_env = os.environ.copy()
+        if self.seed is not None:
+            kernel_env.update(deterministic_kernel_env(self.seed))
+        await self._kernel_manager.start_kernel(cwd=str(self.work_dir), env=kernel_env)
 
         self._client = self._kernel_manager.client()
         self._client.start_channels()
 
         try:
             await self._client.wait_for_ready()
+            if self.seed is not None:
+                bootstrap = await self._execute_code(
+                    rng_bootstrap_code(self.language, self.seed),
+                    deadline=time.perf_counter() + self.default_timeout,
+                    store_history=False,
+                )
+                if bootstrap.error_occurred:
+                    raise RuntimeError("Deterministic kernel RNG bootstrap failed")
             self._is_ready = True
             logger.info(f"Kernel {kernel_name} started in {self.work_dir}")
         except Exception as e:
@@ -335,7 +397,7 @@ class KernelServer:
 
         return result
 
-    async def _execute_code(self, code: str, deadline: float) -> ExecuteResponse:
+    async def _execute_code(self, code: str, deadline: float, *, store_history: bool = True) -> ExecuteResponse:
         """Internal method to execute code and collect outputs.
 
         Uses cooperative deadline checking instead of asyncio.timeout, because
@@ -351,7 +413,10 @@ class KernelServer:
         POLL_INTERVAL_S = 2.0
 
         start_time = time.perf_counter()
-        msg_id = self._client.execute(code)
+        # Bootstrap calls disable history so they do not consume a visible
+        # notebook execution count. Keep IOPub enabled so startup errors are
+        # still observable and can fail the kernel start.
+        msg_id = self._client.execute(code, store_history=store_history)
 
         notebook_outputs: list[dict[str, Any]] = []
         error_occurred = False
@@ -398,8 +463,10 @@ class KernelServer:
             execution_time=execution_time,
         )
 
-    async def reset(self) -> ResetResponse:
+    async def reset(self, seed: int | None = None) -> ResetResponse:
         """Reset the kernel to a clean state."""
+        if seed is not None:
+            self.seed = seed
         if self._is_ready and self._kernel_manager:
             if self._client:
                 self._client.stop_channels()
@@ -409,7 +476,7 @@ class KernelServer:
             self._is_ready = False
 
         await self.start()
-        return ResetResponse(success=True)
+        return ResetResponse(success=True, seed=self.seed)
 
     async def close(self) -> None:
         """Shutdown the kernel."""
@@ -461,8 +528,8 @@ def create_app(server: KernelServer) -> FastAPI:
         return await server.execute(req.code, req.timeout)
 
     @app.post("/reset")
-    async def reset() -> ResetResponse:
-        return await server.reset()
+    async def reset(req: ResetRequest | None = None) -> ResetResponse:
+        return await server.reset(req.seed if req is not None else None)
 
     @app.get("/health")
     async def health() -> HealthResponse:
@@ -480,9 +547,15 @@ def create_app(server: KernelServer) -> FastAPI:
     return app
 
 
-async def run_server(work_dir: Path, language: NBLanguage, port: int = 8000, startup_token: str = "") -> None:
+async def run_server(
+    work_dir: Path,
+    language: NBLanguage,
+    port: int = 8000,
+    startup_token: str = "",
+    seed: int | None = None,
+) -> None:
     """Start the kernel server."""
-    server = KernelServer(work_dir, language, startup_token=startup_token)
+    server = KernelServer(work_dir, language, startup_token=startup_token, seed=seed)
     await server.start()
 
     app = create_app(server)
@@ -504,7 +577,8 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--startup-token", type=str, default="")
     parser.add_argument("--safe-execute", action="store_true")
+    parser.add_argument("--seed", type=int)
     args = parser.parse_args()
 
     language = NBLanguage.PYTHON if args.language == "python" else NBLanguage.R
-    asyncio.run(run_server(args.work_dir, language, args.port, args.startup_token))
+    asyncio.run(run_server(args.work_dir, language, args.port, args.startup_token, args.seed))

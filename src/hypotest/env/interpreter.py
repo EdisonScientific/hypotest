@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import config as cfg
 from . import utils
-from .kernel_server import MessageType
+from .kernel_server import MessageType, deterministic_kernel_env, rng_bootstrap_code
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +207,7 @@ class Interpreter:
         execution_timeout: float = 600,
         use_host_env_vars: bool = False,
         extra_envs: dict[str, str] | None = None,
+        seed: int | None = None,
     ):
         """Initialize the interpreter.
 
@@ -216,12 +217,14 @@ class Interpreter:
             execution_timeout: Timeout for code execution in seconds
             use_host_env_vars: Whether to use host environment variables
             extra_envs: Additional environment variables to pass to the kernel
+            seed: Optional deterministic seed applied at every kernel start
         """
         self.work_dir = work_dir
         self.language = language
         self.execution_timeout = execution_timeout
         self.use_host_env_vars = use_host_env_vars
         self.extra_envs = extra_envs or {}
+        self.seed = seed
 
         # Execution state
         self.execution_history: list[ExecutionResult] = []
@@ -250,12 +253,22 @@ class Interpreter:
         else:
             kwargs["env"] = os.environ | self.extra_envs
 
+        if self.seed is not None:
+            kwargs["env"].update(deterministic_kernel_env(self.seed))
+
         await self.kernel_manager.start_kernel(**kwargs)
         self.client = self.kernel_manager.client()
         self.client.start_channels()
 
         try:
             await self.client.wait_for_ready()
+            if self.seed is not None:
+                bootstrap = await self._execute_code(
+                    rng_bootstrap_code(self.language, self.seed),
+                    store_history=False,
+                )
+                if bootstrap.error_occurred:
+                    raise RuntimeError("Deterministic kernel RNG bootstrap failed")
             self._is_ready = True
             logger.debug(f"Kernel {kernel_name} started successfully in {self.work_dir}")
         except Exception as e:
@@ -273,7 +286,7 @@ class Interpreter:
             debug_str = "; ".join(debug_info) if debug_info else "no debug info"
             raise RuntimeError(f"Kernel failed to start: {e} ({debug_str})") from e
 
-    async def _execute_code(self, code: str) -> ExecutionResult:
+    async def _execute_code(self, code: str, *, store_history: bool = True) -> ExecutionResult:
         """Internal method to execute code and collect outputs.
 
         Uses MessageType.to_notebook_output to convert kernel messages
@@ -283,7 +296,10 @@ class Interpreter:
             raise ValueError("Kernel client not initialized")
 
         start_time = time.perf_counter()
-        msg_id = self.client.execute(code)
+        # Bootstrap calls disable history so they do not consume a visible
+        # notebook execution count. Keep IOPub enabled so startup errors are
+        # still observable and can fail the kernel start.
+        msg_id = self.client.execute(code, store_history=store_history)
         logger.debug(f"Executing code with message ID: {msg_id}")
 
         notebook_outputs: list[NotebookNode] = []
@@ -352,6 +368,7 @@ class Interpreter:
 
         # Use provided timeout or fall back to instance default
         timeout = execution_timeout if execution_timeout is not None else self.execution_timeout
+        execution_started_at = time.perf_counter()
 
         try:
             async with asyncio.timeout(timeout):
@@ -365,6 +382,7 @@ class Interpreter:
             result = ExecutionResult(
                 notebook_outputs=[cast(NotebookNode, timeout_output)],
                 error_occurred=True,
+                execution_time=time.perf_counter() - execution_started_at,
             )
         except Exception as e:
             error_output = MessageType.ERROR.to_notebook_output({
@@ -375,6 +393,7 @@ class Interpreter:
             result = ExecutionResult(
                 notebook_outputs=[cast(NotebookNode, error_output)],
                 error_occurred=True,
+                execution_time=time.perf_counter() - execution_started_at,
             )
 
         self.execution_history.append(result)

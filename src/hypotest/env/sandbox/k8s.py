@@ -242,6 +242,7 @@ class K8sSandbox(Sandbox):
         self._ref = config.ref
         self._job_id = config.job_id
         self._execution_timeout = config.execution_timeout
+        self._seed = config.seed
         self._spec = spec
         self._sandbox: Any = None  # agent-sandbox AsyncSandbox handle
         self._sdk_client: Any = None  # agent-sandbox AsyncSandboxClient (owns the k8s API client)
@@ -257,7 +258,11 @@ class K8sSandbox(Sandbox):
             )
             await self._await_kernel_ready()
             if self._ref.uuid:
-                await self._client.load_capsule(self._ref.uuid)
+                await self._client.load_capsule(self._ref.uuid, self._seed)
+            elif self._seed is not None:
+                # Warm pods start before an env index is assigned. Configure and
+                # restart the kernel now when there is no capsule-triggered reset.
+                await self._client.reset(self._seed)
         except BaseException:
             # Failed after claiming the pod — terminate it so we don't leak (ADR §7).
             await self.close()
@@ -316,7 +321,7 @@ class K8sSandbox(Sandbox):
 
     async def reset(self) -> None:
         assert self._client is not None
-        await self._client.reset()
+        await self._client.reset(self._seed)
 
     async def list_dir(self, directory: str = ".", max_files: int = 20, show_hidden: bool = False) -> str:
         assert self._client is not None

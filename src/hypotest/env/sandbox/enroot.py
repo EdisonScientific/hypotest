@@ -88,12 +88,14 @@ class EnrootKernelServer:
         safe_execute: bool = True,
         sandbox_memory_limit_mb: int | None = None,
         sandbox_max_pids: int | None = None,
+        seed: int | None = None,
     ):
         self.container_sqsh_path = container_sqsh_path
         self.execution_timeout = execution_timeout
         self.safe_execute = safe_execute
         self.sandbox_memory_limit_mb = sandbox_memory_limit_mb
         self.sandbox_max_pids = sandbox_max_pids
+        self.seed = seed
         self._enroot_proc: asyncio.subprocess.Process | None = None
         self._http_client: httpx.AsyncClient | None = None
         self._kernel_client: HttpKernelClient | None = None
@@ -135,10 +137,16 @@ class EnrootKernelServer:
 
     @staticmethod
     def _build_kernel_bash_script(
-        node_workdir: str, language: NBLanguage, port: int, startup_token: str, safe_execute: bool = True
+        node_workdir: str,
+        language: NBLanguage,
+        port: int,
+        startup_token: str,
+        safe_execute: bool = True,
+        seed: int | None = None,
     ) -> str:
         """Build the bash script that sets up the workspace and launches the kernel server."""
         exports = bash_export_block("$WORKDIR")
+        seed_arg = f"--seed {seed}" if seed is not None else ""
         script = dedent(f"""\
             set -euo pipefail
 
@@ -165,7 +173,7 @@ class EnrootKernelServer:
                 --work_dir $WORKDIR \\
                 --language {language.value} \\
                 --port {port} \\
-                --startup-token {startup_token} {"--safe-execute" if safe_execute else ""}
+                --startup-token {startup_token} {"--safe-execute" if safe_execute else ""} {seed_arg}
         """).strip()
         return script.replace("__WORKSPACE_EXPORTS__", exports)
 
@@ -257,7 +265,12 @@ class EnrootKernelServer:
 
             node_workdir.mkdir(parents=True, exist_ok=True)
             bash = self._build_kernel_bash_script(
-                str(node_workdir), language, self._container_port, startup_token, safe_execute=self.safe_execute
+                str(node_workdir),
+                language,
+                self._container_port,
+                startup_token,
+                safe_execute=self.safe_execute,
+                seed=self.seed,
             )
             cmd = self._build_enroot_cmd(
                 work_dir,
@@ -429,7 +442,7 @@ class EnrootKernelServer:
     async def _reset_via_http(self) -> None:
         """Reset the kernel via the shared kernel HTTP client."""
         assert self._kernel_client is not None
-        await self._kernel_client.reset()
+        await self._kernel_client.reset(self.seed)
 
     async def _list_dir_on_node(
         self,
@@ -513,6 +526,7 @@ class EnrootSandbox(Sandbox):
         self._safe_execute = config.safe_execute
         self._mem_mb = config.resources.mem_mb
         self._max_pids = config.resources.max_pids
+        self._seed = config.seed
 
         # ray placement
         self.kernel_container: Any = None
@@ -540,6 +554,7 @@ class EnrootSandbox(Sandbox):
             safe_execute=self._safe_execute,
             sandbox_memory_limit_mb=self._mem_mb,
             sandbox_max_pids=self._max_pids,
+            seed=self._seed,
         )
         init_ref = self.kernel_container.initialize.remote(self.work_dir, self.language)
         await self._await_ray_ref(
@@ -547,7 +562,7 @@ class EnrootSandbox(Sandbox):
             timeout=cfg.KERNEL_SERVER_STARTUP_TIMEOUT,
             req_uuid=f"init:{self.work_dir.name}",
             operation="initialize",
-            max_retries=1,
+            max_wait_attempts=1,
         )
         logger.warning("[ray-enroot] initialize complete for work_dir=%s", self.work_dir)
 
@@ -572,6 +587,7 @@ class EnrootSandbox(Sandbox):
             resource_prefix = _build_resource_limit_prefix(self._mem_mb, self._max_pids)
 
             exports = bash_export_block("/data_workspace")
+            seed_arg = f"--seed {self._seed}" if self._seed is not None else ""
             bash = (
                 dedent(f"""\
                 set -euo pipefail
@@ -585,7 +601,7 @@ class EnrootSandbox(Sandbox):
                     --work_dir /data_workspace \\
                     --language {self.language.value} \\
                     --port {self._container_port} \\
-                    --startup-token {startup_token} {"--safe-execute" if self._safe_execute else ""}
+                    --startup-token {startup_token} {"--safe-execute" if self._safe_execute else ""} {seed_arg}
             """)
                 .strip()
                 .replace("__WORKSPACE_EXPORTS__", exports)
@@ -688,7 +704,7 @@ class EnrootSandbox(Sandbox):
             await self.kernel_container._reset_via_http.remote()
             return
         assert self._client is not None
-        await self._client.reset()
+        await self._client.reset(self._seed)
 
     async def list_dir(self, directory: str = ".", max_files: int = 20, show_hidden: bool = False) -> str:
         if self._use_ray:
@@ -701,7 +717,11 @@ class EnrootSandbox(Sandbox):
             return cast(
                 str,
                 await self._await_ray_ref(
-                    ref, timeout=_LIST_DIR_RAY_TIMEOUT, req_uuid=list_dir_uuid, operation="list_dir", max_retries=2
+                    ref,
+                    timeout=_LIST_DIR_RAY_TIMEOUT,
+                    req_uuid=list_dir_uuid,
+                    operation="list_dir",
+                    max_wait_attempts=2,
                 ),
             )
         return self._filesystem.list_dir(directory, max_files, show_hidden)
@@ -746,38 +766,41 @@ class EnrootSandbox(Sandbox):
         timeout: float | None,  # noqa: ASYNC109
         req_uuid: str,
         operation: str,
-        max_retries: int = MAX_RAY_RESULT_WAIT_RETRIES,
+        max_wait_attempts: int = MAX_RAY_RESULT_WAIT_RETRIES,
     ) -> Any:
         effective_timeout = timeout if timeout is not None else self._execution_timeout
         wait_timeout = effective_timeout + _RAY_RESULT_WAIT_TIMEOUT_GRACE
         last_timeout: TimeoutError | None = None
-        for attempt in range(1, max_retries + 1):
+        for attempt in range(1, max_wait_attempts + 1):
             try:
+                # Retry waiting on the same underlying, shielded ObjectRef. Never call the
+                # actor method again: that could execute a non-idempotent cell
+                # multiple times and must not create additional time charges.
                 return await asyncio.wait_for(asyncio.shield(ref), timeout=wait_timeout)
             except TimeoutError as exc:
                 last_timeout = exc
-                if attempt >= max_retries:
+                if attempt >= max_wait_attempts:
                     logger.exception(
                         "[ray-enroot] req %s exhausted waits for %s on work_dir=%s (attempts=%d, timeout=%.1fs)",
                         req_uuid,
                         operation,
                         self.work_dir,
-                        max_retries,
+                        max_wait_attempts,
                         wait_timeout,
                     )
                     break
                 backoff = min(_RETRY_BASE_SLEEP * 2 ** (attempt - 1), _RETRY_MAX_SLEEP)
                 logger.warning(
-                    "[ray-enroot] req %s timed out waiting for %s (attempt #%d/%d); retrying in %.1fs",
+                    "[ray-enroot] req %s timed out waiting for %s (wait #%d/%d); waiting again in %.1fs",
                     req_uuid,
                     operation,
                     attempt,
-                    max_retries,
+                    max_wait_attempts,
                     backoff,
                 )
                 await asyncio.sleep(backoff)
         raise TimeoutError(
-            f"Timed out waiting for ray {operation} after {max_retries} attempts "
+            f"Timed out waiting for ray {operation} after {max_wait_attempts} wait attempts "
             f"(req={req_uuid}, timeout_per_attempt={wait_timeout:.1f}s)"
         ) from last_timeout
 

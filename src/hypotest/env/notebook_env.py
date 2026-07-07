@@ -62,8 +62,10 @@ class NotebookEnv(InterpreterEnv):
                 cell_idx = None
 
         # Execute code and update notebook atomically
-        result, actual_cell_idx = await self.state.execute_and_add_cell(
-            code, cell_idx=cell_idx, timeout=effective_timeout
+        result, actual_cell_idx = await self._execute_and_account_cell(
+            code,
+            cell_idx=cell_idx,
+            timeout=effective_timeout,
         )
 
         if result.error_occurred:
@@ -72,6 +74,7 @@ class NotebookEnv(InterpreterEnv):
 
     async def step(self, action: ToolRequestMessage) -> tuple[Messages, float, bool, bool]:
         """Execute a step in the environment."""
+        self._record_policy_generation()
         self.step_count += 1
         obs = cast(
             Messages,

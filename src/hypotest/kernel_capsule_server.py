@@ -38,12 +38,14 @@ logger = logging.getLogger(__name__)
 
 class LoadCapsuleRequest(BaseModel):
     capsule_uuid: str
+    seed: int | None = None
 
 
 class LoadCapsuleResponse(BaseModel):
     success: bool
     capsule_uuid: str
     objects: int
+    seed: int | None = None
 
 
 def _clear_dir(path: Path) -> None:
@@ -77,6 +79,7 @@ async def run_server(
     startup_token: str = "",
     safe_execute: bool = True,
     pip_index_url: str | None = None,
+    seed: int | None = None,
 ) -> None:
     work_dir.mkdir(parents=True, exist_ok=True)
     # Lay down the same workspace install model as the enroot path (shim + pydeps +
@@ -84,7 +87,7 @@ async def run_server(
     # The workspace pip.conf overrides /etc/pip.conf, so re-state the cutoff index-url.
     install_shim.write_workspace_config(work_dir, str(work_dir), index_url=pip_index_url)
     _apply_workspace_env(work_dir)
-    server = KernelServer(work_dir, language, startup_token=startup_token, safe_execute=safe_execute)
+    server = KernelServer(work_dir, language, startup_token=startup_token, safe_execute=safe_execute, seed=seed)
     await server.start()
     app = create_app(server)
 
@@ -94,6 +97,8 @@ async def run_server(
         # Stop the kernel (release its files in work_dir), swap in the capsule,
         # then restart the kernel in the repopulated workspace. The pull is
         # offloaded so a large download does not block the event loop.
+        if req.seed is not None:
+            server.seed = req.seed
         await server.close()
         _clear_dir(work_dir)
         count = await asyncio.to_thread(s3_sync.pull_latest_capsule, capsule_source, req.capsule_uuid, work_dir)
@@ -101,7 +106,12 @@ async def run_server(
         install_shim.write_workspace_config(work_dir, str(work_dir), index_url=pip_index_url)
         await server.start()
         logger.warning("Loaded capsule %s (%d objects) into %s", req.capsule_uuid, count, work_dir)
-        return LoadCapsuleResponse(success=True, capsule_uuid=req.capsule_uuid, objects=count)
+        return LoadCapsuleResponse(
+            success=True,
+            capsule_uuid=req.capsule_uuid,
+            objects=count,
+            seed=server.seed,
+        )
 
     config = uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio")  # noqa: S104
     await uvicorn.Server(config).serve()
@@ -121,6 +131,7 @@ def main() -> None:
     )
     parser.add_argument("--startup-token", type=str, default="")
     parser.add_argument("--safe-execute", action="store_true")
+    parser.add_argument("--seed", type=int)
     parser.add_argument(
         "--pip-index-url",
         type=str,
@@ -141,6 +152,7 @@ def main() -> None:
             args.startup_token,
             safe_execute=args.safe_execute,
             pip_index_url=args.pip_index_url or None,
+            seed=args.seed,
         )
     )
 

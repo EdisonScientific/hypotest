@@ -3,7 +3,14 @@
 import httpx
 import pytest
 
-from hypotest.env.kernel_server import PROTOCOL_VERSION, HealthResponse, KernelServer, NBLanguage, create_app
+from hypotest.env.kernel_server import (
+    PROTOCOL_VERSION,
+    HealthResponse,
+    KernelServer,
+    NBLanguage,
+    ResetResponse,
+    create_app,
+)
 from hypotest.env.tools.filesystem import list_dir_tool
 
 
@@ -56,3 +63,23 @@ async def test_list_dir_and_health_endpoints(tmp_path):
 
         health = await client.get("/health")
         assert health.json()["protocol_version"] == PROTOCOL_VERSION
+
+
+@pytest.mark.asyncio
+async def test_reset_endpoint_accepts_seed(tmp_path, monkeypatch):
+    server = _server(tmp_path)
+    captured: list[int | None] = []
+
+    async def fake_reset(seed=None):  # noqa: RUF029
+        captured.append(seed)
+        return ResetResponse(success=True, seed=seed)
+
+    monkeypatch.setattr(server, "reset", fake_reset)
+    transport = httpx.ASGITransport(app=create_app(server))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/reset", json={"seed": 987})
+        unseeded_response = await client.post("/reset")
+
+    assert response.status_code == 200
+    assert unseeded_response.status_code == 200
+    assert captured == [987, None]
