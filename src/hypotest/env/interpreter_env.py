@@ -166,6 +166,8 @@ class InterpreterEnvState:
         work_dir: Path,
         language: NBLanguage,
         execution_timeout: int = 600,
+        timeout_recovery: Literal["none", "interrupt"] = "none",
+        interrupt_grace_seconds: float = 10.0,
         safe_execute: bool = True,
         use_host_env_vars: bool = False,
         extra_envs: dict[str, str] | None = None,
@@ -202,6 +204,8 @@ class InterpreterEnvState:
             work_dir=work_dir,
             language=language,
             execution_timeout=execution_timeout,
+            timeout_recovery=timeout_recovery,
+            interrupt_grace_seconds=interrupt_grace_seconds,
             safe_execute=safe_execute,
             use_host_env_vars=use_host_env_vars,
             extra_envs=self.extra_envs,
@@ -619,6 +623,12 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self._unreported_execution_observed_seconds = 0.0
         self._duplicate_execution_accounting_suppressed = 0
         self._accounted_execution_ids: set[str] = set()
+        self._kernel_timeout_count = 0
+        self._kernel_interrupt_success_count = 0
+        self._kernel_interrupt_failure_count = 0
+        self._kernel_interrupt_seconds_total = 0.0
+        self._kernel_interrupt_seconds_max = 0.0
+        self._kernel_wedged = False
         # prompting_config is set during reset() after language resolution
         self.prompting_config: PromptingConfig
 
@@ -670,6 +680,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             work_dir=self.work_dir,
             language=self.language,
             execution_timeout=self.execution_timeout,
+            timeout_recovery=self.execution_config.cell_timeout_recovery,
+            interrupt_grace_seconds=self.execution_config.cell_interrupt_grace_seconds,
             safe_execute=self.execution_config.safe_execute,
             use_host_env_vars=self.use_host_env_vars,
             extra_envs={
@@ -813,9 +825,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                     `reset_kernel` and `list_dir` are separate tools, NOT Python
                     symbols in the kernel namespace. Do NOT write `reset_kernel()`
                     or `list_dir()` inside a `run_cell` call — invoke them as
-                    separate tool calls instead. A `reset_kernel` tool call after
-                    a `TimeoutError` is the supported way to recover from a locked
-                    kernel.
+                    separate tool calls instead. A `TimeoutError` reports whether
+                    the cell was interrupted and the kernel is ready.
 
                 Installing packages:
                     Install commands (`pip install`, `conda install`, `apt-get install`,
@@ -960,8 +971,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             `reset_kernel` and `list_dir` are separate tools, NOT Python symbols
             in the kernel namespace. Do NOT write `reset_kernel()` or `list_dir()`
             inside a `run_cell` call — invoke them as separate tool calls instead.
-            A `reset_kernel` tool call after a `TimeoutError` is the supported way
-            to recover from a locked kernel.
+            A `TimeoutError` reports whether the cell was interrupted and the
+            kernel is ready.
 
         Installing packages:
             Install commands (`pip install`, `conda install`, `apt-get install`,
@@ -1154,6 +1165,12 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             "rubric_reward_raw": float(self.state.rubric_reward_raw),
             "zero_reward": zero_reward,
             "positive_rubric_score_zero_reward": rubric_points_awarded > 0 and zero_reward,
+            "kernel_timeout_count": self._kernel_timeout_count,
+            "kernel_interrupt_success_count": self._kernel_interrupt_success_count,
+            "kernel_interrupt_failure_count": self._kernel_interrupt_failure_count,
+            "kernel_interrupt_seconds_total": self._kernel_interrupt_seconds_total,
+            "kernel_interrupt_seconds_max": self._kernel_interrupt_seconds_max,
+            "kernel_wedged": self._kernel_wedged,
             "time_accounting": self.get_time_accounting_metadata(),
         }
         if self.config.deterministic:
@@ -1592,6 +1609,12 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self._unreported_execution_observed_seconds = 0.0
         self._duplicate_execution_accounting_suppressed = 0
         self._accounted_execution_ids.clear()
+        self._kernel_timeout_count = 0
+        self._kernel_interrupt_success_count = 0
+        self._kernel_interrupt_failure_count = 0
+        self._kernel_interrupt_seconds_total = 0.0
+        self._kernel_interrupt_seconds_max = 0.0
+        self._kernel_wedged = False
 
     def _record_policy_generation(self, action: ToolRequestMessage | None = None) -> float:
         """Charge model turns preceding an environment step and return their seconds."""
@@ -1677,6 +1700,22 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self._kernel_execution_seconds += seconds
         return seconds
 
+    def _record_timeout_recovery(self, result: ExecutionResult) -> None:
+        if not result.timed_out:
+            return
+        self._kernel_timeout_count += 1
+        if result.timeout_recovery == "interrupted":
+            self._kernel_interrupt_success_count += 1
+        elif result.timeout_recovery == "wedged":
+            self._kernel_interrupt_failure_count += 1
+            self._kernel_wedged = True
+        if result.interrupt_seconds is not None:
+            self._kernel_interrupt_seconds_total += result.interrupt_seconds
+            self._kernel_interrupt_seconds_max = max(
+                self._kernel_interrupt_seconds_max,
+                result.interrupt_seconds,
+            )
+
     async def _execute_and_account_cell(
         self,
         code: str,
@@ -1699,6 +1738,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             time.perf_counter() - observed_start,
             logical_execution_id=logical_execution_id,
         )
+        self._record_timeout_recovery(result)
         return result, actual_cell_idx
 
     def get_elapsed_time(self) -> float:

@@ -29,7 +29,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 import httpx
 from pydantic import BaseModel
@@ -369,6 +369,8 @@ class SandboxConfig:
     work_dir: Path
     language: NBLanguage
     execution_timeout: float = 600
+    timeout_recovery: Literal["none", "interrupt"] = "none"
+    interrupt_grace_seconds: float = 10.0
     safe_execute: bool = True
     use_host_env_vars: bool = False
     extra_envs: dict[str, str] = field(default_factory=dict)

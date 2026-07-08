@@ -19,7 +19,7 @@ import uuid
 from enum import StrEnum, auto
 from pathlib import Path
 from queue import Empty
-from typing import Any, assert_never
+from typing import Any, Literal, assert_never
 
 import nbformat
 import uvicorn
@@ -27,11 +27,25 @@ from fastapi import FastAPI
 from jupyter_client.asynchronous.client import AsyncKernelClient
 from jupyter_client.manager import AsyncKernelManager
 from nbformat import NotebookNode
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class DeadlineExceededError(Exception):
     """Raised when a cooperative deadline check expires."""
+
+    def __init__(self, msg_id: str):
+        super().__init__(msg_id)
+        self.msg_id = msg_id
+
+
+class KernelExecutionState(StrEnum):
+    """Admission state for the single Jupyter execution channel."""
+
+    IDLE = auto()
+    EXECUTING = auto()
+    INTERRUPTING = auto()
+    WEDGED = auto()
+    CLOSED = auto()
 
 
 logger = logging.getLogger(__name__)
@@ -220,6 +234,8 @@ class ExecuteRequest(BaseModel):
 
     code: str
     timeout: float | None = None
+    timeout_recovery: Literal["none", "interrupt"] = "none"
+    interrupt_grace_seconds: float = Field(default=10.0, gt=0, allow_inf_nan=False)
 
 
 class ExecuteResponse(BaseModel):
@@ -231,6 +247,9 @@ class ExecuteResponse(BaseModel):
     notebook_outputs: list[dict[str, Any]]
     error_occurred: bool
     execution_time: float | None
+    timed_out: bool = False
+    timeout_recovery: Literal["interrupted", "wedged"] | None = None
+    interrupt_seconds: float | None = None
 
 
 class ResetResponse(BaseModel):
@@ -304,6 +323,9 @@ class KernelServer:
         self._kernel_manager: AsyncKernelManager | None = None
         self._client: AsyncKernelClient | None = None
         self._is_ready = False
+        self._execution_state = KernelExecutionState.IDLE
+        self._state_lock = asyncio.Lock()
+        self._active_msg_id: str | None = None
 
     async def start(self) -> None:
         """Start the Jupyter kernel."""
@@ -343,7 +365,14 @@ class KernelServer:
         except Exception as e:
             raise RuntimeError(f"Kernel failed to start: {e}") from e
 
-    async def execute(self, code: str, timeout: float | None = None) -> ExecuteResponse:  # noqa: ASYNC109
+    async def execute(
+        self,
+        code: str,
+        timeout: float | None = None,  # noqa: ASYNC109
+        *,
+        timeout_recovery: Literal["none", "interrupt"] = "none",
+        interrupt_grace_seconds: float = 10.0,
+    ) -> ExecuteResponse:
         """Execute code and return the result."""
         if not self._client or not self._is_ready:
             raise RuntimeError("Kernel not ready")
@@ -364,6 +393,10 @@ class KernelServer:
                     execution_time=0.0,
                 )
 
+        unavailable = await self._claim_execution()
+        if unavailable is not None:
+            return unavailable
+
         effective_timeout = timeout if timeout is not None else self.default_timeout
         start_time = time.perf_counter()
 
@@ -372,18 +405,51 @@ class KernelServer:
                 code,
                 deadline=start_time + effective_timeout,
             )
-        except DeadlineExceededError:
+        except DeadlineExceededError as exc:
+            execution_time = time.perf_counter() - start_time
+            recovered = False
+            interrupt_seconds: float | None = None
+            if timeout_recovery == "interrupt":
+                await self._set_execution_state(KernelExecutionState.INTERRUPTING)
+                interrupt_started = time.perf_counter()
+                recovered = await self._interrupt_and_drain(exc.msg_id, interrupt_grace_seconds)
+                interrupt_seconds = time.perf_counter() - interrupt_started
+            await self._set_execution_state(KernelExecutionState.IDLE if recovered else KernelExecutionState.WEDGED)
+            if recovered:
+                self._active_msg_id = None
             timeout_output = MessageType.ERROR.to_notebook_output({
                 "ename": "TimeoutError",
-                "evalue": f"Code execution timed out after {effective_timeout} seconds",
+                "evalue": (
+                    f"Code execution timed out after {effective_timeout} seconds; "
+                    + (
+                        "the cell was interrupted and the kernel is ready"
+                        if recovered
+                        else "the kernel is unresponsive"
+                    )
+                ),
                 "traceback": [f"TimeoutError: Code execution timed out after {effective_timeout} seconds"],
             })
             result = ExecuteResponse(
                 notebook_outputs=[dict(timeout_output)] if timeout_output else [],
                 error_occurred=True,
-                execution_time=time.perf_counter() - start_time,
+                execution_time=execution_time,
+                timed_out=True,
+                timeout_recovery="interrupted" if recovered else "wedged",
+                interrupt_seconds=interrupt_seconds,
             )
+        except asyncio.CancelledError:
+            recovered = False
+            if timeout_recovery == "interrupt" and self._active_msg_id is not None:
+                await self._set_execution_state(KernelExecutionState.INTERRUPTING)
+                recovered = await asyncio.shield(
+                    self._interrupt_and_drain(self._active_msg_id, interrupt_grace_seconds)
+                )
+            await self._set_execution_state(KernelExecutionState.IDLE if recovered else KernelExecutionState.WEDGED)
+            if recovered:
+                self._active_msg_id = None
+            raise
         except Exception as e:
+            await self._set_execution_state(KernelExecutionState.WEDGED)
             error_output = MessageType.ERROR.to_notebook_output({
                 "ename": type(e).__name__,
                 "evalue": str(e),
@@ -394,8 +460,69 @@ class KernelServer:
                 error_occurred=True,
                 execution_time=time.perf_counter() - start_time,
             )
+        else:
+            await self._set_execution_state(KernelExecutionState.IDLE)
+            self._active_msg_id = None
 
         return result
+
+    async def _claim_execution(self) -> ExecuteResponse | None:
+        """Claim the Jupyter channel without queuing behind active work."""
+        async with self._state_lock:
+            if self._execution_state == KernelExecutionState.IDLE:
+                self._execution_state = KernelExecutionState.EXECUTING
+                return None
+            if self._execution_state == KernelExecutionState.WEDGED:
+                error_name = "KernelUnresponsiveError"
+                message = "Kernel did not return to idle after a previous timeout"
+            else:
+                error_name = "KernelBusyError"
+                message = f"Kernel is {self._execution_state.value}; request was not queued"
+
+        output = MessageType.ERROR.to_notebook_output({
+            "ename": error_name,
+            "evalue": message,
+            "traceback": [f"{error_name}: {message}"],
+        })
+        return ExecuteResponse(
+            notebook_outputs=[dict(output)] if output else [],
+            error_occurred=True,
+            execution_time=0.0,
+        )
+
+    async def _set_execution_state(self, state: KernelExecutionState) -> None:
+        async with self._state_lock:
+            self._execution_state = state
+
+    async def _interrupt_and_drain(self, msg_id: str, grace_seconds: float) -> bool:
+        """Interrupt one execution and consume its IOPub stream through idle."""
+        if not self._kernel_manager or not self._client:
+            return False
+
+        deadline = time.perf_counter() + grace_seconds
+        try:
+            async with asyncio.timeout(grace_seconds):
+                await self._kernel_manager.interrupt_kernel()
+                while True:
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        return False
+                    try:
+                        msg = await self._client.get_iopub_msg(timeout=min(0.5, remaining))
+                    except Empty:
+                        continue
+                    if msg["parent_header"].get("msg_id") != msg_id:
+                        continue
+                    if (
+                        MessageType.from_string(msg["msg_type"]) == MessageType.STATUS
+                        and msg["content"].get("execution_state") == "idle"
+                    ):
+                        return True
+        except TimeoutError:
+            return False
+        except Exception:
+            logger.exception("Failed to interrupt Jupyter request %s", msg_id)
+            return False
 
     async def _execute_code(self, code: str, deadline: float, *, store_history: bool = True) -> ExecuteResponse:
         """Internal method to execute code and collect outputs.
@@ -417,6 +544,7 @@ class KernelServer:
         # notebook execution count. Keep IOPub enabled so startup errors are
         # still observable and can fail the kernel start.
         msg_id = self._client.execute(code, store_history=store_history)
+        self._active_msg_id = msg_id
 
         notebook_outputs: list[dict[str, Any]] = []
         error_occurred = False
@@ -424,7 +552,7 @@ class KernelServer:
         while True:
             # Check deadline before each poll
             if time.perf_counter() >= deadline:
-                raise DeadlineExceededError
+                raise DeadlineExceededError(msg_id)
 
             # Use a bounded poll so we never block longer than _POLL_INTERVAL_S.
             # get_iopub_msg(timeout=T) raises queue.Empty if no message arrives
@@ -476,6 +604,7 @@ class KernelServer:
             self._is_ready = False
 
         await self.start()
+        await self._set_execution_state(KernelExecutionState.IDLE)
         return ResetResponse(success=True, seed=self.seed)
 
     async def close(self) -> None:
@@ -488,6 +617,7 @@ class KernelServer:
             await self._kernel_manager.shutdown_kernel(now=True)
             await self._kernel_manager.cleanup_resources(restart=False)
             self._is_ready = False
+            await self._set_execution_state(KernelExecutionState.CLOSED)
             logger.info("Kernel shutdown complete")
 
     def list_dir(self, directory: str = ".", max_files: int = 20, show_hidden: bool = False) -> str:
@@ -525,7 +655,12 @@ def create_app(server: KernelServer) -> FastAPI:
 
     @app.post("/execute")
     async def execute(req: ExecuteRequest) -> ExecuteResponse:
-        return await server.execute(req.code, req.timeout)
+        return await server.execute(
+            req.code,
+            req.timeout,
+            timeout_recovery=req.timeout_recovery,
+            interrupt_grace_seconds=req.interrupt_grace_seconds,
+        )
 
     @app.post("/reset")
     async def reset(req: ResetRequest | None = None) -> ResetResponse:

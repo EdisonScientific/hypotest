@@ -11,7 +11,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from jupyter_client.asynchronous.client import AsyncKernelClient
 from jupyter_client.manager import AsyncKernelManager
@@ -35,6 +35,9 @@ class ExecutionResult(BaseModel):
     notebook_outputs: list[NotebookNode] = Field(default_factory=list)
     error_occurred: bool = False
     execution_time: float | None = None
+    timed_out: bool = False
+    timeout_recovery: Literal["interrupted", "wedged"] | None = None
+    interrupt_seconds: float | None = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 

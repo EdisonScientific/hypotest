@@ -117,6 +117,8 @@ class ExecutionConfig(BaseModel):
     warn_submit_threshold: int = 20 * 60
     force_submit_threshold: int = 10 * 60
     cell_execution_timeout: int = 15 * 60
+    cell_timeout_recovery: Literal["none", "interrupt"] = "none"
+    cell_interrupt_grace_seconds: float = Field(default=10.0, gt=0, allow_inf_nan=False)
     time_accounting: TimeAccountingConfig = Field(default_factory=WallClockTimeAccountingConfig)
 
     # safety

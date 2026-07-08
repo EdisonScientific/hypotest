@@ -3,7 +3,11 @@
 import httpx
 import pytest
 
-from hypotest.env.sandbox.http_client import HttpKernelClient, ProtocolVersionError
+from hypotest.env.sandbox.http_client import (
+    HttpKernelClient,
+    ProtocolVersionError,
+    execute_wire_timeout_seconds,
+)
 
 _STREAM_OUTPUT = {"output_type": "stream", "name": "stdout", "text": "hi\n"}
 
@@ -21,6 +25,31 @@ async def test_execute_parses_outputs(stub_request):
     assert result.error_occurred is False
     assert "hi" in result.get_combined_text()
     assert result.execution_time == 0.1
+
+
+@pytest.mark.asyncio
+async def test_execute_parses_timeout_recovery_metadata(stub_request):
+    client = HttpKernelClient(
+        stub_request(
+            lambda m, e, **kw: httpx.Response(
+                200,
+                json={
+                    "notebook_outputs": [],
+                    "error_occurred": True,
+                    "execution_time": 12.0,
+                    "timed_out": True,
+                    "timeout_recovery": "interrupted",
+                    "interrupt_seconds": 0.2,
+                },
+            )
+        )
+    )
+
+    result = await client.execute("slow()")
+
+    assert result.timed_out is True
+    assert result.timeout_recovery == "interrupted"
+    assert result.interrupt_seconds == 0.2
 
 
 @pytest.mark.asyncio
@@ -71,6 +100,12 @@ async def test_execute_wire_timeout_exceeds_cell_budget(stub_request):
     captured.clear()
     await client.execute("print(1)")  # falls back to execution_timeout
     assert captured["timeout"].read == 630.0  # 600 + 30
+
+
+def test_execute_wire_timeout_contains_recovery_budget():
+    assert execute_wire_timeout_seconds(120, "interrupt", 10) == 150
+    assert execute_wire_timeout_seconds(120, "interrupt", 25) == 165
+    assert execute_wire_timeout_seconds(120, "none", 25) == 150
 
 
 @pytest.mark.asyncio

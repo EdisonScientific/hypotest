@@ -19,7 +19,7 @@ docs/adr/0001-sandbox-backend-abstraction.md §2.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import nbformat
@@ -34,13 +34,19 @@ EXPECTED_PROTOCOL_VERSION = 1
 
 _HEALTH_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
 
-# Headroom added on top of the kernel's cell budget for the /execute wire timeout. The kernel runs
-# its own asyncio deadline at `timeout` and returns a clean timeout ExecutionResult; the wire
-# timeout must sit ABOVE that so it only backstops a wedged server, never pre-empts a legitimately
-# long cell. Without an explicit per-request timeout the agent-sandbox connector applies its default
-# 60s httpx timeout, which binds underneath the cell budget — long cells then surface as
-# SandboxRequestError (a re-wrapped httpx.ReadTimeout) rather than a clean result.
-_WIRE_TIMEOUT_HEADROOM_S = 30.0
+# The wire deadline must outlive both the cell and its bounded interrupt/drain.
+_MIN_WIRE_TIMEOUT_HEADROOM_S = 30.0
+_POST_RECOVERY_TRANSPORT_MARGIN_S = 20.0
+
+
+def execute_wire_timeout_seconds(
+    execution_timeout: float,
+    timeout_recovery: Literal["none", "interrupt"],
+    interrupt_grace_seconds: float,
+) -> float:
+    recovery_budget = interrupt_grace_seconds if timeout_recovery == "interrupt" else 0.0
+    headroom = max(_MIN_WIRE_TIMEOUT_HEADROOM_S, recovery_budget + _POST_RECOVERY_TRANSPORT_MARGIN_S)
+    return execution_timeout + headroom
 
 
 class ProtocolVersionError(RuntimeError):
@@ -55,6 +61,9 @@ def _parse_execute_response(response: httpx.Response) -> ExecutionResult:
         notebook_outputs=notebook_outputs,
         error_occurred=data["error_occurred"],
         execution_time=data.get("execution_time"),
+        timed_out=data.get("timed_out", False),
+        timeout_recovery=data.get("timeout_recovery"),
+        interrupt_seconds=data.get("interrupt_seconds"),
     )
 
 
@@ -66,11 +75,15 @@ class HttpKernelClient:
         request: RequestFn,
         *,
         execution_timeout: float = 600,
+        timeout_recovery: Literal["none", "interrupt"] = "none",
+        interrupt_grace_seconds: float = 10.0,
         label: str = "kernel",
         owns: httpx.AsyncClient | None = None,
     ) -> None:
         self._request = request
         self._execution_timeout = execution_timeout
+        self._timeout_recovery = timeout_recovery
+        self._interrupt_grace_seconds = interrupt_grace_seconds
         self._label = label
         # An httpx client this wrapper owns and should aclose() on close (docker);
         # for the connector transport this is None (the SDK owns it).
@@ -84,11 +97,20 @@ class HttpKernelClient:
         """
         effective_timeout = timeout if timeout is not None else self._execution_timeout
         kwargs: dict[str, Any] = {
-            "json": {"code": code, "timeout": timeout},
-            # Sit the wire timeout above the kernel's cell budget (see _WIRE_TIMEOUT_HEADROOM_S):
-            # the kernel's own deadline returns a clean timeout result first, so this only backstops
-            # a wedged server instead of pre-empting long cells at the connector's default 60s.
-            "timeout": httpx.Timeout(effective_timeout + _WIRE_TIMEOUT_HEADROOM_S, connect=10.0),
+            "json": {
+                "code": code,
+                "timeout": timeout,
+                "timeout_recovery": self._timeout_recovery,
+                "interrupt_grace_seconds": self._interrupt_grace_seconds,
+            },
+            "timeout": httpx.Timeout(
+                execute_wire_timeout_seconds(
+                    effective_timeout,
+                    self._timeout_recovery,
+                    self._interrupt_grace_seconds,
+                ),
+                connect=10.0,
+            ),
         }
         if req_uuid:
             kwargs["headers"] = {"X-Req-UUID": req_uuid}
@@ -113,6 +135,8 @@ class HttpKernelClient:
                 notebook_outputs=[timeout_output],
                 error_occurred=True,
                 execution_time=effective_timeout,
+                timed_out=True,
+                timeout_recovery="wedged",
             )
         return _parse_execute_response(response)
 

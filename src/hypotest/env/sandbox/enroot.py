@@ -33,7 +33,7 @@ import uuid
 from collections.abc import Awaitable
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx
 import ray
@@ -61,7 +61,7 @@ from hypotest.env.sandbox.base import (
     get_free_port,
     used_ports_lock,
 )
-from hypotest.env.sandbox.http_client import HttpKernelClient
+from hypotest.env.sandbox.http_client import HttpKernelClient, execute_wire_timeout_seconds
 from hypotest.env.tools.filesystem import FilesystemTool, list_dir_tool
 
 logger = logging.getLogger(__name__)
@@ -89,6 +89,8 @@ class EnrootKernelServer:
         sandbox_memory_limit_mb: int | None = None,
         sandbox_max_pids: int | None = None,
         seed: int | None = None,
+        timeout_recovery: Literal["none", "interrupt"] = "none",
+        interrupt_grace_seconds: float = 10.0,
     ):
         self.container_sqsh_path = container_sqsh_path
         self.execution_timeout = execution_timeout
@@ -96,6 +98,8 @@ class EnrootKernelServer:
         self.sandbox_memory_limit_mb = sandbox_memory_limit_mb
         self.sandbox_max_pids = sandbox_max_pids
         self.seed = seed
+        self.timeout_recovery = timeout_recovery
+        self.interrupt_grace_seconds = interrupt_grace_seconds
         self._enroot_proc: asyncio.subprocess.Process | None = None
         self._http_client: httpx.AsyncClient | None = None
         self._kernel_client: HttpKernelClient | None = None
@@ -318,7 +322,11 @@ class EnrootKernelServer:
                 timeout=httpx.Timeout(self.execution_timeout + 10, connect=30.0),
             )
             self._kernel_client = HttpKernelClient(
-                self._http_client.request, execution_timeout=self.execution_timeout, label=self._proc_label()
+                self._http_client.request,
+                execution_timeout=self.execution_timeout,
+                timeout_recovery=self.timeout_recovery,
+                interrupt_grace_seconds=self.interrupt_grace_seconds,
+                label=self._proc_label(),
             )
 
             # Wait for health check
@@ -527,6 +535,8 @@ class EnrootSandbox(Sandbox):
         self._mem_mb = config.resources.mem_mb
         self._max_pids = config.resources.max_pids
         self._seed = config.seed
+        self._timeout_recovery = config.timeout_recovery
+        self._interrupt_grace_seconds = config.interrupt_grace_seconds
 
         # ray placement
         self.kernel_container: Any = None
@@ -555,6 +565,8 @@ class EnrootSandbox(Sandbox):
             sandbox_memory_limit_mb=self._mem_mb,
             sandbox_max_pids=self._max_pids,
             seed=self._seed,
+            timeout_recovery=self._timeout_recovery,
+            interrupt_grace_seconds=self._interrupt_grace_seconds,
         )
         init_ref = self.kernel_container.initialize.remote(self.work_dir, self.language)
         await self._await_ray_ref(
@@ -658,7 +670,11 @@ class EnrootSandbox(Sandbox):
                 timeout=httpx.Timeout(self._execution_timeout + 10, connect=30.0),
             )
             self._client = HttpKernelClient(
-                self._http_client.request, execution_timeout=self._execution_timeout, label=self._label()
+                self._http_client.request,
+                execution_timeout=self._execution_timeout,
+                timeout_recovery=self._timeout_recovery,
+                interrupt_grace_seconds=self._interrupt_grace_seconds,
+                label=self._label(),
             )
 
             try:
@@ -694,7 +710,13 @@ class EnrootSandbox(Sandbox):
             ref = self.kernel_container._execute_via_http.remote(code, timeout, req_uuid=req_uuid)
             return cast(
                 ExecutionResult,
-                await self._await_ray_ref(ref, timeout=timeout, req_uuid=req_uuid, operation="_execute_via_http"),
+                await self._await_ray_ref(
+                    ref,
+                    timeout=timeout,
+                    req_uuid=req_uuid,
+                    operation="_execute_via_http",
+                    execution_request=True,
+                ),
             )
         assert self._client is not None
         return await self._client.execute(code, timeout, req_uuid)
@@ -767,9 +789,20 @@ class EnrootSandbox(Sandbox):
         req_uuid: str,
         operation: str,
         max_wait_attempts: int = MAX_RAY_RESULT_WAIT_RETRIES,
+        execution_request: bool = False,
     ) -> Any:
         effective_timeout = timeout if timeout is not None else self._execution_timeout
-        wait_timeout = effective_timeout + _RAY_RESULT_WAIT_TIMEOUT_GRACE
+        if execution_request:
+            wait_timeout = (
+                execute_wire_timeout_seconds(
+                    effective_timeout,
+                    self._timeout_recovery,
+                    self._interrupt_grace_seconds,
+                )
+                + _RAY_RESULT_WAIT_TIMEOUT_GRACE
+            )
+        else:
+            wait_timeout = effective_timeout + _RAY_RESULT_WAIT_TIMEOUT_GRACE
         last_timeout: TimeoutError | None = None
         for attempt in range(1, max_wait_attempts + 1):
             try:

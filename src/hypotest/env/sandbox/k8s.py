@@ -242,6 +242,8 @@ class K8sSandbox(Sandbox):
         self._ref = config.ref
         self._job_id = config.job_id
         self._execution_timeout = config.execution_timeout
+        self._timeout_recovery = config.timeout_recovery
+        self._interrupt_grace_seconds = config.interrupt_grace_seconds
         self._seed = config.seed
         self._spec = spec
         self._sandbox: Any = None  # agent-sandbox AsyncSandbox handle
@@ -254,6 +256,8 @@ class K8sSandbox(Sandbox):
             self._client = HttpKernelClient(
                 self._sandbox.connector.send_request,
                 execution_timeout=self._execution_timeout,
+                timeout_recovery=self._timeout_recovery,
+                interrupt_grace_seconds=self._interrupt_grace_seconds,
                 label=f"k8s:{getattr(self._sandbox, 'sandbox_id', '?')}",
             )
             await self._await_kernel_ready()

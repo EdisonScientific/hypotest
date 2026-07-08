@@ -43,6 +43,8 @@ class DockerSandbox(Sandbox):
         self.work_dir = config.work_dir
         self.language = config.language
         self._execution_timeout = config.execution_timeout
+        self._timeout_recovery = config.timeout_recovery
+        self._interrupt_grace_seconds = config.interrupt_grace_seconds
         self._safe_execute = config.safe_execute
         self._seed = config.seed
         self._docker_client: aiodocker.Docker | None = None
@@ -99,7 +101,12 @@ class DockerSandbox(Sandbox):
             timeout=httpx.Timeout(self._execution_timeout + 10, connect=30.0),
         )
         self._client = HttpKernelClient(
-            http.request, execution_timeout=self._execution_timeout, label=self._label(), owns=http
+            http.request,
+            execution_timeout=self._execution_timeout,
+            timeout_recovery=self._timeout_recovery,
+            interrupt_grace_seconds=self._interrupt_grace_seconds,
+            label=self._label(),
+            owns=http,
         )
         await _poll_kernel_health(
             request=http.request,
