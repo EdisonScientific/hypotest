@@ -19,6 +19,129 @@ The task capsule data is hosted on a public HuggingFace bucket:
 hf sync hf://buckets/EdisonScientific/bixbench-hypothesis-capsules /path/to/capsules/
 ```
 
+## Building the OpenSandbox Image
+
+The primary OpenSandbox path uses one generic Docker/OCI image with no capsule
+data in its layers. On each allocation, Hypotest passes the selected capsule's
+source and exact relative key as `CAPSULE_SOURCE` and `CAPSULE_KEY`. The
+container downloads that capsule before starting Jupyter or its HTTP server, so
+a successful `/health` means both data and kernel are ready. `InterpreterEnv`
+starts episode time accounting only after that initialization completes.
+
+The all-in-one builder creates the scientific base and kernel-server image,
+optionally pushes it, and prints the matching `opensandbox_spec` configuration:
+
+```bash
+docker login registry.example
+
+./scripts/build_opensandbox_image.py \
+  --image registry.example/hypotest-kernel:latest \
+  --capsule-source s3://example-bucket/capsules \
+  --s3-region us-west-2 \
+  --registry-auth \
+  --push
+```
+
+`--registry-auth` never reads or bakes registry credentials. It prints
+`${REGISTRY_USERNAME}` and `${REGISTRY_PASSWORD}` references for the dataset
+server configuration; export those variables in the dataset-server process.
+The separate `docker push` uses the builder machine's normal Docker credential
+store. OpenSandbox sends the credentials as `SandboxImageSpec.auth`, matching
+NeMo Gym's private-registry integration. The remote OpenSandbox workload
+provider must support per-request image auth; current OpenSandbox Docker and
+Kubernetes BatchSandbox providers do, while an unsupported provider rejects the
+request rather than silently dropping credentials.
+
+The S3 source and capsule-key policy can be supplied either way:
+
+- Runtime (recommended): set `capsule_source` and `capsule_key` in
+  `opensandbox_spec`. The default key template is `{capsule_uuid}`.
+- Image default: pass `--capsule-source` and/or `--capsule-key` while building,
+  then set the corresponding runtime field to `null` to preserve the image
+  value. Only non-secret locations belong in image layers.
+
+S3 credentials use the standard runtime `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`, and IAM identity chain.
+`AWS_ENDPOINT_URL`/`AWS_ENDPOINT_URL_S3` selects an S3-compatible endpoint.
+The builder accepts no capsule directory and the Dockerfiles copy only source
+and runtime files, so capsule bytes do not enter the resulting image.
+
+The allocation dataflow is:
+
+```text
+Sandbox.create(image[/auth], CAPSULE_SOURCE, CAPSULE_KEY)
+  -> remote image pull and container start
+  -> exact capsule prefix pulled into /workspace
+  -> persistent Jupyter kernel and HTTP server start
+  -> /health succeeds
+  -> episode timer starts
+```
+
+See [`deploy/server.opensandbox.example.yaml`](deploy/server.opensandbox.example.yaml)
+for a complete server configuration.
+
+## Optional Large-Bundle Images for OpenSandbox
+
+Large-bundle mode can package either one capsule or an entire capsule
+collection into a standard Docker/OCI image. For the high-throughput collection
+layout, the supplied directory's immediate child directories are capsules:
+
+```bash
+./scripts/build_large_bundle.py /path/to/capsules \
+  --all-capsules \
+  --image registry.example/hypotest-capsules:all \
+  --push
+```
+
+The collection is stored at `/opt/hypotest/capsules`. Every OpenSandbox create
+call uses the same image and passes the task's `input_data_path` (or problem ID)
+as `HYPOTEST_BUNDLE_CAPSULE_ID`. Before the kernel starts, Hypotest resolves that
+member without allowing path escape and creates a zero-copy, top-level symlink
+projection in `/workspace`. Configure the digest-pinned value printed by the
+script as one shared image:
+
+```yaml
+capsule_mode: large_bundle
+large_bundle_image: registry.example/hypotest-capsules@sha256:<digest>
+platform_os: linux
+platform_arch: amd64
+```
+
+This trades some isolation for launch and cache performance: only the selected
+capsule is presented in `/workspace`, but all bundled capsules remain readable
+through their absolute paths inside the container. The projection function is
+the intended seam for a future bubblewrap or mount-namespace policy; collection
+mode does not currently claim to prevent a model from deliberately inspecting
+siblings.
+
+The original one-capsule layout remains available. Its contents are copied
+directly to `/workspace`, and the script prints a `large_bundle_images` mapping:
+
+```bash
+./scripts/build_large_bundle.py \
+  /path/to/capsules/CapsuleData-123 \
+  --capsule-id CapsuleData-123 \
+  --image registry.example/hypotest-capsule:capsule-data-123 \
+  --push
+```
+
+Both layouts default to `linux/amd64` and extend `hypotest-kernel:latest`.
+Without `--push`, the script derives a safe local tag and loads the image into
+the current Docker daemon; that works only when OpenSandbox shares the daemon.
+For a remote Docker or Kubernetes OpenSandbox server, use `--push` and a
+registry-visible `--image`. The OpenSandbox runtime—not merely the build
+machine—must have pull access to a private registry. The same `image_auth`
+setting described above applies to generic, single-capsule, and collection
+images.
+
+The kernel base must already be available to the selected Buildx builder. Use
+`make kernel-image` for the local production base or `make kernel-image-core`
+for the native lightweight base. Pass `--platform linux/arm64` when the base and
+OpenSandbox runtime are arm64. The builder rejects a root-level `.dockerignore`,
+escaping/broken symlinks, special filesystem objects, and malformed collection
+roots so capsule inputs cannot be silently omitted or read outside the supplied
+directory.
+
 ## Running the Dataset Server
 
 Create a `server.yaml` config file:

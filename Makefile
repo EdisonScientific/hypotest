@@ -12,6 +12,10 @@ PLATFORM ?= linux/amd64
 KERNEL_IMAGE ?= interpreter-env
 SERVER_IMAGE ?= hypotest-server
 KERNEL_SERVER_IMAGE ?= hypotest-kernel
+# Optional, non-secret defaults for init-time capsule delivery. Per-allocation
+# OpenSandbox env overrides both; leave empty for a fully generic image.
+CAPSULE_SOURCE ?=
+CAPSULE_KEY ?=
 
 export DOCKER_BUILDKIT = 1
 
@@ -71,6 +75,8 @@ kernel-image: image
 		-f Dockerfile.kernel \
 		--build-arg BASE_IMAGE=$(KERNEL_IMAGE):full \
 		--build-arg BUILD_CUTOFF_DATE=$(BUILD_CUTOFF_DATE) \
+		--build-arg CAPSULE_SOURCE=$(CAPSULE_SOURCE) \
+		--build-arg CAPSULE_KEY=$(CAPSULE_KEY) \
 		-t $(KERNEL_SERVER_IMAGE):latest .
 
 # Lean kernel-server image on the lightweight core base (local arm64 / Mac).
@@ -79,6 +85,8 @@ kernel-image-core: image-core
 		-f Dockerfile.kernel \
 		--build-arg BASE_IMAGE=$(KERNEL_IMAGE):core \
 		--build-arg BUILD_CUTOFF_DATE=$(BUILD_CUTOFF_DATE) \
+		--build-arg CAPSULE_SOURCE=$(CAPSULE_SOURCE) \
+		--build-arg CAPSULE_KEY=$(CAPSULE_KEY) \
 		-t $(KERNEL_SERVER_IMAGE):core .
 
 server:

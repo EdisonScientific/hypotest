@@ -23,7 +23,7 @@ from hypotest.env.config import ExecutionConfig
 from hypotest.env.determinism import EnvSeeds
 from hypotest.env.interpreter_env import InterpreterEnv, InterpreterEnvConfig, ProblemInstance
 from hypotest.env.kernel_server import NBLanguage
-from hypotest.env.sandbox import K8sSandboxSpec
+from hypotest.env.sandbox import K8sSandboxSpec, OpenSandboxSpec
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +59,15 @@ class DatasetConfig(BaseModel):
     # Opt-in k8s (agent-sandbox) placement targets; the scheduler load-balances across them and
     # falls back to the enroot backend. Empty = disabled (use the use_*/container_sqsh_path backend).
     k8s_sandbox_specs: list[K8sSandboxSpec] = Field(default_factory=list)
+    # Remote OpenSandbox placement using the raw SDK. Allocation/reachability
+    # failures fall back to the configured local/enroot/docker backend.
+    opensandbox_spec: OpenSandboxSpec | None = None
     # Opaque job identity (e.g. the W&B run-group) stamped on claims for the clean-on-startup sweep;
     # see Dataset.sweep_stale_claims. None disables labeling+sweep. Scope it per orchestrator instance.
     sandbox_job_id: str | None = None
-    # k8s backend: pull each task's capsule into the pod via /load_capsule (off for pure-exec tests).
+    # Remote backend: deliver each task's capsule in the sandbox. OpenSandbox
+    # pulls during container init; k8s uses /load_capsule. Off for pure-exec
+    # tests; large-bundle mode uses data already in the selected image.
     pull_capsule_in_pod: bool = True
     force_python: bool = True
     normalize_reward: bool = True
@@ -87,6 +92,8 @@ class DatasetConfig(BaseModel):
     def validate_dataset_source(self) -> Self:
         if not self.problem_jsonl and not self.hf_dataset:
             raise ValueError("Either problem_jsonl or hf_dataset must be provided")
+        if self.k8s_sandbox_specs and self.opensandbox_spec is not None:
+            raise ValueError("Configure either k8s_sandbox_specs or opensandbox_spec, not both")
         return self
 
     @model_validator(mode="after")
@@ -231,13 +238,9 @@ class Dataset(TaskDataset[InterpreterEnv]):
         else:
             problem_dir = Path(mkdtemp())
 
-        if self.config.k8s_sandbox_specs and self.config.pull_capsule_in_pod:
-            # The k8s pod pulls the capsule in-pod from its CAPSULE_SOURCE (/load_capsule), so the
-            # orchestrator-side copy here is wasted (and an s3 capsule_dir would need orchestrator S3
-            # creds). Skip it. NOTE: a non-k8s fallback (enroot/local) would then run without local
-            # capsule data — acceptable because in-pod pull was explicitly requested.
-            logger.warning("k8s in-pod capsule pull active; skipping orchestrator-side capsule copy for %s", problem.id)
-        elif self.capsule_dir is None:  # lazy s3: pull this task's capsule straight into the work dir
+        # Always stage the capsule locally, even when the primary backend pulls
+        # it remotely. The staged copy makes the fallback backend data-complete.
+        if self.capsule_dir is None:  # lazy s3: pull this task's capsule straight into the work dir
             self._pull_capsule_from_s3(problem, problem_dir)
         else:
             capsule_path = self.capsule_dir / problem.input_data_path

@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from hypotest.env.config import ExecutionConfig
 from hypotest.env.interpreter import ExecutionResult
-from hypotest.env.interpreter_env import InterpreterEnv, InterpreterEnvConfig, ProblemInstance
+from hypotest.env.interpreter_env import InterpreterEnv, InterpreterEnvConfig, InterpreterEnvState, ProblemInstance
 
 
 def _env(tmp_path, problem: ProblemInstance, time_accounting: dict) -> InterpreterEnv:
@@ -59,43 +59,53 @@ def test_wall_clock_is_default_and_rejects_generation_latency() -> None:
     assert ExecutionConfig().time_accounting.mode == "wall_clock"
 
     with pytest.raises(ValidationError, match="generation_latency"):
-        ExecutionConfig.model_validate(
-            {
-                "time_accounting": {
-                    "mode": "wall_clock",
-                    "generation_latency": {"mode": "fixed", "seconds_per_generation": 1},
-                },
-            }
-        )
+        ExecutionConfig.model_validate({
+            "time_accounting": {
+                "mode": "wall_clock",
+                "generation_latency": {"mode": "fixed", "seconds_per_generation": 1},
+            },
+        })
+
+
+@pytest.mark.asyncio
+async def test_episode_timer_starts_after_sandbox_init(tmp_path, default_problem, monkeypatch) -> None:
+    env = _env(tmp_path, default_problem, {"mode": "wall_clock"})
+    observed_start_times: list[float | None] = []
+
+    async def fake_start(_state):  # noqa: RUF029 - must match async sandbox lifecycle
+        observed_start_times.append(env.start_time)
+
+    monkeypatch.setattr(InterpreterEnvState, "start", fake_start)
+    with patch("hypotest.env.interpreter_env.time.perf_counter", return_value=123.5):
+        await env.reset()
+
+    assert observed_start_times == [None]
+    assert env.start_time == 123.5
 
 
 @pytest.mark.parametrize("mode", ["fixed", "rolling_mean", "rolling_p95"])
 def test_kernel_execution_accepts_positive_generation_estimates(mode: str) -> None:
-    config = ExecutionConfig.model_validate(
-        {
-            "time_accounting": {
-                "mode": "kernel_execution",
-                "generation_latency": {"mode": mode, "seconds_per_generation": 2.5},
-            },
-        }
-    )
+    config = ExecutionConfig.model_validate({
+        "time_accounting": {
+            "mode": "kernel_execution",
+            "generation_latency": {"mode": mode, "seconds_per_generation": 2.5},
+        },
+    })
     assert config.time_accounting.mode == "kernel_execution"
     assert config.time_accounting.generation_latency.mode == mode
     assert config.time_accounting.generation_latency.seconds_per_generation == 2.5
 
 
 def test_kernel_execution_accepts_token_throughput() -> None:
-    config = ExecutionConfig.model_validate(
-        {
-            "time_accounting": {
-                "mode": "kernel_execution",
-                "generation_latency": {
-                    "mode": "token_throughput",
-                    "output_tokens_per_second": 141,
-                },
+    config = ExecutionConfig.model_validate({
+        "time_accounting": {
+            "mode": "kernel_execution",
+            "generation_latency": {
+                "mode": "token_throughput",
+                "output_tokens_per_second": 141,
             },
-        }
-    )
+        },
+    })
     assert config.time_accounting.generation_latency.mode == "token_throughput"
     assert config.time_accounting.generation_latency.output_tokens_per_second == 141
 
@@ -169,9 +179,7 @@ def test_kernel_execution_ignores_wall_latency_and_adds_simulated_generation(
     assert metadata["generation_latency"]["mode"] == "rolling_p95"
 
 
-def test_token_throughput_charges_all_reported_model_turns(
-    tmp_path, default_problem: ProblemInstance
-) -> None:
+def test_token_throughput_charges_all_reported_model_turns(tmp_path, default_problem: ProblemInstance) -> None:
     env = _env(
         tmp_path,
         default_problem,
@@ -296,9 +304,7 @@ async def test_step_charges_exactly_one_policy_generation(tmp_path, default_prob
 
 
 @pytest.mark.asyncio
-async def test_step_charges_token_throughput_before_tool_dispatch(
-    tmp_path, default_problem: ProblemInstance
-) -> None:
+async def test_step_charges_token_throughput_before_tool_dispatch(tmp_path, default_problem: ProblemInstance) -> None:
     env = _env(
         tmp_path,
         default_problem,

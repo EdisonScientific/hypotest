@@ -76,9 +76,9 @@ spec:
             - containerPort: 8000  # MUST equal K8sSandboxSpec.server_port
           env:
             - name: CAPSULE_SOURCE
-              value: s3://train-data-05312026-agent-sandbox/capsules
+              value: s3://example-bucket/capsules
             - name: AWS_ENDPOINT_URL
-              value: https://pdx.s8k.io
+              value: https://s3.example.com
             - name: AWS_DEFAULT_REGION
               value: us-east-1
           envFrom:

@@ -3,10 +3,11 @@
 # (hypotest.kernel_capsule_server) — the image the sandbox infra runs in its pods
 # (agent-sandbox / k8s) and behind the enroot .sqsh.
 #
-# It serves the kernel API (/execute, /reset, /health, /list_dir, /close) plus
-# POST /load_capsule {"capsule_uuid": "<uuid>", "seed": <optional-int>}, which
-# pulls the most-recent capsule for that UUID from --capsule-source (or the
-# CAPSULE_SOURCE env) into the work dir and resets the kernel.
+# It pulls CAPSULE_KEY from CAPSULE_SOURCE before starting Jupyter/HTTP when
+# both are configured, so OpenSandbox readiness includes capsule delivery. It
+# also serves POST /load_capsule for backends that select a capsule after boot.
+# A derived large-bundle image may instead pre-populate /workspace, or store a collection
+# under /opt/hypotest/capsules for startup-time selection, and omit the source.
 #
 # Built FROM the interpreter-env exec base, so the scientific stack
 # (numpy/pandas/R/bio/torch) is byte-identical to what the agent runs everywhere
@@ -18,18 +19,29 @@
 # fhlmi, datasets, ray, aiodocker), keeping its deps + attack surface minimal and
 # decoupling it from the dataset server's dependency churn.
 #
-#   BASE_IMAGE  interpreter-env:full (default, amd64 production)
-#               interpreter-env:core (lightweight, arm64 local testing)
+#   BASE_IMAGE      interpreter-env:full (default, amd64 production)
+#                   interpreter-env:core (lightweight, arm64 local testing)
+#   CAPSULE_SOURCE  optional s3://bucket/base-prefix baked runtime default
+#   CAPSULE_KEY     optional relative capsule prefix baked runtime default
 #
 # Built via the Makefile (`make kernel-image` / `make kernel-image-core`), which
 # builds the base first and threads the build-date cutoff.
 
 ARG BASE_IMAGE=interpreter-env:full
 ARG BUILD_CUTOFF_DATE
+ARG CAPSULE_SOURCE=
+ARG CAPSULE_KEY=
 
 FROM ${BASE_IMAGE}
 
 ARG BUILD_CUTOFF_DATE
+ARG CAPSULE_SOURCE
+ARG CAPSULE_KEY
+
+# Non-secret location defaults only. OpenSandbox create-time env overrides
+# these values per allocation; AWS credentials must be injected at runtime.
+ENV CAPSULE_SOURCE="${CAPSULE_SOURCE}" \
+    CAPSULE_KEY="${CAPSULE_KEY}"
 
 # Install hypotest WITHOUT its dependency cone (--no-deps), then add just boto3
 # (s3_sync's only extra runtime dep; imported lazily). The kernel server's other
@@ -72,7 +84,8 @@ RUN if [ -d /app/kernel_env/lib/R/etc ]; then \
 COPY docker/entrypoint.sh /opt/entrypoint.sh
 
 # The entrypoint starts the cutoff proxy, then execs the kernel server. The sandbox
-# deployment (SandboxTemplate / Deployment) supplies --capsule-source (or the
-# CAPSULE_SOURCE env) and may override --port / --language / --safe-execute.
+# deployment (SandboxTemplate / OpenSandbox create call) may supply
+# CAPSULE_SOURCE/CAPSULE_KEY and override --port / --language / --safe-execute.
+# Bundled images ignore init-pull configuration.
 ENTRYPOINT ["sh", "/opt/entrypoint.sh"]
 CMD ["/app/kernel_env/bin/python", "-m", "hypotest.kernel_capsule_server", "--port", "8000", "--safe-execute"]

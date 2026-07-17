@@ -28,7 +28,12 @@ from hypotest.env.interpreter_env import (
     ProblemInstance,
 )
 from hypotest.env.kernel_server import NBLanguage
-from hypotest.env.sandbox import K8sFallbackScheduler, K8sSandboxSpec
+from hypotest.env.sandbox import (
+    K8sFallbackScheduler,
+    K8sSandboxSpec,
+    OpenSandboxFallbackScheduler,
+    OpenSandboxSpec,
+)
 from hypotest.env.sandbox.base import _build_resource_limit_prefix
 from hypotest.env.sandbox.enroot import EnrootKernelServer
 
@@ -1236,11 +1241,26 @@ class TestExecutionConfigSandboxFields:
         config = ExecutionConfig()
         assert config.sandbox_memory_limit_mb is None
         assert config.sandbox_max_pids is None
+        assert config.sandbox_cpu is None
+        assert config.sandbox_ephemeral_storage_gib is None
+        assert config.sandbox_gpu_count is None
+        assert config.sandbox_gpu_type is None
 
     def test_overrides_work(self):
-        config = ExecutionConfig(sandbox_memory_limit_mb=8192, sandbox_max_pids=512)
+        config = ExecutionConfig(
+            sandbox_memory_limit_mb=8192,
+            sandbox_max_pids=512,
+            sandbox_cpu=4,
+            sandbox_ephemeral_storage_gib=50,
+            sandbox_gpu_count=1,
+            sandbox_gpu_type="L40S",
+        )
         assert config.sandbox_memory_limit_mb == 8192
         assert config.sandbox_max_pids == 512
+        assert config.sandbox_cpu == 4
+        assert config.sandbox_ephemeral_storage_gib == 50
+        assert config.sandbox_gpu_count == 1
+        assert config.sandbox_gpu_type == "L40S"
 
     def test_factory_standard_passes_overrides(self):
         config = ExecutionConfig.standard(sandbox_memory_limit_mb=4096)
@@ -1258,23 +1278,29 @@ class TestBuildEnrootCmdWithPrefix:
 
     def test_without_prefix(self):
         cmd = EnrootKernelServer._build_enroot_cmd(
-            pathlib.Path("/work"), pathlib.Path("/node"), pathlib.Path("/ks.py"),
-            "echo hi", {}, pathlib.Path("/sqsh.sqsh"),
+            pathlib.Path("/work"),
+            pathlib.Path("/node"),
+            pathlib.Path("/ks.py"),
+            "echo hi",
+            {},
+            pathlib.Path("/sqsh.sqsh"),
         )
         assert cmd[0] == "env"
         assert "enroot" in cmd
 
     def test_kernel_script_forwards_seed(self):
-        script = EnrootKernelServer._build_kernel_bash_script(
-            "/node/work", NBLanguage.PYTHON, 8000, "token", seed=321
-        )
+        script = EnrootKernelServer._build_kernel_bash_script("/node/work", NBLanguage.PYTHON, 8000, "token", seed=321)
         assert "--seed 321" in script
 
     def test_with_prefix(self):
         prefix = ["prlimit", "--as=8589934592", "--"]
         cmd = EnrootKernelServer._build_enroot_cmd(
-            pathlib.Path("/work"), pathlib.Path("/node"), pathlib.Path("/ks.py"),
-            "echo hi", {}, pathlib.Path("/sqsh.sqsh"),
+            pathlib.Path("/work"),
+            pathlib.Path("/node"),
+            pathlib.Path("/ks.py"),
+            "echo hi",
+            {},
+            pathlib.Path("/sqsh.sqsh"),
             resource_prefix=prefix,
         )
         assert cmd[:3] == prefix
@@ -1282,7 +1308,7 @@ class TestBuildEnrootCmdWithPrefix:
 
 
 class TestSandboxConfigWiring:
-    """The sandbox knobs (use_ray / enable_recovery / k8s_sandbox_specs) flow operator-config -> state."""
+    """The sandbox placement knobs flow from operator config into state."""
 
     def test_dataset_config_spread_carries_sandbox_knobs(self):
         # get_new_env_by_idx builds InterpreterEnvConfig via **DatasetConfig.model_dump(); the new
@@ -1311,6 +1337,74 @@ class TestSandboxConfigWiring:
             k8s_specs=[K8sSandboxSpec(template="py-tmpl")],
         )
         assert isinstance(state._scheduler, K8sFallbackScheduler)
+
+    def test_state_builds_opensandbox_scheduler_from_spec(self, tmp_path):
+        state = InterpreterEnvState(
+            work_dir=tmp_path,
+            language=NBLanguage.PYTHON,
+            use_docker=False,
+            opensandbox_spec=OpenSandboxSpec(image="kernel:latest", create_attempts=1),
+        )
+        assert isinstance(state._scheduler, OpenSandboxFallbackScheduler)
+
+    def test_remote_backends_are_mutually_exclusive(self):
+        with pytest.raises(ValueError, match="either k8s_sandbox_specs or opensandbox_spec"):
+            InterpreterEnvConfig(
+                k8s_sandbox_specs=[K8sSandboxSpec(template="test")],
+                opensandbox_spec=OpenSandboxSpec(image="kernel:latest", create_attempts=1),
+            )
+
+    def test_opensandbox_capsule_delivery_refs(self, tmp_path, default_problem):
+        object_store_env = InterpreterEnv(
+            problem=default_problem,
+            work_dir=tmp_path / "object-store",
+            config=InterpreterEnvConfig(
+                opensandbox_spec=OpenSandboxSpec(
+                    image="kernel:latest",
+                    capsule_source="s3://capsules/root",
+                    create_attempts=1,
+                )
+            ),
+        )
+        object_ref = object_store_env._capsule_ref()
+        assert object_ref is not None
+        assert object_ref.delivery == "object_store"
+        assert object_ref.source == "s3://capsules/root"
+
+        bundled_env = InterpreterEnv(
+            problem=default_problem,
+            work_dir=tmp_path / "bundled",
+            config=InterpreterEnvConfig(
+                opensandbox_spec=OpenSandboxSpec(
+                    image="kernel:latest",
+                    capsule_mode="large_bundle",
+                    large_bundle_image_template="capsule:{capsule_uuid}",
+                    create_attempts=1,
+                )
+            ),
+        )
+        bundled_ref = bundled_env._capsule_ref()
+        assert bundled_ref is not None
+        assert bundled_ref.delivery == "bundled"
+        assert bundled_ref.image == f"capsule:{default_problem.input_data_path or default_problem.id}"
+
+        collection_env = InterpreterEnv(
+            problem=default_problem,
+            work_dir=tmp_path / "collection",
+            config=InterpreterEnvConfig(
+                opensandbox_spec=OpenSandboxSpec(
+                    image="kernel:latest",
+                    capsule_mode="large_bundle",
+                    large_bundle_image="capsule:all",
+                    create_attempts=1,
+                )
+            ),
+        )
+        collection_ref = collection_env._capsule_ref()
+        assert collection_ref is not None
+        assert collection_ref.delivery == "bundled"
+        assert collection_ref.uuid == (default_problem.input_data_path or str(default_problem.id))
+        assert collection_ref.image == "capsule:all"
 
     def test_state_has_no_scheduler_by_default(self, tmp_path):
         state = InterpreterEnvState(work_dir=tmp_path, language=NBLanguage.PYTHON, use_docker=False)

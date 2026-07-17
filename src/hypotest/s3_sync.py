@@ -5,7 +5,7 @@ The capsule data and the tasks JSONL may be given in the dataset config as
 downloaded to a local staging dir. The endpoint and credentials come from the
 standard boto3 environment variables — never the config:
 
-    AWS_ENDPOINT_URL   (e.g. https://pdx.s8k.io for the S3-compatible store)
+    AWS_ENDPOINT_URL   (e.g. https://s3.example.com for the S3-compatible store)
     AWS_ACCESS_KEY_ID
     AWS_SECRET_ACCESS_KEY
     AWS_DEFAULT_REGION
@@ -20,7 +20,7 @@ import logging
 import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -93,6 +93,48 @@ def download_prefix(client: Any, bucket: str, prefix: str, dest: Path, max_worke
     return len(keys)
 
 
+def normalize_capsule_key(key: str) -> str:
+    """Return a safe relative S3/local prefix for one capsule."""
+    path = PurePosixPath(key)
+    if not key or path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"capsule key must be a non-empty relative prefix: {key!r}")
+    normalized = str(path)
+    if normalized in {"", "."}:
+        raise ValueError(f"capsule key must identify a capsule prefix: {key!r}")
+    return normalized
+
+
+def pull_capsule(source: str, key: str, dest: Path, client: Any = None) -> int:
+    """Pull one capsule by exact key first, then use legacy UUID discovery.
+
+    ``source`` is the collection root (for example ``s3://bucket/capsules``)
+    and ``key`` is a relative capsule directory/prefix. Exact lookup avoids the
+    collection-wide listing and recency scan for the normal ``input_data_path``
+    case. The older substring/latest lookup remains as a compatibility fallback
+    when a problem exposes only its UUID.
+    """
+    normalized_key = normalize_capsule_key(key)
+    if is_s3_uri(source):
+        s3_client = client or make_client()
+        bucket, base_prefix = parse_s3_uri(source)
+        exact_prefix = "/".join(part for part in (base_prefix.strip("/"), normalized_key) if part)
+        count = download_prefix(s3_client, bucket, exact_prefix, dest)
+        if count:
+            logger.warning("Pulled exact capsule s3://%s/%s (%d objects)", bucket, exact_prefix, count)
+            return count
+        return _pull_latest_capsule_s3(source, normalized_key, dest, s3_client)
+
+    local_base = Path(source).resolve(strict=True)
+    exact = (local_base / Path(*PurePosixPath(normalized_key).parts)).resolve(strict=False)
+    if exact != local_base and local_base in exact.parents and exact.is_dir():
+        dest.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(exact, dest, dirs_exist_ok=True)
+        count = sum(1 for path in exact.rglob("*") if path.is_file())
+        logger.warning("Pulled exact capsule %s (%d files)", exact, count)
+        return count
+    return _pull_latest_capsule_local(local_base, normalized_key, dest)
+
+
 def pull_latest_capsule(source: str, uuid: str, dest: Path, client: Any = None) -> int:
     """Place the most-recent capsule for ``uuid`` into ``dest``.
 
@@ -117,7 +159,7 @@ def _pull_latest_capsule_s3(source: str, uuid: str, dest: Path, client: Any) -> 
         cp["Prefix"]
         for page in paginator.paginate(Bucket=bucket, Prefix=list_prefix, Delimiter="/")
         for cp in page.get("CommonPrefixes", [])
-        if uuid in cp["Prefix"][len(list_prefix):]
+        if uuid in cp["Prefix"][len(list_prefix) :]
     ]
     if not candidate_prefixes:
         raise FileNotFoundError(f"no capsule for {uuid} under s3://{bucket}/{list_prefix}")

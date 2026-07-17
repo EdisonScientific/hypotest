@@ -1057,7 +1057,10 @@ dev = [
     { name = "vcrpy" },
 ]
 k8s = [
-    { name = "k8s-agent-sandbox" },
+    { name = "k8s-agent-sandbox", extra = ["async"] },
+]
+opensandbox = [
+    { name = "opensandbox" },
 ]
 ray = [
     { name = "ray" },
@@ -1079,13 +1082,14 @@ requires-dist = [
     { name = "huggingface-hub", specifier = ">=1.7.1" },
     { name = "ipdb", marker = "extra == 'dev'" },
     { name = "jupyter-client" },
-    { name = "k8s-agent-sandbox", marker = "extra == 'k8s'" },
+    { name = "k8s-agent-sandbox", extras = ["async"], marker = "extra == 'k8s'" },
     { name = "ldp" },
     { name = "litellm", specifier = "<=1.82.6" },
     { name = "matplotlib", marker = "extra == 'dev'" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8" },
     { name = "nbformat" },
     { name = "numpy" },
+    { name = "opensandbox", marker = "extra == 'opensandbox'", specifier = ">=0.1.9" },
     { name = "pillow" },
     { name = "prek", marker = "extra == 'dev'" },
     { name = "pydantic" },
@@ -1106,10 +1110,10 @@ requires-dist = [
     { name = "types-tqdm", marker = "extra == 'dev'" },
     { name = "vcrpy", marker = "extra == 'dev'", specifier = ">=8" },
 ]
-provides-extras = ["dev", "k8s", "ray"]
+provides-extras = ["dev", "k8s", "opensandbox", "ray"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "hypotest", extras = ["dev"], editable = "." }]
+dev = [{ name = "hypotest", extras = ["dev"] }]
 
 [[package]]
 name = "idna"
@@ -1385,6 +1389,12 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/15/14/699257a55657783a6f2d1ee8d590c3153cc3976557a907a1cbaebceb3c6c/k8s_agent_sandbox-0.4.6-py3-none-any.whl", hash = "sha256:feef320af4302941215641a8fbfaa4d2e673d63a4fa205f6f7e5bf21029d6a7b", size = 64710, upload-time = "2026-05-14T19:36:15.446Z" },
 ]
 
+[package.optional-dependencies]
+async = [
+    { name = "httpx" },
+    { name = "kubernetes-asyncio" },
+]
+
 [[package]]
 name = "kiwisolver"
 version = "1.4.9"
@@ -1468,6 +1478,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/bf/59/dc635e4e9afb3884bc5c57f14fe23783e4c04601aa20b835ac75c41d1625/kubernetes-36.0.0.tar.gz", hash = "sha256:027b606bb8032e6c6464a53236bdd9bd9a94c237e1063bc45a303c25b304ced9", size = 2346728, upload-time = "2026-05-20T20:44:24.28Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cd/d2/6f99ca9c7eb961dfdd45b9643101399a8ee20922c662c362c91e9cc7e832/kubernetes-36.0.0-py2.py3-none-any.whl", hash = "sha256:a766433357ec9f90db7565cccf52e28e7fca40b0ef366c80a6022adbc0ac0425", size = 4660469, upload-time = "2026-05-20T20:44:20.893Z" },
+]
+
+[[package]]
+name = "kubernetes-asyncio"
+version = "36.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "certifi" },
+    { name = "python-dateutil" },
+    { name = "pyyaml" },
+    { name = "six" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/60/45/9e15f4268454636aee32d92ddeaa7128c71100308644bc79685292c1efcc/kubernetes_asyncio-36.1.0.tar.gz", hash = "sha256:6d979d82e5ebe490bea298e7843732a2336173236bae28e200434889443d4443", size = 1426205, upload-time = "2026-06-04T19:42:45.669Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b2/dc/695601e3a6f08ca3d6035d300a944974c17084050591faec6e1de39e4a4e/kubernetes_asyncio-36.1.0-py3-none-any.whl", hash = "sha256:6d25915d1abff24fceda551a502208d986f674d72586297aa58bc7d55e7feaf3", size = 3044531, upload-time = "2026-06-04T19:42:43.84Z" },
 ]
 
 [[package]]
@@ -1991,6 +2018,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/94/f4/4690ecb5d70023ce6bfcfeabfe717020f654bde59a775058ec6ac4692463/openai-2.15.0.tar.gz", hash = "sha256:42eb8cbb407d84770633f31bf727d4ffb4138711c670565a41663d9439174fba", size = 627383, upload-time = "2026-01-09T22:10:08.603Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b5/df/c306f7375d42bafb379934c2df4c2fa3964656c8c782bac75ee10c102818/openai-2.15.0-py3-none-any.whl", hash = "sha256:6ae23b932cd7230f7244e52954daa6602716d6b9bf235401a107af731baea6c3", size = 1067879, upload-time = "2026-01-09T22:10:06.446Z" },
+]
+
+[[package]]
+name = "opensandbox"
+version = "0.1.14"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "attrs" },
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "python-dateutil" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5f/c7/cfc42df5405752818416f0791fc820b2280159164de4c25bf27d99897f05/opensandbox-0.1.14.tar.gz", hash = "sha256:c030038b168b59526010d66feb1ce3dd7e7b78e23bf263b47cf6cf44f7129fb4", size = 214016, upload-time = "2026-07-13T07:04:30.144Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/15/68/ffe6646bc081421c81d715e2a024ff197ca0512ed57143b9551c070fa917/opensandbox-0.1.14-py3-none-any.whl", hash = "sha256:2362bfbdca15e0c3c226d29fdb7eea6d1ad3e908f5c924683840e7e3b011e4b1", size = 517406, upload-time = "2026-07-13T07:04:28.907Z" },
 ]
 
 [[package]]

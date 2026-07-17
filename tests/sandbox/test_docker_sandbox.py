@@ -23,10 +23,19 @@ async def test_execute_delegates_to_kernel_client(tmp_path, stub_request):
 
     def handler(method, endpoint, **kwargs):
         calls.append((method, endpoint))
-        return httpx.Response(200, json=_EXEC_OK)
+        if method == "POST" and endpoint == "/execute":
+            return httpx.Response(202, json={"execution_id": "exec-1", "status": "queued"})
+        if method == "GET" and endpoint == "/execute/exec-1":
+            return httpx.Response(
+                200,
+                json={"execution_id": "exec-1", "status": "completed", "result": _EXEC_OK},
+            )
+        return httpx.Response(404)
 
     sb = _docker(tmp_path)
-    sb._client = HttpKernelClient(stub_request(handler))  # inject; bypass aiodocker start()
+    sb._client = HttpKernelClient(  # inject; bypass aiodocker start()
+        stub_request(handler), execution_poll_interval_seconds=0
+    )
     result = await sb.execute("print('hi')", req_uuid="u1")
     assert "hi" in result.get_combined_text()
     assert ("POST", "/execute") in calls
@@ -36,7 +45,7 @@ async def test_execute_delegates_to_kernel_client(tmp_path, stub_request):
 async def test_health_false_without_client_then_true(tmp_path, stub_request):
     sb = _docker(tmp_path)
     assert await sb.health() is False  # not started yet
-    sb._client = HttpKernelClient(stub_request(lambda m, e, **kw: httpx.Response(200, json={"protocol_version": 1})))
+    sb._client = HttpKernelClient(stub_request(lambda m, e, **kw: httpx.Response(200, json={"protocol_version": 2})))
     assert await sb.health() is True
 
 

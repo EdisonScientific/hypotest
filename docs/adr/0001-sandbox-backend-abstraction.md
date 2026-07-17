@@ -1,6 +1,6 @@
 # ADR 0001 — Sandbox Backend Abstraction
 
-- **Status:** Proposed (2026-06-03)
+- **Status:** Accepted (2026-06-03; OpenSandbox extension 2026-07-17)
 - **Supersedes:** the ad-hoc backend branching in `src/hypotest/env/interpreter_env.py`
 - **Deciders:** sandbox / RL infra
 
@@ -49,6 +49,12 @@ The single in-sandbox contract is the existing `kernel_server.py` HTTP API
 docker, enroot, and k8s pods all run this server; only **local** talks to a `jupyter_client`
 kernel directly.
 
+`/execute` is a short-request submit-and-poll protocol: `POST /execute` returns
+`202 {execution_id, status}`, and `GET /execute/{execution_id}` returns progress or the
+terminal notebook result. `X-Req-UUID` is the idempotency key, so a lost submit response can
+be retried without running a cell twice. `HttpKernelClient.execute()` hides polling from the
+environment/model and preserves the original synchronous-looking tool contract.
+
 `AsyncSandboxConnector.send_request(method, endpoint, **kwargs) -> httpx.Response` is
 httpx-shaped, so k8s uses the **same client** as docker — only the request function differs:
 
@@ -66,9 +72,12 @@ class HttpKernelClient:
     """Speaks the kernel_server HTTP protocol over any httpx-shaped request fn."""
     def __init__(self, request: RequestFn): self._request = request
     async def execute(self, code, timeout, req_uuid=""):
-        r = await self._request("POST", "/execute", json={"code": code, "timeout": timeout},
-                                headers={"X-Req-UUID": req_uuid}, timeout=...)
-        return _parse_execute_response(r)        # identical for docker + k8s
+        submitted = await self._request("POST", "/execute",
+            json={"code": code, "timeout": timeout}, headers={"X-Req-UUID": req_uuid})
+        while True:
+            polled = await self._request("GET", f"/execute/{submitted.json()['execution_id']}")
+            if polled.json()["status"] == "completed": return _parse_execute_data(polled.json()["result"])
+            await asyncio.sleep(POLL_INTERVAL)
     # reset / list_dir / health / load_capsule similar
 
 # docker: HttpKernelClient(httpx.AsyncClient(base_url=f"http://localhost:{port}").request)
@@ -100,9 +109,9 @@ class Sandbox(ABC):
 ```
 
 Implementations: `LocalSandbox` (wraps `Interpreter`, no client), `DockerSandbox`,
-`EnrootSandbox` (ray placement), `K8sSandbox` (agent-sandbox). Each owns its provisioning and
-a `KernelClient`; `execute/reset/list_dir/health` delegate to the client (or to `Interpreter`
-for local).
+`EnrootSandbox` (ray placement), `K8sSandbox` (agent-sandbox), and `OpenSandboxSandbox`
+(raw OpenSandbox SDK lifecycle). Each owns its provisioning and a `KernelClient`;
+`execute/reset/list_dir/health` delegate to the client (or to `Interpreter` for local).
 
 ```python
 result = await self.sandbox.execute(code, timeout, req_uuid)   # the whole dispatch
@@ -119,6 +128,7 @@ teardown lives in its own impl.
 | **docker** | aiodocker container | `HttpKernelClient` → `localhost:port` | single host | bind-mount, dataset-server pre-pull | none (unsupported) | `/list_dir` via client |
 | **enroot** | enroot squashfs subprocess | ray actor `.remote()` → in-actor `HttpKernelClient` | **ray SPREAD** (required) | bind-mount, dataset-server pre-pull | `prlimit` (default) | `/list_dir` via client |
 | **k8s** | agent-sandbox `Sandbox` claim, fresh per task | `connector.send_request` → `HttpKernelClient` | k8s scheduler + `SandboxScheduler` LB across clusters | in-pod `/load_capsule` pull | pod `resources.limits` (cgroup, kubelet-set) | `/list_dir` via client |
+| **OpenSandbox** | `opensandbox.Sandbox.create` against a remote server | SDK `get_endpoint(8000)` → `HttpKernelClient` | OpenSandbox server/runtime; local backend fallback | object-store init pull before `/health`, or single/collection bundled image | lifecycle `resource` map | `/list_dir` via client |
 
 Backend specifics — `warmpool`, `terminate`, `X-Sandbox-*`, ray refs, aiodocker handles,
 `max_concurrency` — **stay inside their impl**. The `Sandbox` ABC sees none of them.
@@ -137,10 +147,32 @@ it differs by backend and is each impl's job inside `start()`:
 - **enroot / docker**: the kernel reads a **host dir** bind-mounted in; the dataset server
   pulls the capsule onto that host dir first (the existing lazy pull).
 - **local**: capsule populated into `work_dir`.
+- **OpenSandbox / object-store**: the lifecycle request injects `CAPSULE_SOURCE` and the exact
+  relative `CAPSULE_KEY`. The container pulls it into `/workspace` before Jupyter or the HTTP
+  server starts. The normal path therefore performs no post-ready `/load_capsule` call;
+  `/health` means both data and kernel are ready. The dataset episode timer starts only after
+  `OpenSandboxSandbox.start()` returns. Image-baked source/key defaults remain available, with
+  per-allocation env taking precedence.
+- **OpenSandbox / large-bundle**: `/load_capsule` is skipped. The build script supports two
+  standard Docker/OCI layouts. A single-capsule image puts one task directly under
+  `/workspace` and is selected from a map/template. A collection image puts all immediate
+  capsule directories under `/opt/hypotest/capsules`; every task uses one shared image and the
+  OpenSandbox create call injects `HYPOTEST_BUNDLE_CAPSULE_ID`. Before kernel startup, the
+  capsule server validates that identity and projects the selected member's top-level entries
+  into `/workspace` as symlinks, avoiding a per-sandbox data copy. The script can load either
+  layout into a same-host Docker daemon or push it to a remote-runtime-visible registry and
+  emits a digest-pinned config plus the matching Linux architecture. The Hypotest client
+  supplies the lifecycle API's required kernel-server entrypoint explicitly.
 
-**Fallback implication:** the data a failed k8s `start()` pulled dies with the terminated
-pod, so the enroot fallback re-provisions the same ref **its own way** (host-pull + mount) —
-it does not inherit the pod's copy. The ref is shared; "data ready" is per-impl.
+  The collection projection is a performance boundary, not a security boundary: sibling
+  capsules remain reachable by absolute path inside the container. This weaker isolation is
+  accepted for now. `project_collection_capsule()` is the explicit replacement seam for a
+  future bubblewrap/bind-mount namespace that exposes only the selected subtree.
+
+**Fallback implication:** the dataset server always stages the capsule in the local task
+workspace, including when the primary remote backend pulls or bundles its own copy. A failed
+remote placement can therefore start the local/enroot/docker fallback with complete data; it
+does not inherit the terminated remote sandbox's filesystem.
 
 **Future — integrity verification.** For now we trust the two delivery paths produce identical
 bytes. Long-run, `load_capsule` / the host-pull should return a `CapsuleDigest` (per-file or
@@ -181,12 +213,14 @@ Recovery is backend-agnostic *because* history is above the seam.
 cgroups do **not** work on the current cluster (no cgroup delegation for the non-root enroot
 user), so we do **not** mandate them.
 
-- `ResourceSpec(mem_mb, mem_high_mb?, max_pids)` is the uniform spec.
+- `ResourceSpec(mem_mb, mem_high_mb?, max_pids, cpu, disk_gib, gpu, gpu_type)` is the uniform spec.
 - A **pluggable, config-selected limiter** maps it per backend:
   - **enroot (default): `prlimit`** — `RLIMIT_AS` + `RLIMIT_NPROC` (works today).
   - **cgroups v2 (opt-in):** `memory.max` (+ optional `memory.high`), `pids.max`, where the
     node supports delegation (e.g. via `systemd-run --scope`). Off by default.
   - **k8s:** pod `resources.limits` — the kubelet sets the cgroup; no delegation issue.
+  - **OpenSandbox:** `cpu`, `memory`, `ephemeral-storage`, `gpu`, and `gpu_type` quantities on
+    `Sandbox.create`; the selected server runtime enforces them.
   - **local / docker:** unsupported (no-op).
 
 **Known, accepted gap:** `RLIMIT_AS` limits *virtual address space* (over-reserved by
@@ -229,8 +263,8 @@ Requirements either way:
 - Orchestrator ServiceAccount needs **RBAC** to CRUD `Sandbox` CRDs in each sandbox namespace.
 - Use the **async** SDK (`async_sandbox` / `async_connector`); the local-tunnel mode is
   sync/dev-only.
-- Router `PROXY_TIMEOUT_SECONDS` (default **180s**) must be raised ≥ max cell timeout, or
-  long executions are silently cut off. (Handled cluster-side.)
+- Long cells do not require long proxy requests: submit and every poll are bounded control
+  calls. The overall client deadline still includes the cell timeout and interrupt headroom.
 
 **`K8sSandbox.start()`** (fresh pod per task — chosen for isolation; no warm pool):
 create claim → wait **`SandboxReady`** (CRD condition) → wait our **`/health`** (kernel up;
@@ -240,6 +274,28 @@ two-level readiness) → `/load_capsule(uuid)`. `close()` → `sandbox.terminate
 Latency lever (fresh pod pays full cold-start + capsule pull, which governs the fallback
 timeout): bake `CAPSULE_UUID` into the pod spec so the entrypoint pulls during boot, overlapping
 kernel start, instead of a serial post-ready `/load_capsule`.
+
+### OpenSandbox remote flow
+
+`OpenSandboxSandbox.start()` calls `opensandbox.Sandbox.create(...)` with an explicit
+`/opt/entrypoint.sh ... hypotest.kernel_capsule_server` command, obtains the arbitrary port
+endpoint with `get_endpoint(8000)`, preserves every returned routing/security header, and polls
+Hypotest's `/health`. Capsule download happens inside process initialization, before the kernel
+and health server start, so it overlaps allocation readiness instead of adding a serial request
+after readiness. When `use_server_proxy` is enabled, request paths are joined relative to the
+returned proxy prefix and the lifecycle API key is sent only to that proxy, never to a direct
+sandbox address. `close()` kills the remote sandbox and then closes SDK-local resources.
+
+Public images are passed to the SDK as a string. Private images follow NeMo Gym's OpenSandbox
+integration: Hypotest constructs `SandboxImageSpec(image, auth=SandboxImageAuth(...))` so the
+remote runtime—not the orchestrator's Docker daemon—can authenticate its pull. Registry secrets
+may be supplied as exact `${ENV_VAR}` config references, are redacted by the config model, and
+are never placed in container env or image layers. The remote workload provider must support
+per-request image auth. The image pull policy is sent in both the `imagePullPolicy` and
+`opensandbox.extensions.image-pull-policy` extension spellings used by OpenSandbox deployments.
+
+The SDK's canonical environment names are `OPEN_SANDBOX_DOMAIN` and
+`OPEN_SANDBOX_API_KEY`. Explicit config wins; otherwise Hypotest leaves resolution to the SDK.
 
 ## 8. Protocol versioning
 
@@ -275,9 +331,9 @@ enroot `.sqsh`, k8s bundled) **and** the orchestrator client, deployed on differ
 
 | # | Decision |
 |---|---|
-| 1 | Router `PROXY_TIMEOUT_SECONDS` raised ≥ max cell timeout — handled cluster-side |
+| 1 | `/execute` is idempotent submit-and-poll, keeping every proxy request short |
 | 2 | **Fresh pod per task** (no warm pool) — bad-reset risk |
-| 3 | `start()` folds capsule-load; k8s via `/load_capsule`; two-level readiness |
+| 3 | `start()` folds capsule delivery; k8s via `/load_capsule`, OpenSandbox via init env before `/health` |
 | 4 | Capsule **ref** uniform; per-impl delivery; **hash verification** is a future hook |
 | 5 | Recovery = swap + capped replay; fidelity not guaranteed (mitigated by reproducible-code prompting) |
 | 6 | Pluggable limiter; **prlimit default**, cgroups opt-in; prlimit↔cgroup semantic gap accepted |
@@ -285,6 +341,9 @@ enroot `.sqsh`, k8s bundled) **and** the orchestrator client, deployed on differ
 | 8 | `commands.run` not used; persistent kernel server reached over HTTP via the connector |
 | 9 | `/list_dir` via our endpoint; ray kept as enroot placement |
 | 10 | Protocol is a versioned contract: additive-only + `protocol_version` in `/health` |
+| 11 | OpenSandbox uses raw SDK lifecycle + arbitrary endpoint calls; remote failure falls back to the locally staged backend |
+| 12 | OpenSandbox defaults to exact object-store init pull; single-capsule/shared-collection images remain optional |
+| 13 | Private OpenSandbox images use SDK `SandboxImageSpec.auth`; registry secrets are runtime-only |
 
 ## 12. Migration (outline — detailed impl plan to follow)
 

@@ -12,6 +12,10 @@ from hypotest.env.sandbox import (
     K8sSandbox,
     K8sSandboxSpec,
     LocalSandbox,
+    OpenSandboxFallbackScheduler,
+    OpenSandboxSandbox,
+    OpenSandboxSpec,
+    OpenSandboxUnavailableError,
     ResourceSpec,
     SandboxConfig,
     StaticSandboxScheduler,
@@ -24,7 +28,7 @@ def _local_config(tmp_path):
 
 
 def _healthy(method, endpoint, **kwargs):
-    return httpx.Response(200, json={"protocol_version": 1} if endpoint == "/health" else {})
+    return httpx.Response(200, json={"protocol_version": 2} if endpoint == "/health" else {})
 
 
 @pytest.mark.asyncio
@@ -134,3 +138,23 @@ async def test_p2c_spreads_across_equal_clusters(tmp_path, monkeypatch, make_fak
         used.add(sb._spec.warmpool)
         await sb.close()
     assert used == {"a", "b"}  # both clusters get traffic under equal load
+
+
+@pytest.mark.asyncio
+async def test_opensandbox_unavailable_falls_back_to_locally_staged_backend(tmp_path, monkeypatch):
+    async def _unavailable(self):  # noqa: RUF029
+        raise OpenSandboxUnavailableError("remote server down")
+
+    monkeypatch.setattr(OpenSandboxSandbox, "start", _unavailable)
+    scheduler = OpenSandboxFallbackScheduler(
+        _local_config(tmp_path),
+        OpenSandboxSpec(image="kernel:latest", create_attempts=1),
+        _local_config(tmp_path),
+    )
+
+    sandbox = await scheduler.acquire(CapsuleRef(uuid="cap-1"), ResourceSpec())
+    try:
+        assert isinstance(sandbox, LocalSandbox)
+        assert await sandbox.health() is True
+    finally:
+        await sandbox.close()

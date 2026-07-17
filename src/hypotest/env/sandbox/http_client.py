@@ -18,7 +18,9 @@ docs/adr/0001-sandbox-backend-abstraction.md §2.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import uuid
 from typing import Any, Literal
 
 import httpx
@@ -30,13 +32,15 @@ from hypotest.env.sandbox.base import RequestFn
 logger = logging.getLogger(__name__)
 
 # Bumped in lockstep with kernel_server.PROTOCOL_VERSION (added in PR d).
-EXPECTED_PROTOCOL_VERSION = 1
+EXPECTED_PROTOCOL_VERSION = 2
 
 _HEALTH_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
 
 # The wire deadline must outlive both the cell and its bounded interrupt/drain.
 _MIN_WIRE_TIMEOUT_HEADROOM_S = 30.0
 _POST_RECOVERY_TRANSPORT_MARGIN_S = 20.0
+_CONTROL_REQUEST_TIMEOUT_S = 30.0
+_SUBMIT_ATTEMPTS = 3
 
 
 def execute_wire_timeout_seconds(
@@ -53,9 +57,8 @@ class ProtocolVersionError(RuntimeError):
     """The kernel server speaks an incompatible protocol version (deploy skew)."""
 
 
-def _parse_execute_response(response: httpx.Response) -> ExecutionResult:
-    """Deserialize an /execute response body into an ExecutionResult."""
-    data = response.json()
+def _parse_execute_data(data: dict[str, Any]) -> ExecutionResult:
+    """Deserialize a terminal execution payload into an ExecutionResult."""
     notebook_outputs = [nbformat.from_dict(o) for o in data["notebook_outputs"]]
     return ExecutionResult(
         notebook_outputs=notebook_outputs,
@@ -79,47 +82,92 @@ class HttpKernelClient:
         interrupt_grace_seconds: float = 10.0,
         label: str = "kernel",
         owns: httpx.AsyncClient | None = None,
+        execution_poll_interval_seconds: float = 0.5,
     ) -> None:
         self._request = request
         self._execution_timeout = execution_timeout
         self._timeout_recovery = timeout_recovery
         self._interrupt_grace_seconds = interrupt_grace_seconds
         self._label = label
+        self._execution_poll_interval_seconds = execution_poll_interval_seconds
         # An httpx client this wrapper owns and should aclose() on close (docker);
         # for the connector transport this is None (the SDK owns it).
         self._owns = owns
 
     async def execute(self, code: str, timeout: float | None = None, req_uuid: str = "") -> ExecutionResult:  # noqa: ASYNC109
-        """Execute code via POST /execute.
+        """Submit code and hide the asynchronous polling protocol from callers.
 
-        Converts httpx timeouts into an error ExecutionResult, since the kernel
-        server's internal asyncio.timeout may not cancel the ZMQ recv promptly.
+        Every HTTP request stays short enough to traverse a remote lifecycle
+        proxy. The overall deadline still outlives the cell and its bounded
+        interrupt/drain. ``X-Req-UUID`` makes a repeated submit idempotent if the
+        first response is lost.
         """
         effective_timeout = timeout if timeout is not None else self._execution_timeout
-        kwargs: dict[str, Any] = {
-            "json": {
-                "code": code,
-                "timeout": timeout,
-                "timeout_recovery": self._timeout_recovery,
-                "interrupt_grace_seconds": self._interrupt_grace_seconds,
-            },
-            "timeout": httpx.Timeout(
-                execute_wire_timeout_seconds(
-                    effective_timeout,
-                    self._timeout_recovery,
-                    self._interrupt_grace_seconds,
-                ),
-                connect=10.0,
-            ),
+        logical_request_id = req_uuid or str(uuid.uuid4())
+        headers = {"X-Req-UUID": logical_request_id}
+        payload: dict[str, Any] = {
+            "code": code,
+            "timeout": timeout,
+            "timeout_recovery": self._timeout_recovery,
+            "interrupt_grace_seconds": self._interrupt_grace_seconds,
         }
-        if req_uuid:
-            kwargs["headers"] = {"X-Req-UUID": req_uuid}
+        overall_timeout = execute_wire_timeout_seconds(
+            effective_timeout,
+            self._timeout_recovery,
+            self._interrupt_grace_seconds,
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + overall_timeout
+        execution_id = ""
+
         try:
-            response = await self._request("POST", "/execute", **kwargs)
-            response.raise_for_status()
+            response: httpx.Response | None = None
+            for attempt in range(_SUBMIT_ATTEMPTS):
+                try:
+                    response = await self._request(
+                        "POST",
+                        "/execute",
+                        json=payload,
+                        headers=headers,
+                        timeout=self._control_timeout(deadline),
+                    )
+                    response.raise_for_status()
+                    break
+                except httpx.TransportError:
+                    if attempt + 1 >= _SUBMIT_ATTEMPTS or loop.time() >= deadline:
+                        raise
+                    await asyncio.sleep(min(self._execution_poll_interval_seconds, max(0.0, deadline - loop.time())))
+
+            assert response is not None
+            execution_id = str(response.json()["execution_id"])
+
+            while True:
+                if loop.time() >= deadline:
+                    raise httpx.ReadTimeout(f"execution polling exceeded {overall_timeout:g}s")
+                poll = await self._request(
+                    "GET",
+                    f"/execute/{execution_id}",
+                    headers=headers,
+                    timeout=self._control_timeout(deadline),
+                )
+                poll.raise_for_status()
+                data = poll.json()
+                job_status = data["status"]
+                if job_status == "completed":
+                    result = data.get("result")
+                    if result is None:
+                        raise RuntimeError(f"Kernel execution {execution_id} completed without a result")
+                    return _parse_execute_data(result)
+                if job_status in {"failed", "cancelled"}:
+                    raise RuntimeError(
+                        f"Kernel execution {execution_id} {job_status}: {data.get('error') or 'unknown error'}"
+                    )
+                await asyncio.sleep(min(self._execution_poll_interval_seconds, max(0.0, deadline - loop.time())))
         except httpx.TimeoutException as e:
+            if execution_id:
+                await self._cancel_after_client_timeout(execution_id, headers)
             logger.warning(
-                "[%s] HTTP %s during /execute (requested kernel timeout=%.1fs): %s",
+                "[%s] HTTP %s during submit/poll execution (requested kernel timeout=%.1fs): %s",
                 self._label,
                 type(e).__name__,
                 effective_timeout,
@@ -138,7 +186,25 @@ class HttpKernelClient:
                 timed_out=True,
                 timeout_recovery="wedged",
             )
-        return _parse_execute_response(response)
+
+    @staticmethod
+    def _control_timeout(deadline: float) -> httpx.Timeout:
+        remaining = max(0.001, deadline - asyncio.get_running_loop().time())
+        total = min(_CONTROL_REQUEST_TIMEOUT_S, remaining)
+        return httpx.Timeout(total, connect=min(10.0, total))
+
+    async def _cancel_after_client_timeout(self, execution_id: str, headers: dict[str, str]) -> None:
+        """Best-effort interrupt so an abandoned request does not occupy the kernel."""
+        try:
+            response = await self._request(
+                "POST",
+                f"/execute/{execution_id}/cancel",
+                headers=headers,
+                timeout=httpx.Timeout(10.0, connect=5.0),
+            )
+            response.raise_for_status()
+        except Exception:
+            logger.warning("[%s] failed to cancel timed-out execution %s", self._label, execution_id)
 
     async def reset(self, seed: int | None = None) -> None:
         """Reset the kernel via POST /reset."""
@@ -152,9 +218,7 @@ class HttpKernelClient:
             logger.warning("[%s] HTTP %s during /reset: %s", self._label, type(e).__name__, e)
             raise RuntimeError(f"Kernel reset timed out: {e}") from e
         if seed is not None and response.json().get("seed") != seed:
-            raise ProtocolVersionError(
-                f"kernel server did not confirm deterministic reset seed {seed} (deploy skew)"
-            )
+            raise ProtocolVersionError(f"kernel server did not confirm deterministic reset seed {seed} (deploy skew)")
 
     async def list_dir(self, directory: str = ".", max_files: int = 20, show_hidden: bool = False) -> str:
         """List the workspace via GET /list_dir (endpoint added in PR d)."""
@@ -167,7 +231,7 @@ class HttpKernelClient:
         return response.json()["listing"]
 
     async def load_capsule(self, uuid: str, seed: int | None = None) -> int:
-        """Pull the most-recent capsule for `uuid` in-pod via POST /load_capsule.
+        """Pull a capsule by exact key (with legacy UUID fallback) via POST /load_capsule.
 
         Returns the number of objects placed.
         """
@@ -185,18 +249,18 @@ class HttpKernelClient:
         response.raise_for_status()
         data = response.json()
         if seed is not None and data.get("seed") != seed:
-            raise ProtocolVersionError(
-                f"kernel server did not confirm deterministic capsule seed {seed} (deploy skew)"
-            )
+            raise ProtocolVersionError(f"kernel server did not confirm deterministic capsule seed {seed} (deploy skew)")
         return data["objects"]
 
-    async def health(self) -> bool:
+    async def health(self, *, raise_for_status: bool = False) -> bool:
         """Return whether GET /health reports ready, rejecting protocol skew."""
         try:
             response = await self._request("GET", "/health", timeout=_HEALTH_TIMEOUT)
         except httpx.HTTPError:
             return False
         if response.status_code != 200:
+            if raise_for_status:
+                response.raise_for_status()
             return False
         version = response.json().get("protocol_version")
         if version is not None and version != EXPECTED_PROTOCOL_VERSION:

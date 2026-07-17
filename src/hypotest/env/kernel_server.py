@@ -11,19 +11,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import re
+import shutil
+import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from enum import StrEnum, auto
 from pathlib import Path
 from queue import Empty
-from typing import Any, Literal, assert_never
+from typing import Annotated, Any, Literal, assert_never
 
 import nbformat
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException, status
 from jupyter_client.asynchronous.client import AsyncKernelClient
 from jupyter_client.manager import AsyncKernelManager
 from nbformat import NotebookNode
@@ -92,7 +96,7 @@ del _hypotest_seed_all_rngs
 # Wire-protocol version for the kernel-server HTTP API. Bump on a breaking change
 # to /execute, /reset, /list_dir, /load_capsule, or /health; the client
 # (HttpKernelClient) reads it from /health to detect deploy skew.
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 # =============================================================================
@@ -252,6 +256,49 @@ class ExecuteResponse(BaseModel):
     interrupt_seconds: float | None = None
 
 
+class ExecuteJobStatus(StrEnum):
+    """Transport-level state for an asynchronously submitted cell."""
+
+    QUEUED = auto()
+    RUNNING = auto()
+    COMPLETED = auto()
+    FAILED = auto()
+    CANCELLED = auto()
+
+
+class ExecuteSubmissionResponse(BaseModel):
+    """Immediate response returned after accepting an execution request."""
+
+    execution_id: str
+    status: ExecuteJobStatus
+
+
+class ExecutePollResponse(ExecuteSubmissionResponse):
+    """Current state of a submitted execution, including its terminal payload."""
+
+    result: ExecuteResponse | None = None
+    error: str | None = None
+
+
+@dataclass
+class _ExecutionJob:
+    """Server-internal execution record retained so clients can reconnect and poll."""
+
+    execution_id: str
+    request_id: str
+    request: ExecuteRequest
+    status: ExecuteJobStatus
+    created_at: float
+    completed_at: float | None = None
+    result: ExecuteResponse | None = None
+    error: str | None = None
+    task: asyncio.Task[None] | None = None
+
+
+class IdempotencyConflictError(ValueError):
+    """A request UUID was reused for a different execution payload."""
+
+
 class ResetResponse(BaseModel):
     """Response model for /reset endpoint."""
 
@@ -312,6 +359,8 @@ class KernelServer:
         startup_token: str = "",
         safe_execute: bool = True,
         seed: int | None = None,
+        execution_result_ttl_seconds: float = 3600,
+        max_retained_executions: int = 256,
     ):
         self.work_dir = work_dir
         self.language = language
@@ -319,6 +368,8 @@ class KernelServer:
         self.startup_token = startup_token
         self.safe_execute = safe_execute
         self.seed = seed
+        self.execution_result_ttl_seconds = execution_result_ttl_seconds
+        self.max_retained_executions = max_retained_executions
 
         self._kernel_manager: AsyncKernelManager | None = None
         self._client: AsyncKernelClient | None = None
@@ -326,6 +377,10 @@ class KernelServer:
         self._execution_state = KernelExecutionState.IDLE
         self._state_lock = asyncio.Lock()
         self._active_msg_id: str | None = None
+        self._execution_jobs: dict[str, _ExecutionJob] = {}
+        self._execution_ids_by_request: dict[str, str] = {}
+        self._execution_jobs_lock = asyncio.Lock()
+        self._kernel_runtime_dir: Path | None = None
 
     async def start(self) -> None:
         """Start the Jupyter kernel."""
@@ -333,11 +388,12 @@ class KernelServer:
             return
 
         kernel_name = self.language.make_kernelspec()["name"]
-        kernel_runtime_dir = self.work_dir / ".jupyter_runtime"
-        kernel_runtime_dir.mkdir(exist_ok=True)
-
-        conn_uuid = uuid.uuid4()
-        kernel_connect_file = (kernel_runtime_dir / f"conn_{conn_uuid}.json").resolve()
+        # ZeroMQ appends an IPC channel suffix to this path. Keeping it under a
+        # short private runtime directory avoids macOS/Linux sockaddr_un limits
+        # when the task workspace itself has a long path.
+        runtime_root = Path(os.getenv("HYPOTEST_KERNEL_RUNTIME_ROOT", tempfile.gettempdir()))
+        self._kernel_runtime_dir = Path(tempfile.mkdtemp(prefix="hk-", dir=runtime_root))
+        kernel_connect_file = (self._kernel_runtime_dir / "c.json").resolve()
 
         self._kernel_manager = AsyncKernelManager(
             kernel_name=kernel_name, transport="ipc", connection_file=str(kernel_connect_file)
@@ -345,12 +401,10 @@ class KernelServer:
         kernel_env = os.environ.copy()
         if self.seed is not None:
             kernel_env.update(deterministic_kernel_env(self.seed))
-        await self._kernel_manager.start_kernel(cwd=str(self.work_dir), env=kernel_env)
-
-        self._client = self._kernel_manager.client()
-        self._client.start_channels()
-
         try:
+            await self._kernel_manager.start_kernel(cwd=str(self.work_dir), env=kernel_env)
+            self._client = self._kernel_manager.client()
+            self._client.start_channels()
             await self._client.wait_for_ready()
             if self.seed is not None:
                 bootstrap = await self._execute_code(
@@ -361,9 +415,156 @@ class KernelServer:
                 if bootstrap.error_occurred:
                     raise RuntimeError("Deterministic kernel RNG bootstrap failed")
             self._is_ready = True
+            await self._set_execution_state(KernelExecutionState.IDLE)
             logger.info(f"Kernel {kernel_name} started in {self.work_dir}")
         except Exception as e:
+            if self._client is not None:
+                self._client.stop_channels()
+                self._client = None
+            if self._kernel_manager is not None:
+                with contextlib.suppress(Exception):
+                    await self._kernel_manager.shutdown_kernel(now=True)
+                with contextlib.suppress(Exception):
+                    await self._kernel_manager.cleanup_resources(restart=False)
+            self._is_ready = False
+            self._cleanup_kernel_runtime_dir()
             raise RuntimeError(f"Kernel failed to start: {e}") from e
+
+    def _cleanup_kernel_runtime_dir(self) -> None:
+        runtime_dir, self._kernel_runtime_dir = self._kernel_runtime_dir, None
+        if runtime_dir is not None:
+            shutil.rmtree(runtime_dir, ignore_errors=True)
+
+    async def submit_execution(self, req: ExecuteRequest, request_id: str | None = None) -> ExecuteSubmissionResponse:
+        """Accept one cell and start it in a detached task.
+
+        ``request_id`` is an idempotency key. Repeating the same request returns
+        the original execution id; reusing the key for a different payload is a
+        conflict. This prevents a lost submit response from executing a cell twice.
+        """
+        request_id = request_id or str(uuid.uuid4())
+        now = time.monotonic()
+        async with self._execution_jobs_lock:
+            self._prune_execution_jobs_locked(now)
+            existing_id = self._execution_ids_by_request.get(request_id)
+            if existing_id is not None:
+                existing = self._execution_jobs.get(existing_id)
+                if existing is not None:
+                    if existing.request != req:
+                        raise IdempotencyConflictError(
+                            f"X-Req-UUID {request_id!r} was already used for a different execution"
+                        )
+                    return ExecuteSubmissionResponse(
+                        execution_id=existing.execution_id,
+                        status=existing.status,
+                    )
+                # A stale reverse index should never survive pruning, but heal it
+                # defensively rather than making this request permanently unusable.
+                self._execution_ids_by_request.pop(request_id, None)
+
+            execution_id = str(uuid.uuid4())
+            job = _ExecutionJob(
+                execution_id=execution_id,
+                request_id=request_id,
+                request=req,
+                status=ExecuteJobStatus.QUEUED,
+                created_at=now,
+            )
+            self._execution_jobs[execution_id] = job
+            self._execution_ids_by_request[request_id] = execution_id
+            job.task = asyncio.create_task(
+                self._run_execution_job(job),
+                name=f"kernel-execute:{execution_id}",
+            )
+            return ExecuteSubmissionResponse(execution_id=execution_id, status=job.status)
+
+    async def get_execution(self, execution_id: str) -> ExecutePollResponse | None:
+        """Return one retained execution, or ``None`` when it is unknown/expired."""
+        async with self._execution_jobs_lock:
+            self._prune_execution_jobs_locked(time.monotonic())
+            job = self._execution_jobs.get(execution_id)
+            if job is None:
+                return None
+            return ExecutePollResponse(
+                execution_id=job.execution_id,
+                status=job.status,
+                result=job.result,
+                error=job.error,
+            )
+
+    async def cancel_execution(self, execution_id: str) -> ExecutePollResponse | None:
+        """Cancel an active execution and return its resulting state."""
+        async with self._execution_jobs_lock:
+            job = self._execution_jobs.get(execution_id)
+            task = job.task if job is not None else None
+        if job is None:
+            return None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        return await self.get_execution(execution_id)
+
+    async def _run_execution_job(self, job: _ExecutionJob) -> None:
+        async with self._execution_jobs_lock:
+            job.status = ExecuteJobStatus.RUNNING
+        try:
+            job.result = await self.execute(
+                job.request.code,
+                job.request.timeout,
+                timeout_recovery=job.request.timeout_recovery,
+                interrupt_grace_seconds=job.request.interrupt_grace_seconds,
+            )
+        except asyncio.CancelledError:
+            async with self._execution_jobs_lock:
+                job.status = ExecuteJobStatus.CANCELLED
+                job.error = "Execution was cancelled"
+                job.completed_at = time.monotonic()
+            raise
+        except Exception as exc:
+            logger.exception("Detached kernel execution %s failed", job.execution_id)
+            async with self._execution_jobs_lock:
+                job.status = ExecuteJobStatus.FAILED
+                job.error = f"{type(exc).__name__}: {exc}"
+                job.completed_at = time.monotonic()
+        else:
+            async with self._execution_jobs_lock:
+                job.status = ExecuteJobStatus.COMPLETED
+                job.completed_at = time.monotonic()
+
+    def _prune_execution_jobs_locked(self, now: float) -> None:
+        """Drop expired results and bound retained terminal executions."""
+        expired = [
+            execution_id
+            for execution_id, job in self._execution_jobs.items()
+            if job.completed_at is not None and now - job.completed_at >= self.execution_result_ttl_seconds
+        ]
+        for execution_id in expired:
+            self._drop_execution_job_locked(execution_id)
+
+        overflow = len(self._execution_jobs) - self.max_retained_executions
+        if overflow <= 0:
+            return
+        terminal = sorted(
+            (job for job in self._execution_jobs.values() if job.completed_at is not None),
+            key=lambda job: job.completed_at or job.created_at,
+        )
+        for job in terminal[:overflow]:
+            self._drop_execution_job_locked(job.execution_id)
+
+    def _drop_execution_job_locked(self, execution_id: str) -> None:
+        job = self._execution_jobs.pop(execution_id, None)
+        if job is not None:
+            self._execution_ids_by_request.pop(job.request_id, None)
+
+    async def _cancel_active_execution_jobs(self) -> None:
+        """Cancel every detached execution before resetting or closing the kernel."""
+        async with self._execution_jobs_lock:
+            tasks = [job.task for job in self._execution_jobs.values() if job.task is not None and not job.task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def execute(
         self,
@@ -593,6 +794,7 @@ class KernelServer:
 
     async def reset(self, seed: int | None = None) -> ResetResponse:
         """Reset the kernel to a clean state."""
+        await self._cancel_active_execution_jobs()
         if seed is not None:
             self.seed = seed
         if self._is_ready and self._kernel_manager:
@@ -601,7 +803,9 @@ class KernelServer:
                 self._client = None
 
             await self._kernel_manager.shutdown_kernel(now=True)
+            await self._kernel_manager.cleanup_resources(restart=False)
             self._is_ready = False
+            self._cleanup_kernel_runtime_dir()
 
         await self.start()
         await self._set_execution_state(KernelExecutionState.IDLE)
@@ -609,6 +813,7 @@ class KernelServer:
 
     async def close(self) -> None:
         """Shutdown the kernel."""
+        await self._cancel_active_execution_jobs()
         if self._is_ready and self._kernel_manager:
             if self._client:
                 self._client.stop_channels()
@@ -618,6 +823,7 @@ class KernelServer:
             await self._kernel_manager.cleanup_resources(restart=False)
             self._is_ready = False
             await self._set_execution_state(KernelExecutionState.CLOSED)
+            self._cleanup_kernel_runtime_dir()
             logger.info("Kernel shutdown complete")
 
     def list_dir(self, directory: str = ".", max_files: int = 20, show_hidden: bool = False) -> str:
@@ -653,14 +859,33 @@ def create_app(server: KernelServer) -> FastAPI:
     """Create the FastAPI application."""
     app = FastAPI(title="Kernel Server")
 
-    @app.post("/execute")
-    async def execute(req: ExecuteRequest) -> ExecuteResponse:
-        return await server.execute(
-            req.code,
-            req.timeout,
-            timeout_recovery=req.timeout_recovery,
-            interrupt_grace_seconds=req.interrupt_grace_seconds,
-        )
+    @app.post(
+        "/execute",
+        response_model=ExecuteSubmissionResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def execute(
+        req: ExecuteRequest,
+        request_id: Annotated[str | None, Header(alias="X-Req-UUID")] = None,
+    ) -> ExecuteSubmissionResponse:
+        try:
+            return await server.submit_execution(req, request_id)
+        except IdempotencyConflictError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    @app.get("/execute/{execution_id}", response_model=ExecutePollResponse)
+    async def get_execution(execution_id: str) -> ExecutePollResponse:
+        execution = await server.get_execution(execution_id)
+        if execution is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown or expired execution")
+        return execution
+
+    @app.post("/execute/{execution_id}/cancel", response_model=ExecutePollResponse)
+    async def cancel_execution(execution_id: str) -> ExecutePollResponse:
+        execution = await server.cancel_execution(execution_id)
+        if execution is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown or expired execution")
+        return execution
 
     @app.post("/reset")
     async def reset(req: ResetRequest | None = None) -> ResetResponse:

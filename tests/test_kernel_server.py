@@ -8,6 +8,7 @@ import pytest
 
 from hypotest.env.kernel_server import (
     PROTOCOL_VERSION,
+    ExecuteResponse,
     HealthResponse,
     KernelExecutionState,
     KernelServer,
@@ -132,6 +133,76 @@ async def test_reset_endpoint_accepts_seed(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert unseeded_response.status_code == 200
     assert captured == [987, None]
+
+
+@pytest.mark.asyncio
+async def test_execute_endpoint_submits_polls_and_deduplicates(tmp_path, monkeypatch):
+    server = _server(tmp_path)
+    calls: list[str] = []
+
+    async def fake_execute(code, timeout=None, **kwargs):  # noqa: ASYNC109
+        calls.append(code)
+        await asyncio.sleep(0)
+        return ExecuteResponse(notebook_outputs=[], error_occurred=False, execution_time=0.01)
+
+    monkeypatch.setattr(server, "execute", fake_execute)
+    transport = httpx.ASGITransport(app=create_app(server))
+    headers = {"X-Req-UUID": "logical-cell-1"}
+    payload = {"code": "x = 1", "timeout": 30}
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        submitted = await client.post("/execute", json=payload, headers=headers)
+        duplicate = await client.post("/execute", json=payload, headers=headers)
+        execution_id = submitted.json()["execution_id"]
+        for _ in range(10):
+            polled = await client.get(f"/execute/{execution_id}")
+            if polled.json()["status"] == "completed":
+                break
+            await asyncio.sleep(0)
+
+    assert submitted.status_code == 202
+    assert duplicate.json()["execution_id"] == execution_id
+    assert polled.json()["result"]["error_occurred"] is False
+    assert calls == ["x = 1"]
+
+
+@pytest.mark.asyncio
+async def test_execute_endpoint_rejects_idempotency_key_reuse(tmp_path, monkeypatch):
+    server = _server(tmp_path)
+
+    async def fake_execute(code, timeout=None, **kwargs):  # noqa: ASYNC109
+        await asyncio.sleep(0)
+        return ExecuteResponse(notebook_outputs=[], error_occurred=False, execution_time=0.0)
+
+    monkeypatch.setattr(server, "execute", fake_execute)
+    transport = httpx.ASGITransport(app=create_app(server))
+    headers = {"X-Req-UUID": "logical-cell-1"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/execute", json={"code": "x = 1"}, headers=headers)
+        conflict = await client.post("/execute", json={"code": "x = 2"}, headers=headers)
+
+    assert conflict.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_execute_endpoint_cancels_detached_execution(tmp_path, monkeypatch):
+    server = _server(tmp_path)
+    started = asyncio.Event()
+
+    async def fake_execute(code, timeout=None, **kwargs):  # noqa: ASYNC109
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(server, "execute", fake_execute)
+    transport = httpx.ASGITransport(app=create_app(server))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        submitted = await client.post("/execute", json={"code": "while True: pass"})
+        execution_id = submitted.json()["execution_id"]
+        await started.wait()
+        cancelled = await client.post(f"/execute/{execution_id}/cancel")
+
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
 
 
 @pytest.mark.asyncio

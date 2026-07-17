@@ -23,6 +23,11 @@ from dataclasses import replace
 from hypotest.env.sandbox.base import CapsuleRef, ResourceSpec, Sandbox, SandboxConfig
 from hypotest.env.sandbox.factory import make_sandbox
 from hypotest.env.sandbox.k8s import K8sSandbox, K8sSandboxSpec, NoCapacityError, warmpool_ready_replicas
+from hypotest.env.sandbox.opensandbox import (
+    OpenSandboxSandbox,
+    OpenSandboxSpec,
+    OpenSandboxUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,3 +112,40 @@ class K8sFallbackScheduler(SandboxScheduler):
     async def _ready_replicas(self, spec: K8sSandboxSpec) -> int:
         """Free warm-pod count for `spec`'s cluster (the P2C signal). Test seam — overridden in unit tests."""
         return await warmpool_ready_replicas(spec)
+
+
+class OpenSandboxFallbackScheduler(SandboxScheduler):
+    """Prefer a remote OpenSandbox server, then use the locally staged backend.
+
+    Only placement/reachability failures trigger fallback. Protocol skew and
+    capsule-loading errors remain visible because falling back would otherwise
+    hide a broken image or data configuration.
+    """
+
+    def __init__(
+        self,
+        remote_config: SandboxConfig,
+        spec: OpenSandboxSpec,
+        fallback_config: SandboxConfig,
+    ) -> None:
+        self._remote_config = remote_config
+        self._spec = spec
+        self._fallback_config = fallback_config
+
+    async def acquire(self, ref: CapsuleRef, resources: ResourceSpec) -> Sandbox:
+        remote = OpenSandboxSandbox(
+            replace(self._remote_config, ref=ref, resources=resources),
+            self._spec,
+        )
+        try:
+            await remote.start()
+        except OpenSandboxUnavailableError as exc:
+            logger.warning("OpenSandbox unavailable (%s); falling back to the locally staged backend", exc)
+            with contextlib.suppress(Exception):
+                await remote.close()
+        else:
+            return remote
+
+        fallback = make_sandbox(replace(self._fallback_config, ref=ref, resources=resources))
+        await fallback.start()
+        return fallback

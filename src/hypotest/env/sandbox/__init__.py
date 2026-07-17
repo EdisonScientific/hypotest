@@ -9,9 +9,9 @@ A uniform `Sandbox` interface with local/docker/enroot/k8s implementations behin
 a `make_sandbox` factory and a `SandboxScheduler`. See
 docs/adr/0001-sandbox-backend-abstraction.md.
 
-`K8sSandbox` is safe to import without the optional `k8s_agent_sandbox` SDK — it
-imports the SDK lazily inside `_allocate()`, so importing this package never
-requires the `k8s` extra to be installed.
+The remote backends are safe to import without their optional SDKs: both defer
+SDK imports until allocation, so importing this package requires neither the
+`k8s` nor the `opensandbox` extra.
 """
 
 from hypotest.env.sandbox.base import (
@@ -30,7 +30,18 @@ from hypotest.env.sandbox.factory import make_sandbox
 from hypotest.env.sandbox.http_client import HttpKernelClient, ProtocolVersionError, RequestFn
 from hypotest.env.sandbox.k8s import K8sSandbox, K8sSandboxSpec, NoCapacityError
 from hypotest.env.sandbox.local import LocalSandbox
-from hypotest.env.sandbox.scheduler import K8sFallbackScheduler, SandboxScheduler, StaticSandboxScheduler
+from hypotest.env.sandbox.opensandbox import (
+    OpenSandboxImageAuth,
+    OpenSandboxSandbox,
+    OpenSandboxSpec,
+    OpenSandboxUnavailableError,
+)
+from hypotest.env.sandbox.scheduler import (
+    K8sFallbackScheduler,
+    OpenSandboxFallbackScheduler,
+    SandboxScheduler,
+    StaticSandboxScheduler,
+)
 
 __all__ = [
     "CapsuleRef",
@@ -44,6 +55,11 @@ __all__ = [
     "LocalSandbox",
     "NoCapacityError",
     "NoopLimiter",
+    "OpenSandboxFallbackScheduler",
+    "OpenSandboxImageAuth",
+    "OpenSandboxSandbox",
+    "OpenSandboxSpec",
+    "OpenSandboxUnavailableError",
     "PrlimitLimiter",
     "ProtocolVersionError",
     "RequestFn",

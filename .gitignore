@@ -113,7 +113,9 @@ celerybeat.pid
 .env
 .venv
 venv/
-ENV/
+/ENV/
+# Anchor the uppercase virtualenv name at the repository root so it does not
+# hide new modules in src/hypotest/env/ on case-insensitive filesystems.
 env.bak/
 venv.bak/
 .spyderproject

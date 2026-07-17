@@ -63,13 +63,15 @@ from .sandbox import (
     CapsuleRef,
     K8sFallbackScheduler,
     K8sSandboxSpec,
+    OpenSandboxFallbackScheduler,
+    OpenSandboxSpec,
     ResourceSpec,
     Sandbox,
     SandboxConfig,
     SandboxScheduler,
     make_sandbox,
 )
-from .step_context import model_turns_from_action_info
+from .step_context import ModelTurn, model_turns_from_action_info
 from .tools.filesystem import FilesystemTool
 from .utils import NBLanguage, render_notebook_for_rubric, view_notebook
 from .wager import (
@@ -178,7 +180,12 @@ class InterpreterEnvState:
         save_dir: Path | None = None,
         sandbox_memory_limit_mb: int | None = None,
         sandbox_max_pids: int | None = None,
+        sandbox_cpu: float | None = None,
+        sandbox_ephemeral_storage_gib: int | None = None,
+        sandbox_gpu_count: int | None = None,
+        sandbox_gpu_type: str | None = None,
         k8s_specs: list[K8sSandboxSpec] | None = None,
+        opensandbox_spec: OpenSandboxSpec | None = None,
         sandbox_job_id: str | None = None,
         enable_recovery: bool = False,
         capsule_ref: CapsuleRef | None = None,
@@ -210,9 +217,16 @@ class InterpreterEnvState:
             use_host_env_vars=use_host_env_vars,
             extra_envs=self.extra_envs,
             container_sqsh_path=container_sqsh_path,
-            resources=ResourceSpec(mem_mb=sandbox_memory_limit_mb, max_pids=sandbox_max_pids),
-            # Capsule identity for the k8s backend's in-pod /load_capsule; other backends deliver
-            # the capsule via work_dir/mount and ignore it (K8sSandbox.start no-ops if uuid is None).
+            resources=ResourceSpec(
+                mem_mb=sandbox_memory_limit_mb,
+                max_pids=sandbox_max_pids,
+                cpu=sandbox_cpu,
+                disk_gib=sandbox_ephemeral_storage_gib,
+                gpu=sandbox_gpu_count,
+                gpu_type=sandbox_gpu_type,
+            ),
+            # Capsule identity for remote delivery. OpenSandbox supplies it as
+            # init env; k8s posts it to /load_capsule. Local backends ignore it.
             ref=capsule_ref or CapsuleRef(),
             job_id=sandbox_job_id,
             use_docker=use_docker,
@@ -222,21 +236,27 @@ class InterpreterEnvState:
         )
         self.sandbox: Sandbox = make_sandbox(self._sandbox_config)
         self._started = False
-        # Optional k8s placement: load-balance across agent-sandbox warmpools, falling back to the
-        # configured backend. When set, start()/recover() acquire through it instead of make_sandbox.
+        # Optional remote placement, falling back to the configured local
+        # backend. When set, start()/recover() acquire through the scheduler.
         # K8sSandbox ignores the use_* selectors and the fallback goes through make_sandbox, so both
         # arms share self._sandbox_config. Recovery stays dark-launched behind enable_recovery.
         scheduler_rng = random.Random(scheduler_seed) if scheduler_seed is not None else None
-        self._scheduler: SandboxScheduler | None = (
-            K8sFallbackScheduler(
+        if k8s_specs and opensandbox_spec is not None:
+            raise ValueError("Configure either k8s_specs or opensandbox_spec, not both")
+        self._scheduler: SandboxScheduler | None = None
+        if k8s_specs:
+            self._scheduler = K8sFallbackScheduler(
                 self._sandbox_config,
                 k8s_specs,
                 self._sandbox_config,
                 rng=scheduler_rng,
             )
-            if k8s_specs
-            else None
-        )
+        elif opensandbox_spec is not None:
+            self._scheduler = OpenSandboxFallbackScheduler(
+                self._sandbox_config,
+                opensandbox_spec,
+                self._sandbox_config,
+            )
         self._enable_recovery = enable_recovery
         self._recovering = False
 
@@ -534,11 +554,16 @@ class InterpreterEnvConfig(BaseModel):
     # Opt-in k8s (agent-sandbox) placement: each spec is a warmpool/template target the scheduler
     # load-balances across, falling back to the configured (enroot) backend. Empty = disabled.
     k8s_sandbox_specs: list[K8sSandboxSpec] = Field(default_factory=list)
+    # Raw OpenSandbox SDK placement. The remote container runs the same kernel
+    # HTTP protocol and falls back to the locally staged backend when allocation
+    # or reachability fails.
+    opensandbox_spec: OpenSandboxSpec | None = None
     # Opaque job identity stamped on k8s claims (hashed) for the clean-on-startup sweep; flows to
     # SandboxConfig.job_id. None => claims are unattributed (sweep is a no-op).
     sandbox_job_id: str | None = None
-    # For the k8s backend: pull the task's capsule into the pod via /load_capsule on start. Off for
-    # pure-exec / no-data smoke tests. Other backends deliver the capsule via work_dir/mount.
+    # Remote capsule delivery: OpenSandbox pulls during container init and k8s
+    # uses /load_capsule. Off for pure-exec/no-data smoke tests. Local fallback
+    # still receives the separately staged work_dir.
     pull_capsule_in_pod: bool = True
     # `seed` is the dataset-level base seed. Component seeds are derived from it
     # and env_idx without consuming a mutable RNG, so streams remain independent.
@@ -566,6 +591,12 @@ class InterpreterEnvConfig(BaseModel):
                 "∈ {'shadow', 'hybrid'}; got 'off'. Wager uses the gate's "
                 "correct signal; it cannot operate standalone."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_one_remote_backend(self) -> "InterpreterEnvConfig":
+        if self.k8s_sandbox_specs and self.opensandbox_spec is not None:
+            raise ValueError("Configure either k8s_sandbox_specs or opensandbox_spec, not both")
         return self
 
 
@@ -648,6 +679,26 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.logger.info("Closing environment")
         await self.state.close()
 
+    def _capsule_ref(self) -> CapsuleRef | None:
+        """Build the primary backend's capsule delivery reference for this task."""
+        capsule_uuid = self.problem.input_data_path or str(self.problem.id)
+        spec = self.config.opensandbox_spec
+        if spec is not None and spec.capsule_mode == "large_bundle":
+            return CapsuleRef(
+                uuid=capsule_uuid,
+                delivery="bundled",
+                image=spec.resolve_large_bundle_image(capsule_uuid),
+            )
+        if spec is not None and self.config.pull_capsule_in_pod:
+            return CapsuleRef(
+                source=spec.capsule_source,
+                uuid=capsule_uuid,
+                delivery="object_store",
+            )
+        if self.config.k8s_sandbox_specs and self.config.pull_capsule_in_pod:
+            return CapsuleRef(uuid=capsule_uuid, delivery="object_store")
+        return None
+
     async def reset(self) -> tuple[Messages, list[Tool]]:
         """Reset the environment and prepare for execution."""
         reset_id = getattr(self, "_nemo_env_id", "?")[:8]
@@ -700,17 +751,17 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             container_sqsh_path=self.config.container_sqsh_path,
             sandbox_memory_limit_mb=self.execution_config.sandbox_memory_limit_mb,
             sandbox_max_pids=self.execution_config.sandbox_max_pids,
+            sandbox_cpu=self.execution_config.sandbox_cpu,
+            sandbox_ephemeral_storage_gib=self.execution_config.sandbox_ephemeral_storage_gib,
+            sandbox_gpu_count=self.execution_config.sandbox_gpu_count,
+            sandbox_gpu_type=self.execution_config.sandbox_gpu_type,
             enable_recovery=self.config.enable_recovery,
             k8s_specs=self.config.k8s_sandbox_specs or None,
+            opensandbox_spec=self.config.opensandbox_spec,
             sandbox_job_id=self.config.sandbox_job_id,
-            # The k8s backend pulls this capsule in-pod via /load_capsule (the pod pulls from its
-            # CAPSULE_SOURCE). Mirror the dataset's capsule resolution: prefer input_data_path, else
-            # the problem id. Gated by pull_capsule_in_pod so pure-exec/no-data smokes can disable it.
-            capsule_ref=(
-                CapsuleRef(uuid=self.problem.input_data_path or str(self.problem.id))
-                if self.config.pull_capsule_in_pod
-                else None
-            ),
+            # Mirror the dataset's capsule resolution: prefer input_data_path,
+            # else problem id. Gated so pure-exec/no-data smokes can disable it.
+            capsule_ref=self._capsule_ref(),
             seed=self.kernel_seed,
             scheduler_seed=self.scheduler_seed,
         )
@@ -1395,12 +1446,15 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             nb_content, _ = view_notebook(self.state.nb.cells, self.language.value)
             rubric_images: list[Mapping[str, Any]] = []
         else:
-            nb_content, rubric_images = render_notebook_for_rubric(
+            nb_content, rendered_images = render_notebook_for_rubric(
                 self.state.nb.cells,
                 self.language.value,
                 include_images=self.config.include_images_in_rubric_model,
                 max_images=self.config.max_rubric_images,
             )
+            # NotebookRubricImage is structurally a Mapping; the cast bridges
+            # list invariance for the shared rubric-model helpers.
+            rubric_images = cast(list[Mapping[str, Any]], rendered_images)
 
         mode = self.config.faithfulness_mode
         faith_result: dict[str, Any] | None = None
@@ -1638,8 +1692,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         # Legacy callers do not provide turn metadata. Preserve one generation
         # per environment step for all pre-existing accounting modes.
-        candidates = turns or [None]
-        unique_turns = []
+        candidates: list[ModelTurn | None] = [*turns] if turns else [None]
+        unique_turns: list[ModelTurn | None] = []
         seen_in_request: set[str] = set()
         for turn in candidates:
             response_id = None if turn is None else turn.response_id

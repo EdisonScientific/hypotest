@@ -124,9 +124,14 @@ class ExecutionConfig(BaseModel):
     # safety
     safe_execute: bool = os.getenv("SAFE_EXECUTE_SANDBOX", "").lower() == "true"
 
-    # Resource limits for sandboxed containers (prlimit RLIMIT_AS/RLIMIT_NPROC)
+    # Backend-neutral sandbox resources. Local/enroot use the limits they can
+    # enforce; OpenSandbox maps the complete set onto its lifecycle API.
     sandbox_memory_limit_mb: int | None = None  # e.g., 8192 for 8GB
     sandbox_max_pids: int | None = None  # e.g., 512 to prevent fork bombs
+    sandbox_cpu: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    sandbox_ephemeral_storage_gib: int | None = Field(default=None, gt=0)
+    sandbox_gpu_count: int | None = Field(default=None, ge=0)
+    sandbox_gpu_type: str | None = None
 
     # Capabilities
     has_gpu: bool = False

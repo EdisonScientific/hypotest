@@ -275,6 +275,10 @@ class ResourceSpec(BaseModel):
     mem_mb: int | None = None
     mem_high_mb: int | None = None  # cgroups soft throttle; ignored by prlimit
     max_pids: int | None = None
+    cpu: float | None = None
+    disk_gib: int | None = None
+    gpu: int | None = None
+    gpu_type: str | None = None
 
 
 class ResourceLimiter(Protocol):
@@ -360,6 +364,10 @@ class CapsuleRef(BaseModel):
 
     source: str | None = None  # local dir or s3://bucket/prefix
     uuid: str | None = None
+    delivery: Literal["workspace", "object_store", "bundled"] = "workspace"
+    # A bundled capsule image already has this task's data under /workspace.
+    # It is selected per task and therefore belongs on the ref, not the backend spec.
+    image: str | None = None
 
 
 @dataclass

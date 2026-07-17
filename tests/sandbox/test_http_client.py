@@ -12,14 +12,34 @@ from hypotest.env.sandbox.http_client import (
 _STREAM_OUTPUT = {"output_type": "stream", "name": "stdout", "text": "hi\n"}
 
 
+def _execute_handler(result, *, captured=None, pending_polls=0):
+    polls = 0
+
+    def handler(method, endpoint, **kwargs):
+        nonlocal polls
+        if captured is not None:
+            captured.append((method, endpoint, kwargs))
+        if method == "POST" and endpoint == "/execute":
+            return httpx.Response(202, json={"execution_id": "exec-1", "status": "queued"})
+        if method == "GET" and endpoint == "/execute/exec-1":
+            polls += 1
+            if polls <= pending_polls:
+                return httpx.Response(200, json={"execution_id": "exec-1", "status": "running"})
+            return httpx.Response(
+                200,
+                json={"execution_id": "exec-1", "status": "completed", "result": result},
+            )
+        return httpx.Response(404)
+
+    return handler
+
+
 @pytest.mark.asyncio
 async def test_execute_parses_outputs(stub_request):
+    result = {"notebook_outputs": [_STREAM_OUTPUT], "error_occurred": False, "execution_time": 0.1}
     client = HttpKernelClient(
-        stub_request(
-            lambda m, e, **kw: httpx.Response(
-                200, json={"notebook_outputs": [_STREAM_OUTPUT], "error_occurred": False, "execution_time": 0.1}
-            )
-        )
+        stub_request(_execute_handler(result, pending_polls=1)),
+        execution_poll_interval_seconds=0,
     )
     result = await client.execute("print('hi')")
     assert result.error_occurred is False
@@ -29,20 +49,17 @@ async def test_execute_parses_outputs(stub_request):
 
 @pytest.mark.asyncio
 async def test_execute_parses_timeout_recovery_metadata(stub_request):
+    result = {
+        "notebook_outputs": [],
+        "error_occurred": True,
+        "execution_time": 12.0,
+        "timed_out": True,
+        "timeout_recovery": "interrupted",
+        "interrupt_seconds": 0.2,
+    }
     client = HttpKernelClient(
-        stub_request(
-            lambda m, e, **kw: httpx.Response(
-                200,
-                json={
-                    "notebook_outputs": [],
-                    "error_occurred": True,
-                    "execution_time": 12.0,
-                    "timed_out": True,
-                    "timeout_recovery": "interrupted",
-                    "interrupt_seconds": 0.2,
-                },
-            )
-        )
+        stub_request(_execute_handler(result)),
+        execution_poll_interval_seconds=0,
     )
 
     result = await client.execute("slow()")
@@ -66,40 +83,56 @@ async def test_execute_timeout_returns_error_result(stub_request):
 
 @pytest.mark.asyncio
 async def test_execute_forwards_req_uuid_header(stub_request):
-    captured: dict[str, object] = {}
+    captured: list[tuple[str, str, dict]] = []
+    result = {"notebook_outputs": [], "error_occurred": False, "execution_time": 0.0}
 
-    def handler(method, endpoint, **kwargs):
-        captured.update(kwargs)
-        return httpx.Response(200, json={"notebook_outputs": [], "error_occurred": False, "execution_time": 0.0})
-
-    client = HttpKernelClient(stub_request(handler))
+    client = HttpKernelClient(
+        stub_request(_execute_handler(result, captured=captured)),
+        execution_poll_interval_seconds=0,
+    )
     await client.execute("print(1)", req_uuid="req-123")
-    assert captured["headers"] == {"X-Req-UUID": "req-123"}
+    assert captured[0][2]["headers"] == {"X-Req-UUID": "req-123"}
+    assert captured[1][2]["headers"] == {"X-Req-UUID": "req-123"}
 
 
 @pytest.mark.asyncio
-async def test_execute_wire_timeout_exceeds_cell_budget(stub_request):
-    """The /execute wire timeout must exceed the kernel's cell budget.
+async def test_execute_uses_short_proxy_safe_control_requests(stub_request):
+    """No individual submit/poll request should inherit the long cell budget."""
+    captured: list[tuple[str, str, dict]] = []
+    result = {"notebook_outputs": [], "error_occurred": False, "execution_time": 0.0}
 
-    Otherwise the agent-sandbox connector's default 60s httpx timeout binds underneath it and long
-    cells fail on the wire (re-wrapped as SandboxRequestError) before the kernel's own deadline
-    returns a clean result.
-    """
-    captured: dict[str, object] = {}
+    client = HttpKernelClient(
+        stub_request(_execute_handler(result, captured=captured, pending_polls=1)),
+        execution_timeout=600,
+        execution_poll_interval_seconds=0,
+    )
+    await client.execute("print(1)", timeout=120)  # explicit per-call cell budget
+    assert captured[0][2]["json"]["timeout"] == 120
+    assert all(call[2]["timeout"].read <= 30 for call in captured)
+
+
+@pytest.mark.asyncio
+async def test_execute_retries_lost_submit_with_same_idempotency_key(stub_request):
+    attempts = 0
+    request_ids: list[str] = []
+    result = {"notebook_outputs": [], "error_occurred": False, "execution_time": 0.0}
+    terminal = _execute_handler(result)
 
     def handler(method, endpoint, **kwargs):
-        captured.update(kwargs)
-        return httpx.Response(200, json={"notebook_outputs": [], "error_occurred": False, "execution_time": 0.0})
+        nonlocal attempts
+        if method == "POST" and endpoint == "/execute":
+            attempts += 1
+            request_ids.append(kwargs["headers"]["X-Req-UUID"])
+            if attempts == 1:
+                raise httpx.ReadTimeout("submit response was lost")
+        return terminal(method, endpoint, **kwargs)
 
-    client = HttpKernelClient(stub_request(handler), execution_timeout=600)
-    await client.execute("print(1)", timeout=120)  # explicit per-call cell budget
-    wire = captured["timeout"]
-    assert isinstance(wire, httpx.Timeout)
-    assert wire.read == 150.0  # 120s cell budget + 30s headroom
-    assert wire.read > captured["json"]["timeout"]  # wire strictly outlasts the cell deadline
-    captured.clear()
-    await client.execute("print(1)")  # falls back to execution_timeout
-    assert captured["timeout"].read == 630.0  # 600 + 30
+    client = HttpKernelClient(stub_request(handler), execution_poll_interval_seconds=0)
+    result_value = await client.execute("print(1)", req_uuid="stable-request")
+
+    assert result_value.error_occurred is False
+    assert attempts == 2
+    assert request_ids == ["stable-request", "stable-request"]
 
 
 def test_execute_wire_timeout_contains_recovery_budget():
@@ -174,7 +207,7 @@ async def test_load_capsule_returns_object_count(stub_request):
 
 @pytest.mark.asyncio
 async def test_health_true_when_version_matches(stub_request):
-    client = HttpKernelClient(stub_request(lambda m, e, **kw: httpx.Response(200, json={"protocol_version": 1})))
+    client = HttpKernelClient(stub_request(lambda m, e, **kw: httpx.Response(200, json={"protocol_version": 2})))
     assert await client.health() is True
 
 

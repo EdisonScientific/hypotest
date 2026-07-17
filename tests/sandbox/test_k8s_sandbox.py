@@ -17,13 +17,22 @@ from hypotest.env.sandbox import CapsuleRef, SandboxConfig
 from hypotest.env.sandbox.k8s import K8sSandbox, K8sSandboxSpec, NoCapacityError
 
 
-def _ok_handler(method, endpoint, **kwargs):
+def _ok_handler(method, endpoint, **kwargs):  # noqa: PLR0911
     if endpoint == "/health":
-        return httpx.Response(200, json={"protocol_version": 1})
+        return httpx.Response(200, json={"protocol_version": 2})
     if endpoint == "/load_capsule":
         return httpx.Response(200, json={"objects": 3, "seed": kwargs.get("json", {}).get("seed")})
-    if endpoint == "/execute":
-        return httpx.Response(200, json={"notebook_outputs": [], "error_occurred": False, "execution_time": 0.0})
+    if method == "POST" and endpoint == "/execute":
+        return httpx.Response(202, json={"execution_id": "exec-1", "status": "queued"})
+    if method == "GET" and endpoint == "/execute/exec-1":
+        return httpx.Response(
+            200,
+            json={
+                "execution_id": "exec-1",
+                "status": "completed",
+                "result": {"notebook_outputs": [], "error_occurred": False, "execution_time": 0.0},
+            },
+        )
     if endpoint == "/reset":
         return httpx.Response(200, json={"success": True, "seed": kwargs.get("json", {}).get("seed")})
     if endpoint == "/list_dir":

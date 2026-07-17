@@ -1,0 +1,74 @@
+# Example dataset-server configuration for a remote OpenSandbox server.
+# The SDK reads these canonical variables when domain/api_key are omitted below:
+#   OPEN_SANDBOX_DOMAIN=sandbox.example.internal:8080
+#   OPEN_SANDBOX_API_KEY=<secret>
+# Private image pulls use separate credentials resolved by Hypotest:
+#   REGISTRY_USERNAME=<registry-user>
+#   REGISTRY_PASSWORD=<registry-password-or-token>
+# S3 credentials remain runtime-only AWS_* variables or workload identity.
+
+dataset:
+  problem_jsonl: /config/problems.jsonl
+  # This copy is always staged into the task workspace for local fallback.
+  capsule_dir: s3://example-bucket/capsules
+  capsule_pull: lazy
+
+  # Colocated fallback used only when remote allocation/reachability fails.
+  use_docker: false
+  use_enroot: true
+  use_ray: true
+  container_sqsh_path: /images/interpreter-env.sqsh
+  enable_recovery: true
+
+  opensandbox_spec:
+    image: registry.example/hypotest-kernel:latest
+    # The raw SDK must receive an image specification (not only an image string)
+    # for private registries. Exact ${ENV_VAR} references are resolved by
+    # Hypotest's config model; omit image_auth for a public image.
+    image_auth:
+      username: ${REGISTRY_USERNAME}
+      password: ${REGISTRY_PASSWORD}
+    use_server_proxy: true
+    capsule_mode: object_store
+    # Passed on each Sandbox.create and consumed before /health. The image build
+    # can instead bake either non-secret default; set that field to null here to
+    # preserve the baked value.
+    capsule_source: s3://example-bucket/capsules
+    capsule_key: "{capsule_uuid}"
+    ttl_seconds: 5400
+    ready_timeout_seconds: 300
+    # Both extension spellings are generated for OpenSandbox compatibility.
+    image_pull_policy: IfNotPresent
+    # Must match the platform selected by scripts/build_opensandbox_image.py.
+    platform_os: linux
+    platform_arch: amd64
+    extensions:
+      # Optional, server/runtime specific; for example a configured pool.
+      poolRef: hypotest-kernels
+
+    # High-throughput large-bundle alternative: package all immediate capsule
+    # directories into one image. The create call passes the selected capsule ID
+    # and the kernel server projects it into /workspace without copying data:
+    #   ./scripts/build_large_bundle.py /data/capsules --all-capsules \
+    #     --image registry.example/hypotest-capsules:all --push
+    # capsule_mode: large_bundle
+    # large_bundle_image: registry.example/hypotest-capsules@sha256:<digest>
+    #
+    # Per-capsule images remain supported when stronger image-level separation
+    # is preferred. Build without --all-capsules, then use either a map:
+    # large_bundle_images:
+    #   CapsuleData-123: registry.example/hypotest-capsule@sha256:<digest>
+    # or a tag template when image tags exactly match capsule IDs:
+    # large_bundle_image_template: registry.example/hypotest-capsule:{capsule_uuid}
+
+  execution_config:
+    safe_execute: true
+    cell_execution_timeout: 900
+    sandbox_cpu: 4
+    sandbox_memory_limit_mb: 16384
+    sandbox_ephemeral_storage_gib: 50
+    # sandbox_gpu_count: 1
+    # sandbox_gpu_type: L40S
+
+api_key: HYPOTEST_SERVER_API_KEY
+port: 8405
