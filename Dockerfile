@@ -111,7 +111,8 @@ RUN set -eux; \
     conda create -p /app/kernel_env --override-channels -c "${CF}" python=3.12 -y; \
     mamba install -p /app/kernel_env --override-channels -c "${CF}" -y \
         numpy=1.26.4 pandas=2.3.2 scipy=1.16.2 scikit-learn=1.7.2 matplotlib=3.10.6 \
-        seaborn=0.13.2 plotly=6.3.0 openpyxl=3.1.5 jupyter=1.1.1 ipykernel=6.30.1 nbconvert=7.16.6; \
+        seaborn=0.13.2 plotly=6.3.0 openpyxl=3.1.5 jupyter=1.1.1 ipykernel=6.30.1 \
+        jupyter_client=8.8.0 nbconvert=7.16.6; \
     /app/kernel_env/bin/python -m ipykernel install --name python3 --display-name "Python 3 (ipykernel)"; \
     mamba clean --all -y; conda clean --all -y; \
     find /app/kernel_env /app/miniconda \( -type d -name __pycache__ -o -type d -name tests -o -type d -name '*.tests' -o -type d -name 'test' \) -exec rm -rf {} + 2>/dev/null || true; \
@@ -258,6 +259,18 @@ RUN set -eux; \
     find /app/miniconda /app/kernel_env \( -type d -name __pycache__ -o -type d -name tests -o -type d -name '*.tests' -o -type d -name 'test' \) -exec rm -rf {} + 2>/dev/null || true; \
     find /app/miniconda /app/kernel_env -type f \( -name '*.a' -o -name '*.js.map' \) -delete 2>/dev/null || true; \
     kill "${PROXY}" 2>/dev/null || true
+
+# A transitive native extension imported by Scanpy requests the legacy gflags
+# 2.2 SONAME, while the cutoff-bounded conda solve provides gflags 2.3. Point
+# the legacy names at that same library implementation. Installing both ABI
+# packages side-by-side is unsafe: loading them together aborts on duplicate
+# global flag registration. The current full import matrix validates that the
+# extension's required symbols remain compatible with conda's implementation.
+RUN set -eux; \
+    GFLAGS="$(basename "$(readlink -f /app/kernel_env/lib/libgflags.so)")"; \
+    GFLAGS_NOTHREADS="$(basename "$(readlink -f /app/kernel_env/lib/libgflags_nothreads.so)")"; \
+    ln -s "${GFLAGS}" /app/kernel_env/lib/libgflags.so.2.2; \
+    ln -s "${GFLAGS_NOTHREADS}" /app/kernel_env/lib/libgflags_nothreads.so.2.2
 
 # Register the R Jupyter kernel. IRkernel::installspec shells out to `jupyter`,
 # which lives in kernel_env (not on the image PATH), so put it on PATH for this

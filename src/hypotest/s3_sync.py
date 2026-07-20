@@ -5,7 +5,7 @@ The capsule data and the tasks JSONL may be given in the dataset config as
 downloaded to a local staging dir. The endpoint and credentials come from the
 standard boto3 environment variables — never the config:
 
-    AWS_ENDPOINT_URL   (e.g. https://s3.example.com for the S3-compatible store)
+    AWS_ENDPOINT_URL   (e.g. https://s3.example.com for an S3-compatible store)
     AWS_ACCESS_KEY_ID
     AWS_SECRET_ACCESS_KEY
     AWS_DEFAULT_REGION
