@@ -25,6 +25,8 @@ from hypotest.env.install_shim import (
     _PIP_SHIM_BASH,
     _R_SHIM_CODE,
     _write_install_shims,
+    workspace_env,
+    write_workspace_config,
 )
 
 
@@ -49,6 +51,31 @@ def test_write_install_shims_hidden_from_default_list(tmp_path: Path) -> None:
     assert ".install_shim" not in visible
     hidden = [p.name for p in tmp_path.iterdir() if p.name.startswith(".")]
     assert ".install_shim" in hidden
+
+
+def test_workspace_config_can_omit_interceptors_but_keep_install_paths(tmp_path: Path) -> None:
+    write_workspace_config(
+        tmp_path,
+        runtime_path="/workspace",
+        index_url="http://127.0.0.1:8723/simple",
+        install_shim_enabled=False,
+    )
+
+    assert not (tmp_path / ".install_shim").exists()
+    assert (tmp_path / "pydeps").is_dir()
+    assert (tmp_path / "pip-cache").is_dir()
+    assert (tmp_path / "r_libs").is_dir()
+    assert "target = /workspace/pydeps" in (tmp_path / "pip.conf").read_text()
+    assert "index-url = http://127.0.0.1:8723/simple" in (tmp_path / "pip.conf").read_text()
+    assert "R_LIBS_USER" in (tmp_path / "Rprofile").read_text()
+    assert "shim_install_factory" not in (tmp_path / "Rprofile").read_text()
+
+    env = workspace_env("/workspace", install_shim_enabled=False)
+    assert env["PYTHONPATH"] == "/workspace/pydeps"
+    assert env["PIP_CONFIG_FILE"] == "/workspace/pip.conf"
+    assert env["R_LIBS_USER"] == "/workspace/r_libs"
+    assert env["PATH"] == "/app/kernel_env/bin"
+    assert "INSTALL_SHIM_LOG" not in env
 
 
 # ---------- bash syntax ----------

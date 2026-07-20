@@ -348,7 +348,13 @@ _RPROFILE_HEADER = (
 )
 
 
-def write_workspace_config(work_dir: Path, runtime_path: str, index_url: str | None = None) -> None:
+def write_workspace_config(
+    work_dir: Path,
+    runtime_path: str,
+    index_url: str | None = None,
+    *,
+    install_shim_enabled: bool = True,
+) -> None:
     """Write the agent workspace install scaffolding into ``work_dir``.
 
     Creates ``pydeps/``, ``pip-cache/``, ``r_libs/``; a ``pip.conf`` whose
@@ -356,7 +362,8 @@ def write_workspace_config(work_dir: Path, runtime_path: str, index_url: str | N
     when the kernel runs — the same dir for k8s, the in-container mount for
     enroot) and which carries ``index_url`` when given (the runtime supply-chain
     cutoff proxy; pip.conf overrides /etc/pip.conf, so it must re-state it); the
-    pip/conda/apt + R install shims; and the ``Rprofile`` (libPaths + R shim).
+    pip/conda/apt + R install shims when ``install_shim_enabled`` is true; and
+    the ``Rprofile`` (libPaths plus the optional R shim).
 
     Single source of truth for the install model so the enroot and k8s kernel
     paths can't drift. Pass ``index_url=None`` for enroot (no in-pod proxy).
@@ -374,28 +381,36 @@ def write_workspace_config(work_dir: Path, runtime_path: str, index_url: str | N
     if index_url:
         pip_conf.append(f"index-url = {index_url}")
     (wd / "pip.conf").write_text("\n".join(pip_conf) + "\n")
-    _write_install_shims(wd)
-    (wd / "Rprofile").write_text(_RPROFILE_HEADER + _R_SHIM_CODE)
+    if install_shim_enabled:
+        _write_install_shims(wd)
+    (wd / "Rprofile").write_text(_RPROFILE_HEADER + (_R_SHIM_CODE if install_shim_enabled else ""))
 
 
-def workspace_env(runtime_path: str) -> dict[str, str]:
+def workspace_env(runtime_path: str, *, install_shim_enabled: bool = True) -> dict[str, str]:
     """Env vars the kernel needs for the workspace install model.
 
     ``PYTHONPATH`` and ``PATH`` are the SEGMENTS to prepend to any existing
     value; the rest are absolute. Used by both the enroot bash (to generate its
     ``export`` lines) and the k8s kernel server (to update ``os.environ``).
     """
-    return {
+    env = {
         "PYTHONPATH": f"{runtime_path}/pydeps",
-        "PATH": f"{runtime_path}/.install_shim/bin",
         "PIP_CONFIG_FILE": f"{runtime_path}/pip.conf",
-        "INSTALL_SHIM_LOG": f"{runtime_path}/.install_shim/log",
         "R_LIBS_USER": f"{runtime_path}/r_libs",
         "R_PROFILE_USER": f"{runtime_path}/Rprofile",
     }
+    if install_shim_enabled:
+        env["PATH"] = f"{runtime_path}/.install_shim/bin"
+        env["INSTALL_SHIM_LOG"] = f"{runtime_path}/.install_shim/log"
+    else:
+        # Bypass the wrappers but keep `pip` aligned with the Python kernel.
+        # The base Miniconda bin remains later on PATH, so raw `conda` still
+        # resolves to /app/miniconda/bin/conda.
+        env["PATH"] = "/app/kernel_env/bin"
+    return env
 
 
-def bash_export_block(runtime_path: str) -> str:
+def bash_export_block(runtime_path: str, *, install_shim_enabled: bool = True) -> str:
     """Render ``workspace_env`` as ``export VAR=...`` lines for the enroot bash.
 
     ``runtime_path`` may be a bash variable like ``$WORKDIR`` (kept literal so the
@@ -403,7 +418,7 @@ def bash_export_block(runtime_path: str) -> str:
     Same single source as the k8s server's ``os.environ`` update, so they can't drift.
     """
     lines = []
-    for key, seg in workspace_env(runtime_path).items():
+    for key, seg in workspace_env(runtime_path, install_shim_enabled=install_shim_enabled).items():
         if key in {"PYTHONPATH", "PATH"}:
             lines.append(f'export {key}="{seg}:${{{key}}}"')
         else:

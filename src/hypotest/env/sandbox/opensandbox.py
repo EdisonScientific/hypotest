@@ -124,6 +124,10 @@ class OpenSandboxSpec(BaseModel):
     create_retry_delay_seconds: float = Field(default=2.0, ge=0, allow_inf_nan=False)
     ttl_seconds: int | None = Field(default=5400, gt=0)
     kernel_port: int = Field(default=8000, ge=1, le=65535)
+    # Remote sandboxes are already isolated at the machine/pod boundary, so
+    # package-manager interception is off by default. Keep the shim available
+    # for compatibility with colocated deployments that explicitly opt in.
+    install_shim_enabled: bool = False
 
     capsule_mode: Literal["object_store", "large_bundle"] = "object_store"
     # Runtime values override ENV defaults baked into the image. ``capsule_key``
@@ -413,6 +417,8 @@ class OpenSandboxSandbox(Sandbox):
         ]
         if self._config.safe_execute:
             command.append("--safe-execute")
+        if not self._spec.install_shim_enabled:
+            command.append("--no-install-shim")
         return command
 
     async def _connect_kernel(self, connection_config: Any) -> None:

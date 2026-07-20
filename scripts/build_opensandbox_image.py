@@ -182,6 +182,7 @@ def _print_opensandbox_config(options: BuildOptions, image: str) -> None:
     print("\nOpenSandbox configuration:")
     print("  capsule_mode: object_store")
     print(f"  image: {json.dumps(image)}")
+    print("  install_shim_enabled: false")
     if options.capsule_source is None:
         print('  capsule_source: "s3://bucket/base-prefix"')
     else:

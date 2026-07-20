@@ -880,16 +880,11 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                     the cell was interrupted and the kernel is ready.
 
                 Installing packages:
-                    Install commands (`pip install`, `conda install`, `apt-get install`,
-                    `BiocManager::install`, `install.packages`) are intercepted: if
-                    the package is already present, the call returns quickly with a
-                    "[pre-installed]" message. To force a fresh install of a
-                    specific version, use the installer's native force flag
-                    (`pip install --force-reinstall`, `BiocManager::install(..., force=TRUE)`,
-                    `conda install --force-reinstall`, `apt-get install --reinstall`).
-                    Version pins without a force flag are treated as informational;
-                    the existing install is used and a "[version-mismatch]" message
-                    is printed.
+                    Package-manager commands run inside the current sandbox. Check
+                    whether a package is already importable before installing it,
+                    prefer pip for Python packages, and run `apt-get update` before
+                    the first `apt-get install`. Workspace-scoped installs persist
+                    across cells and `reset_kernel`, but not across a new sandbox.
                 """
                 if timeout_seconds is None:
                     cap = env_default_cap
@@ -1026,15 +1021,11 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             kernel is ready.
 
         Installing packages:
-            Install commands (`pip install`, `conda install`, `apt-get install`,
-            `BiocManager::install`, `install.packages`) are intercepted: if the
-            package is already present, the call returns quickly with a
-            "[pre-installed]" message. To force a fresh install of a specific
-            version, use the installer's native force flag
-            (`pip install --force-reinstall`, `BiocManager::install(..., force=TRUE)`,
-            `conda install --force-reinstall`, `apt-get install --reinstall`).
-            Version pins without a force flag are treated as informational; the
-            existing install is used and a "[version-mismatch]" message is printed.
+            Package-manager commands run inside the current sandbox. Check whether
+            a package is already importable before installing it, prefer pip for
+            Python packages, and run `apt-get update` before the first
+            `apt-get install`. Workspace-scoped installs persist across cells and
+            `reset_kernel`, but not across a new sandbox.
         """
         return await self._run_cell_with_cap(code, idx=idx, timeout_cap=self.execution_timeout)
 

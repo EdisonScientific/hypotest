@@ -86,6 +86,8 @@ COPY docker/entrypoint.sh /opt/entrypoint.sh
 # The entrypoint starts the cutoff proxy, then execs the kernel server. The sandbox
 # deployment (SandboxTemplate / OpenSandbox create call) may supply
 # CAPSULE_SOURCE/CAPSULE_KEY and override --port / --language / --safe-execute.
+# Package-manager interception is disabled for externally isolated sandbox pods;
+# OpenSandboxSpec can explicitly opt back into the compatibility shim.
 # Bundled images ignore init-pull configuration.
 ENTRYPOINT ["sh", "/opt/entrypoint.sh"]
-CMD ["/app/kernel_env/bin/python", "-m", "hypotest.kernel_capsule_server", "--port", "8000", "--safe-execute"]
+CMD ["/app/kernel_env/bin/python", "-m", "hypotest.kernel_capsule_server", "--port", "8000", "--safe-execute", "--no-install-shim"]

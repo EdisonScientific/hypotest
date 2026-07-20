@@ -163,13 +163,13 @@ async def prepare_initial_workspace(
     return f"{capsule_source.rstrip('/')}/{capsule_key}", count
 
 
-def _apply_workspace_env(work_dir: Path) -> None:
+def _apply_workspace_env(work_dir: Path, *, install_shim_enabled: bool = True) -> None:
     """Put the workspace install model on the env the kernel will inherit.
 
-    Mirrors the enroot bash's exports (same ``install_shim.workspace_env`` source),
-    so an agent gets the same PATH / PYTHONPATH / pip / R behavior on either backend.
+    Uses the same ``install_shim.workspace_env`` source as the enroot path while
+    allowing externally isolated backends to omit the interceptor directories.
     """
-    for key, seg in install_shim.workspace_env(str(work_dir)).items():
+    for key, seg in install_shim.workspace_env(str(work_dir), install_shim_enabled=install_shim_enabled).items():
         if key in {"PYTHONPATH", "PATH"}:
             existing = os.environ.get(key, "")
             os.environ[key] = f"{seg}{os.pathsep}{existing}" if existing else seg
@@ -190,6 +190,7 @@ async def run_server(
     bundle_root: Path | None = None,
     bundle_capsule_id: str | None = None,
     capsule_key: str | None = None,
+    install_shim_enabled: bool = True,
 ) -> None:
     selected, object_count = await prepare_initial_workspace(
         work_dir,
@@ -206,11 +207,16 @@ async def run_server(
             work_dir,
             object_count,
         )
-    # Lay down the same workspace install model as the enroot path (shim + pydeps +
-    # pip.conf + R) so the agent's install/import behavior matches on either backend.
+    # Lay down persistent pip/R workspace paths plus the optional compatibility
+    # shim. Externally isolated OpenSandbox pods disable only the interceptors.
     # The workspace pip.conf overrides /etc/pip.conf, so re-state the cutoff index-url.
-    install_shim.write_workspace_config(work_dir, str(work_dir), index_url=pip_index_url)
-    _apply_workspace_env(work_dir)
+    install_shim.write_workspace_config(
+        work_dir,
+        str(work_dir),
+        index_url=pip_index_url,
+        install_shim_enabled=install_shim_enabled,
+    )
+    _apply_workspace_env(work_dir, install_shim_enabled=install_shim_enabled)
     server = KernelServer(work_dir, language, startup_token=startup_token, safe_execute=safe_execute, seed=seed)
     await server.start()
     app = create_app(server)
@@ -232,7 +238,12 @@ async def run_server(
         _clear_dir(work_dir)
         count = await asyncio.to_thread(s3_sync.pull_capsule, capsule_source, req.capsule_uuid, work_dir)
         # Clearing wiped the scaffolding; re-lay it alongside the freshly pulled capsule.
-        install_shim.write_workspace_config(work_dir, str(work_dir), index_url=pip_index_url)
+        install_shim.write_workspace_config(
+            work_dir,
+            str(work_dir),
+            index_url=pip_index_url,
+            install_shim_enabled=install_shim_enabled,
+        )
         await server.start()
         logger.warning("Loaded capsule %s (%d objects) into %s", req.capsule_uuid, count, work_dir)
         return LoadCapsuleResponse(
@@ -290,6 +301,13 @@ def main() -> None:
         default="http://127.0.0.1:8723/simple",
         help="pip index for agent installs (the runtime cutoff proxy); empty string disables it",
     )
+    parser.add_argument(
+        "--no-install-shim",
+        action="store_false",
+        dest="install_shim_enabled",
+        default=True,
+        help="run package managers directly while retaining workspace-scoped pip/R install paths",
+    )
     args = parser.parse_args()
     language = NBLanguage.PYTHON if args.language == "python" else NBLanguage.R
     asyncio.run(
@@ -306,6 +324,7 @@ def main() -> None:
             bundle_root=args.bundle_root,
             bundle_capsule_id=args.bundle_capsule_id,
             capsule_key=args.capsule_key,
+            install_shim_enabled=args.install_shim_enabled,
         )
     )
 

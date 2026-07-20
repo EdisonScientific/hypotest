@@ -314,8 +314,9 @@ enroot `.sqsh`, k8s bundled) **and** the orchestrator client, deployed on differ
   backends); the kernel-server regex (`_kernel_check_code_safety`) runs in-pod for HTTP
   backends. Unchanged — the `Sandbox` interface needs no safety method.
 - **Workspace install model**: `install_shim.write_workspace_config` / `workspace_env` /
-  `bash_export_block` are already the shared single source; each backend lays it down in
-  `start()`. (Done in the prior parity refactor.)
+  `bash_export_block` are the shared single source. OpenSandbox keeps workspace-scoped
+  pip/R paths but disables package-manager interception by default; colocated backends
+  retain the shim, and OpenSandbox can opt back in with `install_shim_enabled: true`.
 - **`/list_dir`**: served by our kernel server (sees the kernel's cwd + files executed code
   wrote), not agent-sandbox's `files/filesystem` — one workspace view across backends.
 

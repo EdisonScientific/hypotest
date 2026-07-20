@@ -101,6 +101,7 @@ def test_dry_run_prints_push_and_runtime_configuration(monkeypatch, capsys):
     assert "no capsule data in image layers" in output
     assert "docker build" in output
     assert "docker push registry.example/hypotest:v1" in output
+    assert "install_shim_enabled: false" in output
     assert "capsule_key: null" in output
     assert "AWS_ENDPOINT_URL" in output
     assert 'username: "${HYPOTEST_REGISTRY_USER}"' in output

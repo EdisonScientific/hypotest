@@ -101,7 +101,7 @@ Kernel Recovery and Tool Usage
 
 If a run_cell call returns a TimeoutError, read its message to confirm whether the timed-out cell was interrupted and the kernel is ready. After a successful interrupt, earlier kernel state remains available, but partial effects from the interrupted cell may remain. A KernelUnresponsiveError means no further cells can run. reset_kernel and list_dir are tool names, not Python functions; invoke them as separate tool calls rather than writing reset_kernel() or list_dir() inside run_cell.
 
-Package installations are intercepted: if you write pip install, conda install, apt-get install, BiocManager::install, or install.packages for a package that is already present, the call returns quickly with a "[pre-installed]" message — no re-install, no wait. If you genuinely need a fresh install of a specific version, use the installer's native force flag: pip install --force-reinstall, BiocManager::install(..., force=TRUE), conda install --force-reinstall, or apt-get install --reinstall. Version pins without a force flag are treated as informational; the existing install is used and a "[version-mismatch]" message is printed.
+Package installation commands run inside the current sandbox. Check whether a package is already importable before installing it, and prefer pip for Python packages. Run apt-get update before the first apt-get install. Workspace-scoped package installs persist across notebook cells and reset_kernel calls, but not across a new sandbox or episode.
 
 {additional_guidelines}
 

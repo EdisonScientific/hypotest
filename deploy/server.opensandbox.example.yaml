@@ -35,6 +35,9 @@ dataset:
     # preserve the baked value.
     capsule_source: s3://example-bucket/capsules
     capsule_key: "{capsule_uuid}"
+    # Package managers run directly on remote sandbox machines by default.
+    # Set true only for compatibility with the former colocated install shim.
+    install_shim_enabled: false
     ttl_seconds: 5400
     ready_timeout_seconds: 300
     # Both extension spellings are generated for OpenSandbox compatibility.

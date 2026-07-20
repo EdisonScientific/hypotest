@@ -186,6 +186,7 @@ async def test_object_store_lifecycle_preserves_proxy_path_headers_and_resources
         "--language",
         "python",
         "--safe-execute",
+        "--no-install-shim",
     ]
     assert create_kwargs["platform"].kwargs == {"os": "linux", "arch": "amd64"}
     assert _FakeConnectionConfig.created[-1]["domain"] == "sandbox.example:8080"
@@ -220,6 +221,7 @@ async def test_large_bundle_selects_image_skips_load_and_resets_seed(tmp_path, m
         use_server_proxy=False,
         capsule_mode="large_bundle",
         large_bundle_image_template="registry/capsule:{capsule_uuid}",
+        install_shim_enabled=True,
         create_attempts=1,
         health_poll_interval_seconds=0.001,
     )
@@ -308,6 +310,7 @@ def test_private_registry_auth_rejects_blank_values(username, password, message)
 
 def test_image_pull_policy_populates_both_extension_spellings_and_honors_override():
     defaulted = OpenSandboxSpec(image="kernel:latest")
+    assert defaulted.install_shim_enabled is False
     assert defaulted.resolve_extensions() == {
         "imagePullPolicy": "IfNotPresent",
         "opensandbox.extensions.image-pull-policy": "IfNotPresent",
