@@ -1371,6 +1371,39 @@ class TestSandboxConfigWiring:
         assert object_ref.delivery == "object_store"
         assert object_ref.source == "s3://capsules/root"
 
+        mounted_env = InterpreterEnv(
+            problem=default_problem,
+            work_dir=tmp_path / "mounted",
+            config=InterpreterEnvConfig(
+                opensandbox_spec=OpenSandboxSpec(
+                    image="kernel:latest",
+                    capsule_mode="mounted_volume",
+                    mounted_capsule_root="/mnt/shared/capsules",
+                    create_attempts=1,
+                )
+            ),
+        )
+        mounted_ref = mounted_env._capsule_ref()
+        assert mounted_ref is not None
+        assert mounted_ref.delivery == "mounted_volume"
+        assert mounted_ref.source == "/mnt/shared/capsules"
+        assert mounted_ref.uuid == (default_problem.input_data_path or str(default_problem.id))
+
+        no_data_env = InterpreterEnv(
+            problem=default_problem,
+            work_dir=tmp_path / "mounted-no-data",
+            config=InterpreterEnvConfig(
+                pull_capsule_in_pod=False,
+                opensandbox_spec=OpenSandboxSpec(
+                    image="kernel:latest",
+                    capsule_mode="mounted_volume",
+                    mounted_capsule_root="/mnt/capsules",
+                    create_attempts=1,
+                ),
+            ),
+        )
+        assert no_data_env._capsule_ref() is None
+
         bundled_env = InterpreterEnv(
             problem=default_problem,
             work_dir=tmp_path / "bundled",

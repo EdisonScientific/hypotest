@@ -689,6 +689,12 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
                 delivery="bundled",
                 image=spec.resolve_large_bundle_image(capsule_uuid),
             )
+        if spec is not None and spec.capsule_mode == "mounted_volume" and self.config.pull_capsule_in_pod:
+            return CapsuleRef(
+                source=spec.mounted_capsule_root,
+                uuid=capsule_uuid,
+                delivery="mounted_volume",
+            )
         if spec is not None and self.config.pull_capsule_in_pod:
             return CapsuleRef(
                 source=spec.capsule_source,

@@ -102,7 +102,8 @@ class OpenSandboxSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    # Generic kernel image used by object-store delivery and no-data smoke tests.
+    # Generic kernel image used by object-store/mounted-volume delivery and
+    # no-data smoke tests.
     image: str
     # Private-registry credentials belong on the SDK's image specification,
     # not in container env or image layers. Public registries leave this unset.
@@ -129,12 +130,16 @@ class OpenSandboxSpec(BaseModel):
     # for compatibility with colocated deployments that explicitly opt in.
     install_shim_enabled: bool = False
 
-    capsule_mode: Literal["object_store", "large_bundle"] = "object_store"
+    capsule_mode: Literal["object_store", "mounted_volume", "large_bundle"] = "object_store"
     # Runtime values override ENV defaults baked into the image. ``capsule_key``
-    # may be a literal relative S3 prefix or contain {capsule_uuid}; None leaves
-    # the image's CAPSULE_KEY untouched.
+    # may be a literal relative object-store/mount path or contain
+    # {capsule_uuid}; None leaves the corresponding image setting untouched.
     capsule_source: str | None = None
     capsule_key: str | None = "{capsule_uuid}"
+    # Root of a capsule collection already mounted by the OpenSandbox cluster.
+    # The selected capsule is copied from here into the sandbox-local
+    # /workspace before the kernel and health endpoint start.
+    mounted_capsule_root: str | None = None
     # In large-bundle mode, a selected image already contains this task's
     # capsule at /workspace, or contains a collection that the startup server
     # projects into /workspace. A per-capsule map wins over the format template,
@@ -162,6 +167,16 @@ class OpenSandboxSpec(BaseModel):
             raise ValueError("platform_os and platform_arch must be set together")
         if self.entrypoint == []:
             raise ValueError("entrypoint must be non-empty when provided")
+        if self.capsule_mode == "mounted_volume":
+            if self.mounted_capsule_root is None:
+                raise ValueError("mounted_volume capsule_mode requires mounted_capsule_root")
+            if self.capsule_key is None:
+                raise ValueError("mounted_volume capsule_mode requires a capsule_key template")
+        if self.mounted_capsule_root is not None:
+            if not self.mounted_capsule_root.strip():
+                raise ValueError("mounted_capsule_root cannot be blank")
+            if not self.mounted_capsule_root.startswith("/"):
+                raise ValueError("mounted_capsule_root must be an absolute container path")
         return self
 
     def resolve_large_bundle_image(self, capsule_uuid: str) -> str:
@@ -323,9 +338,8 @@ class OpenSandboxSandbox(Sandbox):
             kwargs["protocol"] = self._spec.protocol
         return ConnectionConfig(**kwargs)
 
-    async def _allocate(self, connection_config: Any) -> Any:
-        OpenSandbox, _, PlatformSpec, SandboxImageAuth, SandboxImageSpec = _require_opensandbox_sdk()
-        image = self._selected_image()
+    def _allocation_env(self) -> dict[str, str]:
+        """Build init-time capsule and caller environment for one allocation."""
         env = dict(self._spec.env)
         env.update(self._config.extra_envs)
         if self._ref.delivery == "object_store":
@@ -334,12 +348,26 @@ class OpenSandboxSandbox(Sandbox):
                 env["CAPSULE_SOURCE"] = source
             if self._ref.uuid and (capsule_key := self._spec.resolve_capsule_key(self._ref.uuid)) is not None:
                 env["CAPSULE_KEY"] = capsule_key
+        elif self._ref.delivery == "mounted_volume":
+            # Clear any object-store defaults baked into the generic image so
+            # mounted-volume delivery is unambiguous.
+            env["CAPSULE_SOURCE"] = ""
+            env["CAPSULE_KEY"] = ""
+            root = self._ref.source or self._spec.mounted_capsule_root
+            if root is not None:
+                env["HYPOTEST_MOUNTED_CAPSULE_ROOT"] = root
+            if self._ref.uuid and (capsule_key := self._spec.resolve_capsule_key(self._ref.uuid)) is not None:
+                env["HYPOTEST_MOUNTED_CAPSULE_ID"] = capsule_key
         elif self._ref.delivery == "bundled" and self._ref.uuid:
             # Collection images use this to project just the requested capsule
             # into /workspace before the persistent kernel starts. Single-capsule
             # images ignore it because their workspace is already populated.
             env["HYPOTEST_BUNDLE_CAPSULE_ID"] = self._ref.uuid
+        return env
 
+    async def _allocate(self, connection_config: Any) -> Any:
+        OpenSandbox, _, PlatformSpec, SandboxImageAuth, SandboxImageSpec = _require_opensandbox_sdk()
+        image = self._selected_image()
         metadata = dict(self._spec.metadata)
         if self._config.job_id:
             metadata.setdefault("hypotest-job", self._config.job_id)
@@ -348,7 +376,7 @@ class OpenSandboxSandbox(Sandbox):
             "image": _to_image_spec(image, self._spec.image_auth, SandboxImageAuth, SandboxImageSpec),
             "timeout": timedelta(seconds=self._spec.ttl_seconds) if self._spec.ttl_seconds is not None else None,
             "ready_timeout": timedelta(seconds=self._spec.ready_timeout_seconds),
-            "env": env,
+            "env": self._allocation_env(),
             "metadata": metadata,
             "resource": _resource_map(self._resources),
             "extensions": self._spec.resolve_extensions(),

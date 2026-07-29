@@ -6,6 +6,8 @@
 # It pulls CAPSULE_KEY from CAPSULE_SOURCE before starting Jupyter/HTTP when
 # both are configured, so OpenSandbox readiness includes capsule delivery. It
 # also serves POST /load_capsule for backends that select a capsule after boot.
+# Cluster-mounted collections can instead copy one selected capsule into the
+# local writable workspace before readiness.
 # A derived large-bundle image may instead pre-populate /workspace, or store a collection
 # under /opt/hypotest/capsules for startup-time selection, and omit the source.
 #

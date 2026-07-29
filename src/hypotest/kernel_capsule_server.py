@@ -9,10 +9,16 @@ that workspace. When both
 pulled during process initialization *before* Jupyter and the HTTP health server
 start. OpenSandbox uses that path so readiness means data and kernel are ready.
 
-A source is optional for large-bundle images. A single-capsule image already has
-task data under ``/workspace``; a collection image stores every capsule below
-``/opt/hypotest/capsules`` and projects the requested one into ``/workspace``
-before starting the kernel. Bundled layouts ignore init-pull settings.
+A capsule may instead come from a collection volume mounted by the sandbox
+cluster. In that mode, the selected directory is copied into writable,
+sandbox-local ``/workspace`` before startup; the model never works directly on
+the shared mount.
+
+A source is optional for large-bundle images. A single-capsule image already
+has task data under ``/workspace``; a collection image stores every capsule
+below ``/opt/hypotest/capsules`` and projects the requested one into
+``/workspace`` before starting the kernel. Bundled layouts ignore init-pull
+settings.
 
 This lives in hypotest (not in ``kernel_server.py``) on purpose: ``kernel_server.py``
 must stay import-free for the enroot/docker path, which has neither hypotest nor
@@ -33,6 +39,7 @@ import asyncio
 import logging
 import os
 import shutil
+import stat
 from pathlib import Path
 
 import uvicorn
@@ -70,24 +77,27 @@ def _clear_dir(path: Path) -> None:
             child.unlink(missing_ok=True)
 
 
-def resolve_collection_capsule(bundle_root: Path, capsule_id: str) -> Path:
+def _resolve_capsule_directory(root_path: Path, capsule_id: str, *, source_kind: str) -> Path:
     """Resolve an exact or legacy-named capsule without allowing traversal."""
-    root = bundle_root.resolve(strict=True)
+    root = root_path.resolve(strict=True)
     if not root.is_dir():
-        raise NotADirectoryError(f"bundle root is not a directory: {root}")
+        raise NotADirectoryError(f"{source_kind} root is not a directory: {root}")
     try:
         relative = Path(capsule_id)
     except ValueError as exc:
-        raise ValueError("bundle capsule id is not a valid filesystem path") from exc
-    if not capsule_id or relative.is_absolute() or ".." in relative.parts:
-        raise ValueError(f"unsafe bundle capsule id: {capsule_id!r}")
+        raise ValueError(f"{source_kind} capsule id is not a valid filesystem path") from exc
+    if not capsule_id or relative == Path(".") or relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"unsafe {source_kind} capsule id: {capsule_id!r}")
 
     names = [relative]
     if len(relative.parts) == 1:
         names.extend((Path(f"CapsuleData-{capsule_id}"), Path(f"capsule_{capsule_id}")))
     for name in names:
+        unresolved = root / name
+        if unresolved.is_symlink():
+            continue
         try:
-            candidate = (root / name).resolve(strict=False)
+            candidate = unresolved.resolve(strict=False)
         except (OSError, RuntimeError, ValueError):
             continue
         if candidate == root or root not in candidate.parents:
@@ -96,6 +106,74 @@ def resolve_collection_capsule(bundle_root: Path, capsule_id: str) -> Path:
             return candidate
     attempted = ", ".join(str(name) for name in names)
     raise FileNotFoundError(f"no capsule for {capsule_id!r} under {root} (tried: {attempted})")
+
+
+def resolve_collection_capsule(bundle_root: Path, capsule_id: str) -> Path:
+    """Resolve one capsule baked into a collection image."""
+    return _resolve_capsule_directory(bundle_root, capsule_id, source_kind="bundle")
+
+
+def resolve_mounted_capsule(mounted_root: Path, capsule_id: str) -> Path:
+    """Resolve one capsule below a cluster-mounted collection root."""
+    return _resolve_capsule_directory(mounted_root, capsule_id, source_kind="mounted-volume")
+
+
+def _validate_copy_source(source: Path) -> int:
+    """Reject links and special files before copying a mounted capsule."""
+    count = 0
+    for directory, dirnames, filenames in os.walk(source, followlinks=False):
+        directory_path = Path(directory)
+        for name in dirnames:
+            child = directory_path / name
+            child_stat = child.lstat()
+            if stat.S_ISLNK(child_stat.st_mode):
+                raise ValueError(f"mounted capsule contains a symlink: {child.relative_to(source)}")
+            if not stat.S_ISDIR(child_stat.st_mode):
+                raise ValueError(f"mounted capsule contains a special filesystem object: {child.relative_to(source)}")
+        for name in filenames:
+            child = directory_path / name
+            child_stat = child.lstat()
+            if stat.S_ISLNK(child_stat.st_mode):
+                raise ValueError(f"mounted capsule contains a symlink: {child.relative_to(source)}")
+            if not stat.S_ISREG(child_stat.st_mode):
+                raise ValueError(f"mounted capsule contains a special filesystem object: {child.relative_to(source)}")
+            count += 1
+    return count
+
+
+def _make_tree_owner_writable(root: Path) -> None:
+    """Ensure copied data can be edited while preserving executable bits."""
+    root.chmod(root.stat().st_mode | stat.S_IWUSR | stat.S_IXUSR)
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        for name in dirnames:
+            child = directory_path / name
+            child.chmod(child.stat().st_mode | stat.S_IWUSR | stat.S_IXUSR)
+        for name in filenames:
+            child = directory_path / name
+            child.chmod(child.stat().st_mode | stat.S_IWUSR)
+
+
+def copy_mounted_capsule(mounted_root: Path, capsule_id: str, work_dir: Path) -> tuple[Path, int]:
+    """Copy one mounted capsule into an independent writable workspace."""
+    selected = resolve_mounted_capsule(mounted_root, capsule_id)
+    workspace = work_dir.resolve(strict=False)
+    if workspace == selected or workspace in selected.parents or selected in workspace.parents:
+        raise ValueError(f"mounted capsule and workspace must not overlap: {selected}, {workspace}")
+
+    entries = list(selected.iterdir())
+    collisions = sorted(entry.name for entry in entries if entry.name in _WORKSPACE_CONTROL_NAMES)
+    if collisions:
+        raise ValueError(f"mounted capsule uses reserved workspace names: {', '.join(collisions)}")
+    count = _validate_copy_source(selected)
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    if work_dir.is_symlink():
+        raise ValueError(f"mounted capsule workspace must be a real directory: {work_dir}")
+    _clear_dir(work_dir)
+    shutil.copytree(selected, work_dir, dirs_exist_ok=True, symlinks=False)
+    _make_tree_owner_writable(work_dir)
+    return selected, count
 
 
 def project_collection_capsule(bundle_root: Path, capsule_id: str, work_dir: Path) -> Path:
@@ -136,6 +214,8 @@ async def prepare_initial_workspace(
     bundle_layout: str,
     bundle_root: Path | None,
     bundle_capsule_id: str | None,
+    mounted_capsule_root: Path | None = None,
+    mounted_capsule_id: str | None = None,
 ) -> tuple[str | None, int]:
     """Populate the workspace before kernel/HTTP startup.
 
@@ -153,6 +233,20 @@ async def prepare_initial_workspace(
         return str(selected), 0
     if bundle_layout == "single":
         return None, 0
+    if (mounted_capsule_root is None) != (mounted_capsule_id is None):
+        raise ValueError(
+            "mounted-volume delivery requires HYPOTEST_MOUNTED_CAPSULE_ROOT and HYPOTEST_MOUNTED_CAPSULE_ID"
+        )
+    if mounted_capsule_root is not None and mounted_capsule_id is not None:
+        if capsule_source is not None or capsule_key is not None:
+            raise ValueError("mounted-volume and object-store capsule delivery cannot be configured together")
+        selected, count = await asyncio.to_thread(
+            copy_mounted_capsule,
+            mounted_capsule_root,
+            mounted_capsule_id,
+            work_dir,
+        )
+        return str(selected), count
     if capsule_key is None:
         return None, 0
     if capsule_source is None:
@@ -190,6 +284,8 @@ async def run_server(
     bundle_root: Path | None = None,
     bundle_capsule_id: str | None = None,
     capsule_key: str | None = None,
+    mounted_capsule_root: Path | None = None,
+    mounted_capsule_id: str | None = None,
     install_shim_enabled: bool = True,
 ) -> None:
     selected, object_count = await prepare_initial_workspace(
@@ -199,10 +295,12 @@ async def run_server(
         bundle_layout=bundle_layout,
         bundle_root=bundle_root,
         bundle_capsule_id=bundle_capsule_id,
+        mounted_capsule_root=mounted_capsule_root,
+        mounted_capsule_id=mounted_capsule_id,
     )
     if selected is not None:
         logger.warning(
-            "Prepared capsule %s in %s before kernel startup (%d downloaded objects)",
+            "Prepared capsule %s in %s before kernel startup (%d staged objects)",
             selected,
             work_dir,
             object_count,
@@ -223,20 +321,33 @@ async def run_server(
 
     @app.post("/load_capsule")
     async def load_capsule(req: LoadCapsuleRequest) -> LoadCapsuleResponse:
-        if capsule_source is None:
+        if capsule_source is None and mounted_capsule_root is None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="This kernel image has no capsule source; use a bundled workspace or set CAPSULE_SOURCE",
+                detail=(
+                    "This kernel image has no capsule source; use a bundled workspace, "
+                    "set CAPSULE_SOURCE, or set HYPOTEST_MOUNTED_CAPSULE_ROOT"
+                ),
             )
-        logger.warning("Loading capsule %s from %s", req.capsule_uuid, capsule_source)
+        source_label = str(mounted_capsule_root) if mounted_capsule_root is not None else capsule_source
+        logger.warning("Loading capsule %s from %s", req.capsule_uuid, source_label)
         # Stop the kernel (release its files in work_dir), swap in the capsule,
         # then restart the kernel in the repopulated workspace. The pull is
         # offloaded so a large download does not block the event loop.
         if req.seed is not None:
             server.seed = req.seed
         await server.close()
-        _clear_dir(work_dir)
-        count = await asyncio.to_thread(s3_sync.pull_capsule, capsule_source, req.capsule_uuid, work_dir)
+        if mounted_capsule_root is not None:
+            _, count = await asyncio.to_thread(
+                copy_mounted_capsule,
+                mounted_capsule_root,
+                req.capsule_uuid,
+                work_dir,
+            )
+        else:
+            assert capsule_source is not None
+            _clear_dir(work_dir)
+            count = await asyncio.to_thread(s3_sync.pull_capsule, capsule_source, req.capsule_uuid, work_dir)
         # Clearing wiped the scaffolding; re-lay it alongside the freshly pulled capsule.
         install_shim.write_workspace_config(
             work_dir,
@@ -295,6 +406,18 @@ def main() -> None:
         default=os.getenv("HYPOTEST_BUNDLE_CAPSULE_ID"),
         help="collection member to project (defaults to HYPOTEST_BUNDLE_CAPSULE_ID)",
     )
+    mounted_capsule_root = os.getenv("HYPOTEST_MOUNTED_CAPSULE_ROOT")
+    parser.add_argument(
+        "--mounted-capsule-root",
+        type=Path,
+        default=Path(mounted_capsule_root) if mounted_capsule_root else None,
+        help="cluster-mounted capsule collection root (defaults to HYPOTEST_MOUNTED_CAPSULE_ROOT)",
+    )
+    parser.add_argument(
+        "--mounted-capsule-id",
+        default=os.getenv("HYPOTEST_MOUNTED_CAPSULE_ID"),
+        help="mounted collection member to copy (defaults to HYPOTEST_MOUNTED_CAPSULE_ID)",
+    )
     parser.add_argument(
         "--pip-index-url",
         type=str,
@@ -324,6 +447,8 @@ def main() -> None:
             bundle_root=args.bundle_root,
             bundle_capsule_id=args.bundle_capsule_id,
             capsule_key=args.capsule_key,
+            mounted_capsule_root=args.mounted_capsule_root,
+            mounted_capsule_id=args.mounted_capsule_id,
             install_shim_enabled=args.install_shim_enabled,
         )
     )

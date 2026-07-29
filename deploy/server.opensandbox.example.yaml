@@ -35,6 +35,12 @@ dataset:
     # preserve the baked value.
     capsule_source: s3://example-bucket/capsules
     capsule_key: "{capsule_uuid}"
+    # If the cluster already mounts the full collection, use the generic image
+    # but copy one selected capsule into writable /workspace before /health:
+    # capsule_mode: mounted_volume
+    # mounted_capsule_root: /mnt/capsules
+    # capsule_key: "{capsule_uuid}"
+    # capsule_source: null
     # Package managers run directly on remote sandbox machines by default.
     # Set true only for compatibility with the former colocated install shim.
     install_shim_enabled: false

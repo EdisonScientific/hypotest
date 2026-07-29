@@ -207,6 +207,43 @@ async def test_object_store_lifecycle_preserves_proxy_path_headers_and_resources
 
 
 @pytest.mark.asyncio
+async def test_mounted_volume_lifecycle_stages_before_health_with_generic_image(tmp_path, monkeypatch):
+    remote, create_kwargs, requests = _install_fakes(monkeypatch)
+    sandbox = OpenSandboxSandbox(
+        SandboxConfig(
+            work_dir=tmp_path,
+            language=NBLanguage.PYTHON,
+            ref=CapsuleRef(
+                source="/mnt/shared/capsules",
+                uuid="cap-2",
+                delivery="mounted_volume",
+            ),
+        ),
+        OpenSandboxSpec(
+            image="registry/kernel:latest",
+            capsule_mode="mounted_volume",
+            mounted_capsule_root="/mnt/unused",
+            capsule_key="capsules/{capsule_uuid}",
+            create_attempts=1,
+            health_poll_interval_seconds=0.001,
+        ),
+    )
+
+    await sandbox.start()
+
+    assert create_kwargs["image"] == "registry/kernel:latest"
+    assert not create_kwargs["env"]["CAPSULE_SOURCE"]
+    assert not create_kwargs["env"]["CAPSULE_KEY"]
+    assert create_kwargs["env"]["HYPOTEST_MOUNTED_CAPSULE_ROOT"] == "/mnt/shared/capsules"
+    assert create_kwargs["env"]["HYPOTEST_MOUNTED_CAPSULE_ID"] == "capsules/cap-2"
+    assert not any(request.url.path.endswith("/load_capsule") for request in requests)
+
+    await sandbox.close()
+    assert remote.killed
+    assert remote.closed
+
+
+@pytest.mark.asyncio
 async def test_large_bundle_selects_image_skips_load_and_resets_seed(tmp_path, monkeypatch):
     remote, create_kwargs, requests = _install_fakes(monkeypatch, endpoint="10.0.0.8:8000")
     config = SandboxConfig(
@@ -367,6 +404,22 @@ def test_init_pull_key_can_be_overridden_or_left_to_image():
     invalid = OpenSandboxSpec(image="kernel:latest", capsule_key="{unknown}")
     with pytest.raises(ValueError, match="may only contain"):
         invalid.resolve_capsule_key("cap-1")
+
+
+def test_mounted_capsule_root_must_be_an_absolute_nonblank_container_path():
+    with pytest.raises(ValueError, match="requires mounted_capsule_root"):
+        OpenSandboxSpec(image="kernel:latest", capsule_mode="mounted_volume")
+    with pytest.raises(ValueError, match="cannot be blank"):
+        OpenSandboxSpec(image="kernel:latest", capsule_mode="mounted_volume", mounted_capsule_root=" ")
+    with pytest.raises(ValueError, match="absolute container path"):
+        OpenSandboxSpec(image="kernel:latest", capsule_mode="mounted_volume", mounted_capsule_root="mnt/capsules")
+    with pytest.raises(ValueError, match="requires a capsule_key"):
+        OpenSandboxSpec(
+            image="kernel:latest",
+            capsule_mode="mounted_volume",
+            mounted_capsule_root="/mnt/capsules",
+            capsule_key=None,
+        )
 
 
 @pytest.mark.asyncio

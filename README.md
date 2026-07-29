@@ -80,6 +80,36 @@ Sandbox.create(image[/auth], CAPSULE_SOURCE, CAPSULE_KEY)
 See [`deploy/server.opensandbox.example.yaml`](deploy/server.opensandbox.example.yaml)
 for a complete server configuration.
 
+## Cluster-Mounted Capsule Collections
+
+When the OpenSandbox cluster already mounts the capsule collection into every
+sandbox, use the same generic kernel image with mounted-volume delivery:
+
+```yaml
+capsule_mode: mounted_volume
+mounted_capsule_root: /mnt/capsules
+capsule_key: "{capsule_uuid}"
+```
+
+For each allocation, Hypotest passes the selected identity as
+`HYPOTEST_MOUNTED_CAPSULE_ID`. The kernel bootstrap resolves an exact directory
+below `mounted_capsule_root`, also accepting the legacy `CapsuleData-<id>` and
+`capsule_<id>` directory conventions. It rejects traversal, symlinked capsules,
+symlinks or special files inside a capsule, and overlap with `/workspace`.
+
+The shared mount is only a bootstrap source. Before Jupyter or `/health`
+starts, the selected capsule is copied into the sandbox's local `/workspace`
+and owner-write permission is added to the copied files and directories. The
+model therefore sees a normal writable workspace: edits and newly generated
+files remain sandbox-local and do not mutate the cluster mount. A successful
+`/health` means the copy and kernel startup are complete, and episode time
+accounting begins afterward.
+
+Size ephemeral storage for the largest selected capsule plus package installs
+and model outputs. The OpenSandbox workload provider is responsible for making
+the mount visible at the configured container path; no volume declaration is
+encoded in the OCI image or lifecycle request.
+
 ## Optional Large-Bundle Images for OpenSandbox
 
 Large-bundle mode can package either one capsule or an entire capsule

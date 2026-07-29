@@ -153,6 +153,14 @@ it differs by backend and is each impl's job inside `start()`:
   `/health` means both data and kernel are ready. The dataset episode timer starts only after
   `OpenSandboxSandbox.start()` returns. Image-baked source/key defaults remain available, with
   per-allocation env taking precedence.
+- **OpenSandbox / mounted-volume**: the cluster exposes a shared capsule collection at
+  `mounted_capsule_root`. The lifecycle request injects the root and selected capsule ID, then
+  kernel bootstrap resolves that member without traversal or symlink escape and copies its
+  regular files into sandbox-local `/workspace`. Copied files and directories are made
+  owner-writable. The shared mount is never the model workspace, so model edits and outputs
+  remain episode-local. As with object-store delivery, this finishes before `/health` and
+  therefore before episode time accounting. The cluster provider owns the actual volume mount;
+  neither the image nor the raw OpenSandbox create request declares it.
 - **OpenSandbox / large-bundle**: `/load_capsule` is skipped. The build script supports two
   standard Docker/OCI layouts. A single-capsule image puts one task directly under
   `/workspace` and is selected from a map/template. A collection image puts all immediate

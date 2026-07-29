@@ -362,9 +362,9 @@ class CapsuleRef(BaseModel):
     `source=None` means work_dir is already populated.
     """
 
-    source: str | None = None  # local dir or s3://bucket/prefix
+    source: str | None = None  # local/mounted dir or s3://bucket/prefix
     uuid: str | None = None
-    delivery: Literal["workspace", "object_store", "bundled"] = "workspace"
+    delivery: Literal["workspace", "object_store", "mounted_volume", "bundled"] = "workspace"
     # A bundled capsule image already has this task's data under /workspace.
     # It is selected per task and therefore belongs on the ref, not the backend spec.
     image: str | None = None
