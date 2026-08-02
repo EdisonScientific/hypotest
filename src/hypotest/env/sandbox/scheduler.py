@@ -140,9 +140,12 @@ class OpenSandboxFallbackScheduler(SandboxScheduler):
         try:
             await remote.start()
         except OpenSandboxUnavailableError as exc:
-            logger.warning("OpenSandbox unavailable (%s); falling back to the locally staged backend", exc)
             with contextlib.suppress(Exception):
                 await remote.close()
+            if not self._spec.local_fallback_enabled:
+                logger.warning("OpenSandbox unavailable and local fallback is disabled: %s", exc)
+                raise
+            logger.warning("OpenSandbox unavailable (%s); falling back to the locally staged backend", exc)
         else:
             return remote
 

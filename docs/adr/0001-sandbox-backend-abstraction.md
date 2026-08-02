@@ -128,7 +128,7 @@ teardown lives in its own impl.
 | **docker** | aiodocker container | `HttpKernelClient` → `localhost:port` | single host | bind-mount, dataset-server pre-pull | none (unsupported) | `/list_dir` via client |
 | **enroot** | enroot squashfs subprocess | ray actor `.remote()` → in-actor `HttpKernelClient` | **ray SPREAD** (required) | bind-mount, dataset-server pre-pull | `prlimit` (default) | `/list_dir` via client |
 | **k8s** | agent-sandbox `Sandbox` claim, fresh per task | `connector.send_request` → `HttpKernelClient` | k8s scheduler + `SandboxScheduler` LB across clusters | in-pod `/load_capsule` pull | pod `resources.limits` (cgroup, kubelet-set) | `/list_dir` via client |
-| **OpenSandbox** | `opensandbox.Sandbox.create` against a remote server | SDK `get_endpoint(8000)` → `HttpKernelClient` | OpenSandbox server/runtime; local backend fallback | object-store init pull before `/health`, or single/collection bundled image | lifecycle `resource` map | `/list_dir` via client |
+| **OpenSandbox** | `opensandbox.Sandbox.create` against a remote server | SDK `get_endpoint(8000)` → `HttpKernelClient` | OpenSandbox server/runtime; local backend fallback | object-store init pull before `/health`, or single/collection bundled image | outer lifecycle `resource` map + optional inner kernel `prlimit` | `/list_dir` via client |
 
 Backend specifics — `warmpool`, `terminate`, `X-Sandbox-*`, ray refs, aiodocker handles,
 `max_concurrency` — **stay inside their impl**. The `Sandbox` ABC sees none of them.
@@ -228,13 +228,17 @@ user), so we do **not** mandate them.
     node supports delegation (e.g. via `systemd-run --scope`). Off by default.
   - **k8s:** pod `resources.limits` — the kubelet sets the cgroup; no delegation issue.
   - **OpenSandbox:** `cpu`, `memory`, `ephemeral-storage`, `gpu`, and `gpu_type` quantities on
-    `Sandbox.create`; the selected server runtime enforces them.
+    `Sandbox.create`; the selected server runtime enforces them. An optional
+    `kernel_memory_limit_mb` applies `RLIMIT_AS` only to the Jupyter child and must remain below
+    the outer memory quantity. This makes large allocations return `MemoryError` while retaining
+    enough headroom for the HTTP server to report the result.
   - **local / docker:** unsupported (no-op).
 
 **Known, accepted gap:** `RLIMIT_AS` limits *virtual address space* (over-reserved by
 CUDA/BLAS/threaded runtimes → can spuriously trip), while k8s pod limits cap *RSS* and
-OOM-kill. So the same `ResourceSpec` yields different failure behavior on the enroot fallback
-vs. k8s. Documented; revisit if cgroup delegation becomes available cluster-wide.
+OOM-kill. OpenSandbox can layer both limits, but the inner limit is per-process rather than an
+aggregate kernel-process-tree cgroup. Revisit with a delegated child cgroup or separate kernel
+container if multiprocessing workloads need hard aggregate containment.
 
 ## 7. Topology, placement & connection
 

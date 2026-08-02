@@ -38,6 +38,9 @@ class ExecutionResult(BaseModel):
     timed_out: bool = False
     timeout_recovery: Literal["interrupted", "wedged"] | None = None
     interrupt_seconds: float | None = None
+    kernel_restarted: bool = False
+    kernel_state_lost: bool = False
+    kernel_exit_code: int | None = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -194,6 +197,11 @@ class ExecutionResult(BaseModel):
         return {"content": content}
 
 
+def _require_successful_bootstrap(result: ExecutionResult) -> None:
+    if result.error_occurred:
+        raise RuntimeError("Deterministic kernel RNG bootstrap failed")
+
+
 class Interpreter:
     """Manages Python/R interpreter kernels for code execution.
 
@@ -270,8 +278,7 @@ class Interpreter:
                     rng_bootstrap_code(self.language, self.seed),
                     store_history=False,
                 )
-                if bootstrap.error_occurred:
-                    raise RuntimeError("Deterministic kernel RNG bootstrap failed")
+                _require_successful_bootstrap(bootstrap)
             self._is_ready = True
             logger.debug(f"Kernel {kernel_name} started successfully in {self.work_dir}")
         except Exception as e:

@@ -111,6 +111,8 @@ celerybeat-schedule
 celerybeat.pid
 *.sage.py
 .env
+.env.*
+!.env.example
 .venv
 venv/
 /ENV/
@@ -135,3 +137,6 @@ cython_debug/
 *.pem
 
 server.yaml
+
+# Local qualification and stress-test reports may contain operational metadata.
+/artifacts/

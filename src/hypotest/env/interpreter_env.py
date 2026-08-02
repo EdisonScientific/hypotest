@@ -136,6 +136,50 @@ def _schedule_dir_cleanup(path: Path) -> None:
     task.add_done_callback(_BACKGROUND_CLEANUP_TASKS.discard)
 
 
+def _validate_generation_measurements(
+    latency: cfg.GenerationLatencyConfig | None,
+    turns: list[ModelTurn],
+) -> None:
+    """Require the source data selected by the generation accounting mode."""
+    if isinstance(latency, cfg.TokenThroughputGenerationLatencyConfig):
+        if not turns:
+            raise ValueError("token_throughput generation latency requires NeMo Gym model-turn metadata")
+        missing_usage = [turn.response_id for turn in turns if turn.usage is None]
+        if missing_usage:
+            raise ValueError(
+                "token_throughput generation latency requires output-token usage for responses: "
+                + ", ".join(missing_usage)
+            )
+    elif isinstance(latency, cfg.ReportedGenerationLatencyConfig):
+        if not turns:
+            raise ValueError("reported generation latency requires NeMo Gym model-turn metadata")
+        missing_duration = [turn.response_id for turn in turns if turn.generation_seconds is None]
+        if missing_duration:
+            raise ValueError(
+                "reported generation latency requires generation_seconds for responses: "
+                + ", ".join(missing_duration)
+            )
+
+
+def _generation_seconds(
+    latency: cfg.GenerationLatencyConfig | None,
+    turns: list[ModelTurn | None],
+    output_tokens: int,
+) -> float:
+    """Compute one step's configured generation charge from validated turns."""
+    if isinstance(latency, cfg.GenerationLatencyEstimateConfig):
+        return float(latency.seconds_per_generation) * len(turns)
+    if isinstance(latency, cfg.TokenThroughputGenerationLatencyConfig):
+        return output_tokens / float(latency.output_tokens_per_second)
+    if isinstance(latency, cfg.ReportedGenerationLatencyConfig):
+        return sum(
+            turn.generation_seconds
+            for turn in turns
+            if turn is not None and turn.generation_seconds is not None
+        )
+    return 0.0
+
+
 class ProblemInstance(BaseModel):
     id: UUID
     hypothesis: str
@@ -178,8 +222,10 @@ class InterpreterEnvState:
         use_ray: bool = True,
         container_sqsh_path: Path | None = None,
         save_dir: Path | None = None,
+        sandbox_memory_request_mb: int | None = None,
         sandbox_memory_limit_mb: int | None = None,
         sandbox_max_pids: int | None = None,
+        sandbox_cpu_request: float | None = None,
         sandbox_cpu: float | None = None,
         sandbox_ephemeral_storage_gib: int | None = None,
         sandbox_gpu_count: int | None = None,
@@ -219,8 +265,10 @@ class InterpreterEnvState:
             container_sqsh_path=container_sqsh_path,
             resources=ResourceSpec(
                 mem_mb=sandbox_memory_limit_mb,
+                mem_request_mb=sandbox_memory_request_mb,
                 max_pids=sandbox_max_pids,
                 cpu=sandbox_cpu,
+                cpu_request=sandbox_cpu_request,
                 disk_gib=sandbox_ephemeral_storage_gib,
                 gpu=sandbox_gpu_count,
                 gpu_type=sandbox_gpu_type,
@@ -646,6 +694,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.scheduler_seed: int | None = None
         self._kernel_execution_seconds = 0.0
         self._simulated_generation_seconds = 0.0
+        self._reported_generation_seconds = 0.0
         self._policy_generation_count = 0
         self._policy_generation_output_tokens = 0
         self._duplicate_generation_accounting_suppressed = 0
@@ -755,8 +804,10 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             use_enroot=self.config.use_enroot,
             use_ray=self.config.use_ray,
             container_sqsh_path=self.config.container_sqsh_path,
+            sandbox_memory_request_mb=self.execution_config.sandbox_memory_request_mb,
             sandbox_memory_limit_mb=self.execution_config.sandbox_memory_limit_mb,
             sandbox_max_pids=self.execution_config.sandbox_max_pids,
+            sandbox_cpu_request=self.execution_config.sandbox_cpu_request,
             sandbox_cpu=self.execution_config.sandbox_cpu,
             sandbox_ephemeral_storage_gib=self.execution_config.sandbox_ephemeral_storage_gib,
             sandbox_gpu_count=self.execution_config.sandbox_gpu_count,
@@ -1648,10 +1699,11 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
     # ========== Time Management ==========
 
     def _reset_episode_time_accounting(self) -> None:
-        """Reset wall, kernel-execution, and simulated-generation counters."""
+        """Reset wall, kernel-execution, and model-generation counters."""
         self.start_time = time.perf_counter()
         self._kernel_execution_seconds = 0.0
         self._simulated_generation_seconds = 0.0
+        self._reported_generation_seconds = 0.0
         self._policy_generation_count = 0
         self._policy_generation_output_tokens = 0
         self._duplicate_generation_accounting_suppressed = 0
@@ -1677,15 +1729,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         )
         turns = model_turns_from_action_info(action.info if action is not None else None)
 
-        if isinstance(latency, cfg.TokenThroughputGenerationLatencyConfig):
-            if not turns:
-                raise ValueError("token_throughput generation latency requires NeMo Gym model-turn metadata")
-            missing_usage = [turn.response_id for turn in turns if turn.usage is None]
-            if missing_usage:
-                raise ValueError(
-                    "token_throughput generation latency requires output-token usage for responses: "
-                    + ", ".join(missing_usage)
-                )
+        _validate_generation_measurements(latency, turns)
 
         # Legacy callers do not provide turn metadata. Preserve one generation
         # per environment step for all pre-existing accounting modes.
@@ -1713,13 +1757,11 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         )
         self._policy_generation_output_tokens += output_tokens
 
-        if isinstance(latency, cfg.GenerationLatencyEstimateConfig):
-            seconds = float(latency.seconds_per_generation) * len(unique_turns)
-        elif isinstance(latency, cfg.TokenThroughputGenerationLatencyConfig):
-            seconds = output_tokens / float(latency.output_tokens_per_second)
+        seconds = _generation_seconds(latency, unique_turns, output_tokens)
+        if isinstance(latency, cfg.ReportedGenerationLatencyConfig):
+            self._reported_generation_seconds += seconds
         else:
-            seconds = 0.0
-        self._simulated_generation_seconds += seconds
+            self._simulated_generation_seconds += seconds
         return seconds
 
     def _record_kernel_execution(
@@ -1797,7 +1839,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         accounting = self.execution_config.time_accounting
         if isinstance(accounting, cfg.WallClockTimeAccountingConfig):
             return 0.0 if self.start_time is None else max(0.0, time.perf_counter() - self.start_time)
-        return self._kernel_execution_seconds + self._simulated_generation_seconds
+        return self._kernel_execution_seconds + self._simulated_generation_seconds + self._reported_generation_seconds
 
     def get_time_accounting_metadata(self) -> dict[str, Any]:
         """Return auditable wall and accounted-time totals for rollout artifacts."""
@@ -1806,7 +1848,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         elapsed = (
             wall_elapsed
             if isinstance(accounting, cfg.WallClockTimeAccountingConfig)
-            else self._kernel_execution_seconds + self._simulated_generation_seconds
+            else self._kernel_execution_seconds
+            + self._simulated_generation_seconds
+            + self._reported_generation_seconds
         )
         generation_latency = (
             accounting.generation_latency.model_dump(mode="json")
@@ -1820,7 +1864,9 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             "remaining_seconds": self.execution_config.job_timeout - elapsed,
             "wall_clock_elapsed_seconds": wall_elapsed,
             "kernel_execution_seconds": self._kernel_execution_seconds,
+            "model_generation_seconds": self._simulated_generation_seconds + self._reported_generation_seconds,
             "simulated_generation_seconds": self._simulated_generation_seconds,
+            "reported_generation_seconds": self._reported_generation_seconds,
             "policy_generation_count": self._policy_generation_count,
             "policy_generation_output_tokens": self._policy_generation_output_tokens,
             "duplicate_generation_accounting_suppressed": self._duplicate_generation_accounting_suppressed,

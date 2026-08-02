@@ -73,7 +73,7 @@ k8s = [
     "k8s-agent-sandbox[async]",  # async extra: AsyncSandboxClient/AsyncSandboxConnector need it
 ]
 opensandbox = [
-    "opensandbox>=0.1.9",
+    "opensandbox>=0.1.14",
 ]
 ray = [
     "ray",

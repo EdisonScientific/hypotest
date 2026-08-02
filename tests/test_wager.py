@@ -13,6 +13,7 @@ Ports the 10 tests from features/wager_scheme/reference_impl.py plus four new:
 from __future__ import annotations
 
 import csv
+import os
 from pathlib import Path
 
 import pytest
@@ -132,9 +133,12 @@ def test_breakdown_penalty_on_wrong() -> None:
 
 def test_fixtures_csv_parity() -> None:
     # Every row in the reference fixture must match our port to 1e-6.
-    fixtures_path = Path("/lustre/fsw/general_sa/akomaragiri/nemorl-polyphe/features/wager_scheme/validation/fixtures.csv")
+    fixtures_location = os.getenv("HYPOTEST_WAGER_FIXTURES")
+    if not fixtures_location:
+        pytest.skip("HYPOTEST_WAGER_FIXTURES is not configured")
+    fixtures_path = Path(fixtures_location)
     if not fixtures_path.exists():
-        pytest.skip(f"fixtures not available at {fixtures_path}")
+        pytest.skip("configured wager fixtures are not available")
 
     with fixtures_path.open() as f:
         reader = csv.DictReader(f)

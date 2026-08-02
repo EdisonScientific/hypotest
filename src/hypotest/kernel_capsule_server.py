@@ -287,6 +287,7 @@ async def run_server(
     mounted_capsule_root: Path | None = None,
     mounted_capsule_id: str | None = None,
     install_shim_enabled: bool = True,
+    kernel_memory_limit_mb: int | None = None,
 ) -> None:
     selected, object_count = await prepare_initial_workspace(
         work_dir,
@@ -315,7 +316,14 @@ async def run_server(
         install_shim_enabled=install_shim_enabled,
     )
     _apply_workspace_env(work_dir, install_shim_enabled=install_shim_enabled)
-    server = KernelServer(work_dir, language, startup_token=startup_token, safe_execute=safe_execute, seed=seed)
+    server = KernelServer(
+        work_dir,
+        language,
+        startup_token=startup_token,
+        safe_execute=safe_execute,
+        seed=seed,
+        kernel_memory_limit_mb=kernel_memory_limit_mb,
+    )
     await server.start()
     app = create_app(server)
 
@@ -389,6 +397,11 @@ def main() -> None:
     parser.add_argument("--safe-execute", action="store_true")
     parser.add_argument("--seed", type=int)
     parser.add_argument(
+        "--kernel-memory-limit-mb",
+        type=int,
+        help="per-Jupyter-process RLIMIT_AS ceiling; leaves the HTTP server outside the limit",
+    )
+    parser.add_argument(
         "--bundle-layout",
         choices=sorted(_BUNDLE_LAYOUTS),
         default=os.getenv("HYPOTEST_BUNDLE_LAYOUT", "none"),
@@ -450,6 +463,7 @@ def main() -> None:
             mounted_capsule_root=args.mounted_capsule_root,
             mounted_capsule_id=args.mounted_capsule_id,
             install_shim_enabled=args.install_shim_enabled,
+            kernel_memory_limit_mb=args.kernel_memory_limit_mb,
         )
     )
 

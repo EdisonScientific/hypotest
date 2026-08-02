@@ -20,9 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import os
 import re
+import time
+import weakref
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Literal
 
@@ -120,15 +125,50 @@ class OpenSandboxSpec(BaseModel):
     create_timeout_seconds: float = Field(default=600.0, gt=0, allow_inf_nan=False)
     ready_timeout_seconds: float = Field(default=300.0, gt=0, allow_inf_nan=False)
     health_poll_interval_seconds: float = Field(default=0.5, gt=0, allow_inf_nan=False)
+    # Poll immediately after submit, then use this value as the first delay.
+    # Long-running cells back off with per-execution jitter to avoid synchronized
+    # status-request bursts through the OpenSandbox proxy.
     execution_poll_interval_seconds: float = Field(default=0.5, gt=0, allow_inf_nan=False)
+    execution_poll_max_interval_seconds: float = Field(default=10.0, gt=0, allow_inf_nan=False)
+    execution_poll_backoff_multiplier: float = Field(default=2.0, ge=1, allow_inf_nan=False)
+    execution_poll_jitter_ratio: float = Field(default=0.2, ge=0, le=1, allow_inf_nan=False)
+    # A status endpoint should answer immediately even while its cell is still
+    # running. Bound one bad proxy request independently of the cell deadline.
+    execution_poll_request_timeout_seconds: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    # None retries transient poll failures until the per-execution wire deadline.
+    # Set an integer to impose an earlier consecutive-error cap.
+    execution_poll_max_retries: int | None = Field(default=None, ge=0)
+
+    # All OpenSandbox instances in one process/event loop share two transports:
+    # a smaller lifecycle pool and an independently bounded hot-path kernel pool.
+    lifecycle_max_connections: int = Field(default=64, ge=1)
+    lifecycle_max_keepalive_connections: int = Field(default=32, ge=0)
+    # Admit create operations before they enter httpx so excess allocations wait
+    # outside the per-request pool timeout. OpenSandbox.create performs several
+    # lifecycle calls, so one permit is held through the entire SDK operation.
+    lifecycle_create_concurrency: int = Field(default=64, ge=1)
+    kernel_max_connections: int = Field(default=256, ge=1)
+    kernel_max_keepalive_connections: int = Field(default=128, ge=0)
+    # Kernel calls are short submit/poll/control requests. Gate them before
+    # httpx so many logical sandboxes cannot exhaust the proxy connection pool.
+    kernel_request_concurrency: int = Field(default=128, ge=1)
+    http_keepalive_expiry_seconds: float = Field(default=30.0, gt=0, allow_inf_nan=False)
+
     create_attempts: int = Field(default=2, ge=1)
     create_retry_delay_seconds: float = Field(default=2.0, ge=0, allow_inf_nan=False)
     ttl_seconds: int | None = Field(default=5400, gt=0)
     kernel_port: int = Field(default=8000, ge=1, le=65535)
+    # An inner RLIMIT_AS applied only to the Jupyter process. Keep this below
+    # the outer ResourceSpec.mem_mb cgroup ceiling so Python receives ENOMEM
+    # before Kubernetes OOM-kills the sandbox container.
+    kernel_memory_limit_mb: int | None = Field(default=None, gt=0)
     # Remote sandboxes are already isolated at the machine/pod boundary, so
     # package-manager interception is off by default. Keep the shim available
     # for compatibility with colocated deployments that explicitly opt in.
     install_shim_enabled: bool = False
+    # Operators can disable the colocated fallback for qualification runs (or
+    # strict remote-only deployments) so capacity failures cannot be masked.
+    local_fallback_enabled: bool = True
 
     capsule_mode: Literal["object_store", "mounted_volume", "large_bundle"] = "object_store"
     # Runtime values override ENV defaults baked into the image. ``capsule_key``
@@ -167,6 +207,10 @@ class OpenSandboxSpec(BaseModel):
             raise ValueError("platform_os and platform_arch must be set together")
         if self.entrypoint == []:
             raise ValueError("entrypoint must be non-empty when provided")
+        if self.entrypoint is not None and self.kernel_memory_limit_mb is not None:
+            raise ValueError("kernel_memory_limit_mb cannot be combined with a custom entrypoint")
+        if self.execution_poll_max_interval_seconds < self.execution_poll_interval_seconds:
+            raise ValueError("execution_poll_max_interval_seconds cannot be less than execution_poll_interval_seconds")
         if self.capsule_mode == "mounted_volume":
             if self.mounted_capsule_root is None:
                 raise ValueError("mounted_volume capsule_mode requires mounted_capsule_root")
@@ -177,6 +221,18 @@ class OpenSandboxSpec(BaseModel):
                 raise ValueError("mounted_capsule_root cannot be blank")
             if not self.mounted_capsule_root.startswith("/"):
                 raise ValueError("mounted_capsule_root must be an absolute container path")
+        return self
+
+    @model_validator(mode="after")
+    def validate_shared_client_limits(self) -> OpenSandboxSpec:
+        if self.lifecycle_max_keepalive_connections > self.lifecycle_max_connections:
+            raise ValueError("lifecycle_max_keepalive_connections cannot exceed lifecycle_max_connections")
+        if self.lifecycle_create_concurrency > self.lifecycle_max_connections:
+            raise ValueError("lifecycle_create_concurrency cannot exceed lifecycle_max_connections")
+        if self.kernel_max_keepalive_connections > self.kernel_max_connections:
+            raise ValueError("kernel_max_keepalive_connections cannot exceed kernel_max_connections")
+        if self.kernel_request_concurrency > self.kernel_max_connections:
+            raise ValueError("kernel_request_concurrency cannot exceed kernel_max_connections")
         return self
 
     def resolve_large_bundle_image(self, capsule_uuid: str) -> str:
@@ -266,6 +322,16 @@ def _resource_map(resources: ResourceSpec) -> dict[str, str]:
     return values
 
 
+def _resource_request_map(resources: ResourceSpec) -> dict[str, str]:
+    """Map the reserved CPU/memory floor to Kubernetes resource requests."""
+    values: dict[str, str] = {}
+    if resources.cpu_request is not None:
+        values["cpu"] = _resource_quantity(resources.cpu_request)
+    if resources.mem_request_mb is not None:
+        values["memory"] = f"{resources.mem_request_mb}Mi"
+    return values
+
+
 def _endpoint_url(endpoint: str, protocol: str) -> str:
     """Normalize an SDK endpoint while preserving any server-proxy path."""
     endpoint = endpoint.strip()
@@ -293,10 +359,188 @@ def _is_transient_remote_error(exc: Exception, *, endpoint_readiness: bool = Fal
     return any(marker in message for marker in _RETRYABLE_MESSAGE_MARKERS)
 
 
+@dataclass(frozen=True, slots=True)
+class _OpenSandboxClientPoolKey:
+    """Non-secret identity for one event-loop-local shared client pool."""
+
+    connection_config_type: type
+    base_url: str
+    api_key_digest: bytes
+    use_server_proxy: bool
+    lifecycle_max_connections: int
+    lifecycle_max_keepalive_connections: int
+    lifecycle_create_concurrency: int
+    kernel_max_connections: int
+    kernel_max_keepalive_connections: int
+    kernel_request_concurrency: int
+    keepalive_expiry_seconds: float
+
+
+@dataclass(slots=True)
+class _OpenSandboxClientPool:
+    """Shared connection pools; individual sandboxes retain only logical handles."""
+
+    loop: asyncio.AbstractEventLoop
+    key: _OpenSandboxClientPoolKey
+    lifecycle_transport: httpx.AsyncBaseTransport
+    lifecycle_create_semaphore: asyncio.Semaphore
+    kernel_transport: httpx.AsyncBaseTransport
+    kernel_client: httpx.AsyncClient
+    kernel_request_semaphore: asyncio.Semaphore
+    references: int = 0
+
+    async def aclose(self) -> None:
+        # AsyncClient owns/closes its configured kernel transport. Explicitly
+        # close it too for custom transports whose client wrapper was replaced.
+        with contextlib.suppress(Exception):
+            await self.kernel_client.aclose()
+        with contextlib.suppress(Exception):
+            await self.kernel_transport.aclose()
+        with contextlib.suppress(Exception):
+            await self.lifecycle_transport.aclose()
+
+
+_OPEN_SANDBOX_CLIENT_POOLS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    dict[_OpenSandboxClientPoolKey, _OpenSandboxClientPool],
+] = weakref.WeakKeyDictionary()
+
+
+def _client_pool_key(connection_config: Any, spec: OpenSandboxSpec) -> _OpenSandboxClientPoolKey:
+    get_base_url = getattr(connection_config, "get_base_url", None)
+    if callable(get_base_url):
+        base_url = str(get_base_url())
+    else:
+        protocol = getattr(connection_config, "protocol", None) or spec.protocol or "http"
+        domain = (
+            getattr(connection_config, "domain", None)
+            or spec.domain
+            or os.getenv(
+                "OPEN_SANDBOX_DOMAIN",
+                "localhost:8080",
+            )
+        )
+        base_url = f"{protocol}://{domain}/v1"
+
+    get_api_key = getattr(connection_config, "get_api_key", None)
+    api_key = get_api_key() if callable(get_api_key) else (spec.api_key or os.getenv("OPEN_SANDBOX_API_KEY", ""))
+    api_key_digest = hashlib.sha256(str(api_key).encode("utf-8")).digest()
+
+    return _OpenSandboxClientPoolKey(
+        connection_config_type=type(connection_config),
+        base_url=base_url,
+        api_key_digest=api_key_digest,
+        use_server_proxy=spec.use_server_proxy,
+        lifecycle_max_connections=spec.lifecycle_max_connections,
+        lifecycle_max_keepalive_connections=spec.lifecycle_max_keepalive_connections,
+        lifecycle_create_concurrency=spec.lifecycle_create_concurrency,
+        kernel_max_connections=spec.kernel_max_connections,
+        kernel_max_keepalive_connections=spec.kernel_max_keepalive_connections,
+        kernel_request_concurrency=spec.kernel_request_concurrency,
+        keepalive_expiry_seconds=spec.http_keepalive_expiry_seconds,
+    )
+
+
+async def _acquire_client_pool(
+    connection_config: Any,
+    spec: OpenSandboxSpec,
+) -> _OpenSandboxClientPool:
+    loop = asyncio.get_running_loop()
+    key = _client_pool_key(connection_config, spec)
+    loop_pools = _OPEN_SANDBOX_CLIENT_POOLS.setdefault(loop, {})
+    if pool := loop_pools.get(key):
+        pool.references += 1
+        return pool
+
+    lifecycle_transport = httpx.AsyncHTTPTransport(
+        limits=httpx.Limits(
+            max_connections=spec.lifecycle_max_connections,
+            max_keepalive_connections=spec.lifecycle_max_keepalive_connections,
+            keepalive_expiry=spec.http_keepalive_expiry_seconds,
+        )
+    )
+    kernel_transport = httpx.AsyncHTTPTransport(
+        limits=httpx.Limits(
+            max_connections=spec.kernel_max_connections,
+            max_keepalive_connections=spec.kernel_max_keepalive_connections,
+            keepalive_expiry=spec.http_keepalive_expiry_seconds,
+        )
+    )
+    try:
+        kernel_client = httpx.AsyncClient(
+            transport=kernel_transport,
+            timeout=httpx.Timeout(30.0, connect=10.0),
+        )
+    except BaseException:
+        with contextlib.suppress(Exception):
+            await kernel_transport.aclose()
+        with contextlib.suppress(Exception):
+            await lifecycle_transport.aclose()
+        raise
+
+    pool = _OpenSandboxClientPool(
+        loop=loop,
+        key=key,
+        lifecycle_transport=lifecycle_transport,
+        lifecycle_create_semaphore=asyncio.Semaphore(spec.lifecycle_create_concurrency),
+        kernel_transport=kernel_transport,
+        kernel_client=kernel_client,
+        kernel_request_semaphore=asyncio.Semaphore(spec.kernel_request_concurrency),
+        references=1,
+    )
+    loop_pools[key] = pool
+    logger.debug(
+        "Created shared OpenSandbox client pool (lifecycle=%d, create_admission=%d, kernel=%d, kernel_admission=%d)",
+        spec.lifecycle_max_connections,
+        spec.lifecycle_create_concurrency,
+        spec.kernel_max_connections,
+        spec.kernel_request_concurrency,
+    )
+    return pool
+
+
+async def _request_with_kernel_admission(
+    pool: _OpenSandboxClientPool,
+    method: str,
+    url: httpx.URL,
+    *,
+    record_wait: Callable[[float], None] | None = None,
+    **kwargs: Any,
+) -> httpx.Response:
+    """Queue a kernel-proxy request before its httpx timeout begins."""
+    queue_started = time.perf_counter()
+    async with pool.kernel_request_semaphore:
+        if record_wait is not None:
+            record_wait(time.perf_counter() - queue_started)
+        return await pool.kernel_client.request(method, url, **kwargs)
+
+
+async def _release_client_pool(pool: _OpenSandboxClientPool) -> None:
+    if pool.references <= 0:
+        return
+    pool.references -= 1
+    if pool.references:
+        return
+
+    loop_pools = _OPEN_SANDBOX_CLIENT_POOLS.get(pool.loop)
+    if loop_pools is not None and loop_pools.get(pool.key) is pool:
+        del loop_pools[pool.key]
+        if not loop_pools:
+            _OPEN_SANDBOX_CLIENT_POOLS.pop(pool.loop, None)
+    await pool.aclose()
+    logger.debug("Closed shared OpenSandbox client pool")
+
+
 class OpenSandboxSandbox(Sandbox):
     """A fresh OpenSandbox container running Hypotest's persistent kernel server."""
 
     def __init__(self, config: SandboxConfig, spec: OpenSandboxSpec) -> None:
+        if (
+            spec.kernel_memory_limit_mb is not None
+            and config.resources.mem_mb is not None
+            and spec.kernel_memory_limit_mb >= config.resources.mem_mb
+        ):
+            raise ValueError("OpenSandbox kernel_memory_limit_mb must be less than the outer sandbox memory limit")
         self.work_dir = config.work_dir
         self.language = config.language
         self._config = config
@@ -305,31 +549,58 @@ class OpenSandboxSandbox(Sandbox):
         self._resources = config.resources
         self._sandbox: Any = None
         self._client: HttpKernelClient | None = None
-        self._http_client: httpx.AsyncClient | None = None
+        self._client_pool: _OpenSandboxClientPool | None = None
+        self._startup_timings: dict[str, float] = {}
+        self._kernel_request_wait_seconds = 0.0
+
+    @property
+    def startup_timings(self) -> dict[str, float]:
+        """Return allocation/readiness phase timings for observability."""
+        return dict(self._startup_timings)
+
+    def _record_kernel_request_wait(self, seconds: float) -> None:
+        self._kernel_request_wait_seconds += seconds
 
     async def start(self) -> None:
         if self._sandbox is not None:
             return
 
-        connection_config = self._make_connection_config()
-        self._sandbox = await self._allocate(connection_config)
+        startup_started = time.perf_counter()
+        base_connection_config = self._make_connection_config()
         try:
+            self._client_pool = await _acquire_client_pool(base_connection_config, self._spec)
+            connection_config = self._make_connection_config(
+                transport=self._client_pool.lifecycle_transport,
+            )
+            allocation_started = time.perf_counter()
+            self._sandbox = await self._allocate(connection_config)
+            self._startup_timings["allocation_seconds"] = time.perf_counter() - allocation_started
+            connect_started = time.perf_counter()
             await self._connect_kernel(connection_config)
+            self._startup_timings["kernel_connect_seconds"] = time.perf_counter() - connect_started
             assert self._client is not None
             if self._config.seed is not None:
                 # Init-time capsule delivery completes before /health. Apply the
                 # deterministic seed only after the ready kernel is reachable.
+                reset_started = time.perf_counter()
                 await self._client.reset(self._config.seed)
+                self._startup_timings["seed_reset_seconds"] = time.perf_counter() - reset_started
+            self._startup_timings["startup_seconds"] = time.perf_counter() - startup_started
         except BaseException:
             await self.close()
             raise
 
-    def _make_connection_config(self) -> Any:
+    def _make_connection_config(self, *, transport: httpx.AsyncBaseTransport | None = None) -> Any:
         _, ConnectionConfig, _, _, _ = _require_opensandbox_sdk()
         kwargs: dict[str, Any] = {
             "request_timeout": timedelta(seconds=self._spec.request_timeout_seconds),
             "use_server_proxy": self._spec.use_server_proxy,
         }
+        if transport is not None:
+            # OpenSandbox >=0.1.14 treats caller-supplied transports as
+            # externally owned, so each Sandbox.close() leaves the shared pool
+            # alive until the final Hypotest sandbox releases it.
+            kwargs["transport"] = transport
         if self._spec.domain is not None:
             kwargs["domain"] = self._spec.domain
         if self._spec.api_key is not None:
@@ -379,6 +650,7 @@ class OpenSandboxSandbox(Sandbox):
             "env": self._allocation_env(),
             "metadata": metadata,
             "resource": _resource_map(self._resources),
+            "resource_requests": _resource_request_map(self._resources),
             "extensions": self._spec.resolve_extensions(),
             "secure_access": self._spec.secure_access,
             "entrypoint": self._entrypoint(),
@@ -391,12 +663,20 @@ class OpenSandboxSandbox(Sandbox):
             kwargs["platform"] = PlatformSpec(os=self._spec.platform_os, arch=self._spec.platform_arch)
 
         last_error: Exception | None = None
+        assert self._client_pool is not None
+        create_semaphore = self._client_pool.lifecycle_create_semaphore
         for attempt in range(1, self._spec.create_attempts + 1):
             try:
-                return await asyncio.wait_for(
-                    OpenSandbox.create(**kwargs),
-                    timeout=self._spec.create_timeout_seconds,
-                )
+                queue_started = time.perf_counter()
+                async with create_semaphore:
+                    queue_seconds = time.perf_counter() - queue_started
+                    self._startup_timings["create_queue_seconds"] = (
+                        self._startup_timings.get("create_queue_seconds", 0.0) + queue_seconds
+                    )
+                    sandbox = await asyncio.wait_for(
+                        OpenSandbox.create(**kwargs),
+                        timeout=self._spec.create_timeout_seconds,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -414,6 +694,9 @@ class OpenSandboxSandbox(Sandbox):
                     )
                     if delay:
                         await asyncio.sleep(delay)
+            else:
+                self._startup_timings["create_attempts"] = float(attempt)
+                return sandbox
 
         assert last_error is not None
         raise OpenSandboxUnavailableError(
@@ -443,6 +726,8 @@ class OpenSandboxSandbox(Sandbox):
             "--language",
             self.language.value,
         ]
+        if self._spec.kernel_memory_limit_mb is not None:
+            command.extend(("--kernel-memory-limit-mb", str(self._spec.kernel_memory_limit_mb)))
         if self._config.safe_execute:
             command.append("--safe-execute")
         if not self._spec.install_shim_enabled:
@@ -483,16 +768,25 @@ class OpenSandboxSandbox(Sandbox):
                 # Never forward this credential to a direct sandbox endpoint.
                 headers.setdefault(_OPEN_SANDBOX_API_KEY_HEADER, api_key)
 
-        self._http_client = httpx.AsyncClient(
-            base_url=_endpoint_url(str(endpoint.endpoint), protocol),
-            headers=headers,
-            timeout=httpx.Timeout(30.0, connect=10.0),
-        )
+        assert self._client_pool is not None
+        client_pool = self._client_pool
+        base_url = httpx.URL(_endpoint_url(str(endpoint.endpoint), protocol))
 
         async def request(method: str, path: str, **kwargs: Any) -> httpx.Response:
-            assert self._http_client is not None
-            # A leading slash would discard a server-proxy path in base_url.
-            return await self._http_client.request(method, path.lstrip("/"), **kwargs)
+            # Keep routing/auth headers sandbox-local while sharing only the
+            # stateless AsyncClient and connection transport. A leading slash
+            # would discard a server-proxy path, so always join a relative path.
+            request_headers = httpx.Headers(headers)
+            if extra_headers := kwargs.pop("headers", None):
+                request_headers.update(extra_headers)
+            return await _request_with_kernel_admission(
+                client_pool,
+                method,
+                base_url.join(path.lstrip("/")),
+                record_wait=self._record_kernel_request_wait,
+                headers=request_headers,
+                **kwargs,
+            )
 
         self._client = HttpKernelClient(
             request,
@@ -500,8 +794,13 @@ class OpenSandboxSandbox(Sandbox):
             timeout_recovery=self._config.timeout_recovery,
             interrupt_grace_seconds=self._config.interrupt_grace_seconds,
             label=f"opensandbox:{getattr(self._sandbox, 'id', '?')}",
-            owns=self._http_client,
             execution_poll_interval_seconds=self._spec.execution_poll_interval_seconds,
+            execution_poll_max_interval_seconds=self._spec.execution_poll_max_interval_seconds,
+            execution_poll_backoff_multiplier=self._spec.execution_poll_backoff_multiplier,
+            execution_poll_jitter_ratio=self._spec.execution_poll_jitter_ratio,
+            execution_poll_max_retries=self._spec.execution_poll_max_retries,
+            execution_poll_request_timeout_seconds=self._spec.execution_poll_request_timeout_seconds,
+            infrastructure_wait_seconds=lambda: self._kernel_request_wait_seconds,
         )
 
         while loop.time() < deadline:
@@ -542,20 +841,21 @@ class OpenSandboxSandbox(Sandbox):
     async def close(self) -> None:
         client, self._client = self._client, None
         raw, self._sandbox = self._sandbox, None
-        http_client, self._http_client = self._http_client, None
-        if client is not None:
-            with contextlib.suppress(Exception):
-                await client.aclose()
-        elif http_client is not None:
-            with contextlib.suppress(Exception):
-                await http_client.aclose()
-        if raw is not None:
-            # A future artifact-retention policy belongs immediately before
-            # destroy. For now the remote sandbox is intentionally ephemeral.
-            try:
-                await raw.kill()
-            except Exception:
-                logger.warning("Failed to kill OpenSandbox %s", getattr(raw, "id", "?"), exc_info=True)
-            finally:
+        pool, self._client_pool = self._client_pool, None
+        try:
+            if client is not None:
                 with contextlib.suppress(Exception):
-                    await raw.close()
+                    await client.aclose()
+            if raw is not None:
+                # A future artifact-retention policy belongs immediately before
+                # destroy. For now the remote sandbox is intentionally ephemeral.
+                try:
+                    await raw.kill()
+                except Exception:
+                    logger.warning("Failed to kill OpenSandbox %s", getattr(raw, "id", "?"), exc_info=True)
+                finally:
+                    with contextlib.suppress(Exception):
+                        await raw.close()
+        finally:
+            if pool is not None:
+                await _release_client_pool(pool)

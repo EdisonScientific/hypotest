@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 from hypotest.env import config as cfg
 from hypotest.env.interpreter import ExecutionResult
@@ -266,19 +266,29 @@ async def _kill_process_group(
 
 # ---- pluggable resource limiting (prlimit default for enroot; cgroups opt-in) ----
 class ResourceSpec(BaseModel):
-    """Backend-agnostic resource limits.
+    """Backend-agnostic resource requests and limits.
 
     Mapped per-backend by a `ResourceLimiter` (enroot -> prlimit/cgroups;
-    k8s -> pod resources.limits; local/docker -> noop).
+    k8s -> pod resources.requests/resources.limits; local/docker -> noop).
     """
 
     mem_mb: int | None = None
+    mem_request_mb: int | None = Field(default=None, gt=0)
     mem_high_mb: int | None = None  # cgroups soft throttle; ignored by prlimit
     max_pids: int | None = None
     cpu: float | None = None
+    cpu_request: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     disk_gib: int | None = None
     gpu: int | None = None
     gpu_type: str | None = None
+
+    @model_validator(mode="after")
+    def validate_requests_do_not_exceed_limits(self) -> "ResourceSpec":
+        if self.cpu_request is not None and self.cpu is not None and self.cpu_request > self.cpu:
+            raise ValueError(f"cpu_request ({self.cpu_request}) cannot exceed cpu ({self.cpu})")
+        if self.mem_request_mb is not None and self.mem_mb is not None and self.mem_request_mb > self.mem_mb:
+            raise ValueError(f"mem_request_mb ({self.mem_request_mb}) cannot exceed mem_mb ({self.mem_mb})")
+        return self
 
 
 class ResourceLimiter(Protocol):

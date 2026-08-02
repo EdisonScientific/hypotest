@@ -1,5 +1,6 @@
 """Unit tests for the raw OpenSandbox lifecycle backend."""
 
+import asyncio
 import json
 from datetime import timedelta
 from types import SimpleNamespace
@@ -24,10 +25,16 @@ class _FakeConnectionConfig:
     def __init__(self, **kwargs):
         type(self).created.append(kwargs)
         self.protocol = kwargs.get("protocol", "http")
+        self.domain = kwargs.get("domain", "sandbox.example")
+        self.transport = kwargs.get("transport")
+        self.use_server_proxy = kwargs.get("use_server_proxy", False)
         self._api_key = kwargs.get("api_key", "fake-env-api-key")
 
     def get_api_key(self):
         return self._api_key
+
+    def get_base_url(self):
+        return f"{self.protocol}://{self.domain}/v1"
 
 
 class _FakePlatformSpec:
@@ -48,9 +55,9 @@ class _FakeImageSpec:
 
 
 class _FakeRemote:
-    def __init__(self, endpoint: str):
-        self.id = "sb-123"
-        self.endpoint = SimpleNamespace(endpoint=endpoint, headers={"X-OpenSandbox-Route": "route-1"})
+    def __init__(self, endpoint: str, *, sandbox_id: str = "sb-123", route: str = "route-1"):
+        self.id = sandbox_id
+        self.endpoint = SimpleNamespace(endpoint=endpoint, headers={"X-OpenSandbox-Route": route})
         self.killed = False
         self.closed = False
 
@@ -116,10 +123,25 @@ def _install_fakes(
         return httpx.Response(404)
 
     def client_factory(**kwargs):
+        # The production client owns the shared kernel transport. Tests replace
+        # only its wire behavior with a MockTransport.
+        kwargs.pop("transport", None)
         return real_async_client(transport=httpx.MockTransport(handler), **kwargs)
 
     monkeypatch.setattr(opensandboxmod.httpx, "AsyncClient", client_factory)
     return remote, create_kwargs, requests
+
+
+@pytest.mark.parametrize(
+    ("resources", "message"),
+    [
+        ({"cpu": 1, "cpu_request": 2}, "cpu_request"),
+        ({"mem_mb": 512, "mem_request_mb": 1024}, "mem_request_mb"),
+    ],
+)
+def test_resource_request_cannot_exceed_limit(resources, message):
+    with pytest.raises(ValueError, match=message):
+        ResourceSpec(**resources)
 
 
 @pytest.mark.asyncio
@@ -132,7 +154,15 @@ async def test_object_store_lifecycle_preserves_proxy_path_headers_and_resources
         execution_timeout=60,
         safe_execute=True,
         extra_envs={"EXTRA": "value"},
-        resources=ResourceSpec(mem_mb=8192, cpu=1.5, disk_gib=20, gpu=1, gpu_type="L40S"),
+        resources=ResourceSpec(
+            mem_mb=8192,
+            mem_request_mb=512,
+            cpu=1.5,
+            cpu_request=0.25,
+            disk_gib=20,
+            gpu=1,
+            gpu_type="L40S",
+        ),
         ref=CapsuleRef(source="s3://capsules/root", uuid="cap-1", delivery="object_store"),
         seed=123,
         job_id="run-9",
@@ -146,6 +176,7 @@ async def test_object_store_lifecycle_preserves_proxy_path_headers_and_resources
         create_attempts=1,
         health_poll_interval_seconds=0.001,
         execution_poll_interval_seconds=0.001,
+        kernel_memory_limit_mb=7168,
         extensions={"poolRef": "hypotest-pool"},
         platform_os="linux",
         platform_arch="amd64",
@@ -170,6 +201,10 @@ async def test_object_store_lifecycle_preserves_proxy_path_headers_and_resources
         "gpu": "1",
         "gpu_type": "L40S",
     }
+    assert create_kwargs["resource_requests"] == {
+        "cpu": "0.25",
+        "memory": "512Mi",
+    }
     assert create_kwargs["extensions"] == {
         "poolRef": "hypotest-pool",
         "imagePullPolicy": "IfNotPresent",
@@ -185,6 +220,8 @@ async def test_object_store_lifecycle_preserves_proxy_path_headers_and_resources
         "8000",
         "--language",
         "python",
+        "--kernel-memory-limit-mb",
+        "7168",
         "--safe-execute",
         "--no-install-shim",
     ]
@@ -200,10 +237,243 @@ async def test_object_store_lifecycle_preserves_proxy_path_headers_and_resources
     assert all(request.headers["OPEN-SANDBOX-API-KEY"] == "fake-lifecycle-api-key" for request in requests)
     assert not any(request.url.path.endswith("/load_capsule") for request in requests)
     assert any(request.url.path.endswith("/reset") for request in requests)
+    assert sandbox.startup_timings.keys() == {
+        "allocation_seconds",
+        "create_attempts",
+        "create_queue_seconds",
+        "kernel_connect_seconds",
+        "seed_reset_seconds",
+        "startup_seconds",
+    }
 
     await sandbox.close()
     assert remote.killed is True
     assert remote.closed is True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sandboxes_share_bounded_clients_until_last_close(tmp_path, monkeypatch):
+    _FakeConnectionConfig.created.clear()
+    _install_fakes(monkeypatch)
+    spec = OpenSandboxSpec(
+        image="registry/kernel:latest",
+        create_attempts=1,
+        health_poll_interval_seconds=0.001,
+        lifecycle_max_connections=7,
+        lifecycle_max_keepalive_connections=3,
+        lifecycle_create_concurrency=5,
+        kernel_max_connections=11,
+        kernel_max_keepalive_connections=5,
+        kernel_request_concurrency=4,
+    )
+    first = OpenSandboxSandbox(
+        SandboxConfig(work_dir=tmp_path / "first", language=NBLanguage.PYTHON),
+        spec,
+    )
+    second = OpenSandboxSandbox(
+        SandboxConfig(work_dir=tmp_path / "second", language=NBLanguage.PYTHON),
+        spec,
+    )
+
+    try:
+        await asyncio.gather(first.start(), second.start())
+
+        assert first._client_pool is not None
+        assert first._client_pool is second._client_pool
+        pool = first._client_pool
+        assert pool.references == 2
+        assert pool.lifecycle_create_semaphore._value == 5
+        assert pool.kernel_request_semaphore._value == 4
+        shared_lifecycle_transports = [
+            kwargs["transport"] for kwargs in _FakeConnectionConfig.created if kwargs.get("transport") is not None
+        ]
+        assert shared_lifecycle_transports == [pool.lifecycle_transport, pool.lifecycle_transport]
+
+        await first.close()
+        assert pool.references == 1
+        assert await second.health() is True
+
+        await second.close()
+        assert pool.references == 0
+        assert asyncio.get_running_loop() not in opensandboxmod._OPEN_SANDBOX_CLIENT_POOLS
+    finally:
+        await first.close()
+        await second.close()
+
+
+@pytest.mark.asyncio
+async def test_create_admission_waits_outside_sdk_request_pool(tmp_path, monkeypatch):
+    remote, _, _ = _install_fakes(monkeypatch)
+    release_creates = asyncio.Event()
+    admission_full = asyncio.Event()
+    active_creates = 0
+    peak_creates = 0
+
+    class _GatedSDK:
+        @classmethod
+        async def create(cls, **_kwargs):
+            nonlocal active_creates, peak_creates
+            active_creates += 1
+            peak_creates = max(peak_creates, active_creates)
+            if active_creates == 2:
+                admission_full.set()
+            try:
+                await release_creates.wait()
+                return remote
+            finally:
+                active_creates -= 1
+
+    monkeypatch.setattr(
+        opensandboxmod,
+        "_require_opensandbox_sdk",
+        lambda: (_GatedSDK, _FakeConnectionConfig, _FakePlatformSpec, _FakeImageAuth, _FakeImageSpec),
+    )
+    spec = OpenSandboxSpec(
+        image="registry/kernel:latest",
+        create_attempts=1,
+        health_poll_interval_seconds=0.001,
+        lifecycle_max_connections=2,
+        lifecycle_max_keepalive_connections=2,
+        lifecycle_create_concurrency=2,
+    )
+    sandboxes = [
+        OpenSandboxSandbox(
+            SandboxConfig(work_dir=tmp_path / f"sandbox-{index}", language=NBLanguage.PYTHON),
+            spec,
+        )
+        for index in range(3)
+    ]
+    starts = [asyncio.create_task(sandbox.start()) for sandbox in sandboxes]
+
+    try:
+        await asyncio.wait_for(admission_full.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert active_creates == 2
+        assert peak_creates == 2
+
+        release_creates.set()
+        await asyncio.gather(*starts)
+        assert peak_creates == 2
+        assert sandboxes[2].startup_timings["create_queue_seconds"] > 0
+    finally:
+        release_creates.set()
+        await asyncio.gather(*starts, return_exceptions=True)
+        await asyncio.gather(*(sandbox.close() for sandbox in sandboxes))
+
+
+@pytest.mark.asyncio
+async def test_kernel_request_admission_waits_outside_httpx_timeout():
+    release_requests = asyncio.Event()
+    admission_full = asyncio.Event()
+    active_requests = 0
+    peak_requests = 0
+
+    class _BlockingClient:
+        async def request(self, method, url, **_kwargs):
+            nonlocal active_requests, peak_requests
+            assert method == "GET"
+            active_requests += 1
+            peak_requests = max(peak_requests, active_requests)
+            if active_requests == 2:
+                admission_full.set()
+            try:
+                await release_requests.wait()
+                return httpx.Response(200, request=httpx.Request(method, url))
+            finally:
+                active_requests -= 1
+
+    pool = SimpleNamespace(
+        kernel_request_semaphore=asyncio.Semaphore(2),
+        kernel_client=_BlockingClient(),
+    )
+    requests = [
+        asyncio.create_task(
+            opensandboxmod._request_with_kernel_admission(pool, "GET", httpx.URL("https://proxy.invalid/health"))
+        )
+        for _ in range(3)
+    ]
+
+    try:
+        await asyncio.wait_for(admission_full.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert active_requests == 2
+        assert peak_requests == 2
+
+        release_requests.set()
+        responses = await asyncio.gather(*requests)
+        assert all(response.status_code == 200 for response in responses)
+        assert peak_requests == 2
+    finally:
+        release_requests.set()
+        await asyncio.gather(*requests, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_shared_kernel_client_keeps_endpoint_headers_sandbox_local(tmp_path, monkeypatch):
+    remotes = iter([
+        _FakeRemote(
+            "proxy.example/sandboxes/sb-a/proxy/8000",
+            sandbox_id="sb-a",
+            route="route-a",
+        ),
+        _FakeRemote(
+            "proxy.example/sandboxes/sb-b/proxy/8000",
+            sandbox_id="sb-b",
+            route="route-b",
+        ),
+    ])
+
+    class _FakeSDK:
+        @classmethod
+        async def create(cls, **_kwargs):
+            return next(remotes)
+
+    monkeypatch.setattr(
+        opensandboxmod,
+        "_require_opensandbox_sdk",
+        lambda: (_FakeSDK, _FakeConnectionConfig, _FakePlatformSpec, _FakeImageAuth, _FakeImageSpec),
+    )
+    requests: list[httpx.Request] = []
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"protocol_version": 2})
+
+    def client_factory(**kwargs):
+        kwargs.pop("transport", None)
+        return real_async_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(opensandboxmod.httpx, "AsyncClient", client_factory)
+    spec = OpenSandboxSpec(
+        image="registry/kernel:latest",
+        domain="sandbox.example",
+        api_key="lifecycle-key",
+        create_attempts=1,
+        health_poll_interval_seconds=0.001,
+    )
+    first = OpenSandboxSandbox(
+        SandboxConfig(work_dir=tmp_path / "first", language=NBLanguage.PYTHON),
+        spec,
+    )
+    second = OpenSandboxSandbox(
+        SandboxConfig(work_dir=tmp_path / "second", language=NBLanguage.PYTHON),
+        spec,
+    )
+
+    try:
+        await asyncio.gather(first.start(), second.start())
+
+        assert first._client_pool is second._client_pool
+        routes_by_sandbox = {
+            "sb-a": {request.headers["X-OpenSandbox-Route"] for request in requests if "/sb-a/" in request.url.path},
+            "sb-b": {request.headers["X-OpenSandbox-Route"] for request in requests if "/sb-b/" in request.url.path},
+        }
+        assert routes_by_sandbox == {"sb-a": {"route-a"}, "sb-b": {"route-b"}}
+        assert all(request.headers["OPEN-SANDBOX-API-KEY"] == "lifecycle-key" for request in requests)
+    finally:
+        await first.close()
+        await second.close()
 
 
 @pytest.mark.asyncio
@@ -348,6 +618,10 @@ def test_private_registry_auth_rejects_blank_values(username, password, message)
 def test_image_pull_policy_populates_both_extension_spellings_and_honors_override():
     defaulted = OpenSandboxSpec(image="kernel:latest")
     assert defaulted.install_shim_enabled is False
+    assert defaulted.execution_poll_interval_seconds == 0.5
+    assert defaulted.execution_poll_max_interval_seconds == 10
+    assert defaulted.execution_poll_backoff_multiplier == 2
+    assert defaulted.execution_poll_request_timeout_seconds == 5
     assert defaulted.resolve_extensions() == {
         "imagePullPolicy": "IfNotPresent",
         "opensandbox.extensions.image-pull-policy": "IfNotPresent",
@@ -369,6 +643,76 @@ def test_image_pull_policy_populates_both_extension_spellings_and_honors_overrid
         extensions={"runtime.example/option": "value"},
     )
     assert untouched.resolve_extensions() == {"runtime.example/option": "value"}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {
+                "execution_poll_interval_seconds": 2,
+                "execution_poll_max_interval_seconds": 1,
+            },
+            "execution_poll_max_interval_seconds",
+        ),
+        (
+            {
+                "lifecycle_max_connections": 2,
+                "lifecycle_max_keepalive_connections": 3,
+            },
+            "lifecycle_max_keepalive_connections",
+        ),
+        (
+            {
+                "lifecycle_max_connections": 2,
+                "lifecycle_max_keepalive_connections": 2,
+                "lifecycle_create_concurrency": 3,
+            },
+            "lifecycle_create_concurrency",
+        ),
+        (
+            {
+                "kernel_max_connections": 2,
+                "kernel_max_keepalive_connections": 3,
+            },
+            "kernel_max_keepalive_connections",
+        ),
+        (
+            {
+                "kernel_max_connections": 2,
+                "kernel_max_keepalive_connections": 2,
+                "kernel_request_concurrency": 3,
+            },
+            "kernel_request_concurrency",
+        ),
+    ],
+)
+def test_polling_and_shared_client_limits_are_consistent(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        OpenSandboxSpec(image="kernel:latest", **overrides)
+
+
+def test_kernel_memory_limit_must_leave_outer_container_headroom(tmp_path):
+    config = SandboxConfig(
+        work_dir=tmp_path,
+        language=NBLanguage.PYTHON,
+        resources=ResourceSpec(mem_mb=8192),
+    )
+
+    with pytest.raises(ValueError, match="must be less than"):
+        OpenSandboxSandbox(
+            config,
+            OpenSandboxSpec(image="kernel:latest", kernel_memory_limit_mb=8192),
+        )
+
+
+def test_kernel_memory_limit_rejects_custom_entrypoint():
+    with pytest.raises(ValueError, match="custom entrypoint"):
+        OpenSandboxSpec(
+            image="kernel:latest",
+            kernel_memory_limit_mb=7168,
+            entrypoint=["custom-server"],
+        )
 
 
 def test_large_bundle_shared_image_and_specific_override_precedence():
@@ -494,6 +838,7 @@ async def test_create_authentication_error_is_not_treated_as_remote_unavailable(
         await sandbox.start()
 
     assert exc_info.value is error
+    assert asyncio.get_running_loop() not in opensandboxmod._OPEN_SANDBOX_CLIENT_POOLS
 
 
 @pytest.mark.asyncio
@@ -525,6 +870,7 @@ async def test_create_service_failure_becomes_remote_unavailable_after_retries(t
         await sandbox.start()
 
     assert attempts == 2
+    assert asyncio.get_running_loop() not in opensandboxmod._OPEN_SANDBOX_CLIENT_POOLS
 
 
 @pytest.mark.asyncio

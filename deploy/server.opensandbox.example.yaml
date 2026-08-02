@@ -44,8 +44,36 @@ dataset:
     # Package managers run directly on remote sandbox machines by default.
     # Set true only for compatibility with the former colocated install shim.
     install_shim_enabled: false
+    # Fail large Python/R allocations inside the Jupyter process before the
+    # outer Kubernetes cgroup is exhausted. This must remain below
+    # execution_config.sandbox_memory_limit_mb to reserve server headroom.
+    kernel_memory_limit_mb: 57344
+    # Keep true for production resilience; set false for remote-only
+    # qualification runs so a cluster failure cannot be hidden by fallback.
+    local_fallback_enabled: true
     ttl_seconds: 5400
     ready_timeout_seconds: 300
+    # Every process/event loop shares bounded lifecycle and kernel transports.
+    # Polling starts quickly for short cells, then backs off with jitter to
+    # avoid synchronized request bursts through the server proxy.
+    # For very large batches, run multiple dataset-server replicas and load
+    # balance across them; each replica owns an independent pair of pools.
+    lifecycle_max_connections: 64
+    lifecycle_max_keepalive_connections: 32
+    lifecycle_create_concurrency: 64
+    kernel_max_connections: 256
+    kernel_max_keepalive_connections: 128
+    kernel_request_concurrency: 128
+    http_keepalive_expiry_seconds: 30
+    execution_poll_interval_seconds: 0.5
+    execution_poll_max_interval_seconds: 10
+    execution_poll_backoff_multiplier: 2
+    execution_poll_jitter_ratio: 0.2
+    # A poll should return current state immediately. Retry a non-responsive
+    # proxy request without consuming the much longer cell execution budget.
+    execution_poll_request_timeout_seconds: 5
+    # null retries transient poll failures until the cell wire deadline.
+    execution_poll_max_retries: null
     # Both extension spellings are generated for OpenSandbox compatibility.
     image_pull_policy: IfNotPresent
     # Must match the platform selected by scripts/build_opensandbox_image.py.
@@ -73,8 +101,20 @@ dataset:
   execution_config:
     safe_execute: true
     cell_execution_timeout: 900
+    # Charge model-visible budget only for kernel execution plus policy model
+    # generation. Proxy queues, polling, allocation, and cleanup remain
+    # wall-clock telemetry. The policy-serving adapter must supply measured
+    # generation_seconds for every model turn in its versioned step context.
+    time_accounting:
+      mode: kernel_execution
+      generation_latency:
+        mode: reported
+    # Kubernetes reserves this floor but allows each Burstable sandbox to use
+    # CPU/memory up to the existing limit fields below.
+    sandbox_cpu_request: 0.25
+    sandbox_memory_request_mb: 512
     sandbox_cpu: 4
-    sandbox_memory_limit_mb: 16384
+    sandbox_memory_limit_mb: 65536
     sandbox_ephemeral_storage_gib: 50
     # sandbox_gpu_count: 1
     # sandbox_gpu_type: L40S

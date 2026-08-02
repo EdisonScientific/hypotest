@@ -6,6 +6,7 @@ from queue import Empty
 import httpx
 import pytest
 
+from hypotest.env import kernel_server as kernel_server_module
 from hypotest.env.kernel_server import (
     PROTOCOL_VERSION,
     ExecuteResponse,
@@ -57,6 +58,9 @@ class _InterruptManager:
         self.interrupt_count += 1
         self.client.interrupted = True
 
+    async def is_alive(self):
+        return True
+
 
 def _ready_server(tmp_path):
     server = _server(tmp_path)
@@ -100,6 +104,36 @@ def test_list_dir_matches_filesystem_tool(tmp_path):
 def test_health_response_carries_protocol_version():
     health = HealthResponse(status="OK", startup_token="t", kernel_ready=True)  # noqa: S106
     assert health.protocol_version == PROTOCOL_VERSION
+
+
+def test_kernel_memory_limit_prefixes_only_kernel_command(monkeypatch):
+    monkeypatch.setattr(
+        kernel_server_module.shutil,
+        "which",
+        lambda name: "/usr/bin/prlimit" if name == "prlimit" else None,
+    )
+    manager = kernel_server_module._PrlimitAsyncKernelManager(
+        kernel_name="python",
+        kernel_memory_limit_mb=512,
+    )
+    manager._launch_args = {}
+
+    command = manager.format_kernel_cmd()
+
+    assert command[:3] == ["/usr/bin/prlimit", f"--as={512 * 1024 * 1024}", "--"]
+    assert "ipykernel_launcher" in command
+
+
+def test_kernel_memory_limit_requires_prlimit(monkeypatch):
+    monkeypatch.setattr(kernel_server_module.shutil, "which", lambda _name: None)
+    manager = kernel_server_module._PrlimitAsyncKernelManager(
+        kernel_name="python",
+        kernel_memory_limit_mb=512,
+    )
+    manager._launch_args = {}
+
+    with pytest.raises(RuntimeError, match="prlimit"):
+        manager.format_kernel_cmd()
 
 
 @pytest.mark.asyncio
@@ -301,3 +335,31 @@ async def test_timeout_interrupt_preserves_real_kernel_state(tmp_path):
     assert timed_out.timeout_recovery == "interrupted"
     assert after.error_occurred is False
     assert any("42" in output.get("text", "") for output in after.notebook_outputs)
+
+
+@pytest.mark.asyncio
+async def test_dead_kernel_is_restarted_without_replacing_workspace(tmp_path):
+    server = _server(tmp_path)
+    await server.start()
+    try:
+        before = await server.execute(
+            "sentinel = 41\nfrom pathlib import Path\nPath('sentinel.txt').write_text('preserved')",
+            timeout=10,
+        )
+        died = await server.execute("import os\nos._exit(137)", timeout=10)
+        after = await server.execute(
+            "from pathlib import Path\nprint('sentinel' in globals(), Path('sentinel.txt').read_text())",
+            timeout=10,
+        )
+    finally:
+        await server.close()
+
+    assert before.error_occurred is False
+    assert died.error_occurred is True
+    assert died.kernel_restarted is True
+    assert died.kernel_state_lost is True
+    assert died.kernel_exit_code == 137
+    assert died.notebook_outputs[0]["ename"] == "KernelDiedError"
+    assert "workspace files were preserved" in died.notebook_outputs[0]["evalue"]
+    assert after.error_occurred is False
+    assert any("False preserved" in output.get("text", "") for output in after.notebook_outputs)

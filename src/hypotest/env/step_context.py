@@ -19,6 +19,9 @@ class ModelTurn(_WireModel):
     response_id: str = Field(min_length=1)
     turn_index: int = Field(ge=1)
     usage: ModelTokenUsage | None = None
+    # Measured model-service generation duration. This excludes queue time and
+    # is optional unless episode accounting selects generation mode=reported.
+    generation_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class NemoGymStepContextV1(_WireModel):

@@ -81,8 +81,17 @@ class TokenThroughputGenerationLatencyConfig(_TimeConfig):
     output_tokens_per_second: float = Field(gt=0, allow_inf_nan=False)
 
 
+class ReportedGenerationLatencyConfig(_TimeConfig):
+    """Charge the measured generation duration reported for each model turn."""
+
+    mode: Literal["reported"]
+
+
 GenerationLatencyConfig = Annotated[
-    NoGenerationLatencyConfig | GenerationLatencyEstimateConfig | TokenThroughputGenerationLatencyConfig,
+    NoGenerationLatencyConfig
+    | GenerationLatencyEstimateConfig
+    | TokenThroughputGenerationLatencyConfig
+    | ReportedGenerationLatencyConfig,
     Field(discriminator="mode"),
 ]
 
@@ -94,7 +103,7 @@ class WallClockTimeAccountingConfig(_TimeConfig):
 
 
 class KernelExecutionTimeAccountingConfig(_TimeConfig):
-    """Count kernel-reported execution plus optional simulated generation time."""
+    """Count kernel-reported execution plus configured model-generation time."""
 
     mode: Literal["kernel_execution"] = "kernel_execution"
     generation_latency: GenerationLatencyConfig = Field(default_factory=NoGenerationLatencyConfig)
@@ -125,7 +134,11 @@ class ExecutionConfig(BaseModel):
     safe_execute: bool = os.getenv("SAFE_EXECUTE_SANDBOX", "").lower() == "true"
 
     # Backend-neutral sandbox resources. Local/enroot use the limits they can
-    # enforce; OpenSandbox maps the complete set onto its lifecycle API.
+    # enforce; OpenSandbox maps the complete set onto its lifecycle API. CPU
+    # and memory requests are the reserved floor used for burstable remote
+    # scheduling, while sandbox_cpu/sandbox_memory_limit_mb remain the ceiling.
+    sandbox_memory_request_mb: int | None = Field(default=None, gt=0)
+    sandbox_cpu_request: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     sandbox_memory_limit_mb: int | None = None  # e.g., 8192 for 8GB
     sandbox_max_pids: int | None = None  # e.g., 512 to prevent fork bombs
     sandbox_cpu: float | None = Field(default=None, gt=0, allow_inf_nan=False)
@@ -146,6 +159,24 @@ class ExecutionConfig(BaseModel):
                 f"warn_submit_threshold ({self.warn_submit_threshold}) must be greater than "
                 f"force_submit_threshold ({self.force_submit_threshold}). "
                 "It is seconds before timeout."
+            )
+        if (
+            self.sandbox_cpu_request is not None
+            and self.sandbox_cpu is not None
+            and self.sandbox_cpu_request > self.sandbox_cpu
+        ):
+            raise ValueError(
+                f"sandbox_cpu_request ({self.sandbox_cpu_request}) cannot exceed "
+                f"sandbox_cpu ({self.sandbox_cpu})"
+            )
+        if (
+            self.sandbox_memory_request_mb is not None
+            and self.sandbox_memory_limit_mb is not None
+            and self.sandbox_memory_request_mb > self.sandbox_memory_limit_mb
+        ):
+            raise ValueError(
+                f"sandbox_memory_request_mb ({self.sandbox_memory_request_mb}) cannot exceed "
+                f"sandbox_memory_limit_mb ({self.sandbox_memory_limit_mb})"
             )
         return self
 

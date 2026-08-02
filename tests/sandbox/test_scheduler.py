@@ -158,3 +158,23 @@ async def test_opensandbox_unavailable_falls_back_to_locally_staged_backend(tmp_
         assert await sandbox.health() is True
     finally:
         await sandbox.close()
+
+
+@pytest.mark.asyncio
+async def test_opensandbox_unavailable_is_surfaced_when_local_fallback_is_disabled(tmp_path, monkeypatch):
+    async def _unavailable(self):  # noqa: RUF029
+        raise OpenSandboxUnavailableError("remote server down")
+
+    monkeypatch.setattr(OpenSandboxSandbox, "start", _unavailable)
+    scheduler = OpenSandboxFallbackScheduler(
+        _local_config(tmp_path),
+        OpenSandboxSpec(
+            image="kernel:latest",
+            create_attempts=1,
+            local_fallback_enabled=False,
+        ),
+        _local_config(tmp_path),
+    )
+
+    with pytest.raises(OpenSandboxUnavailableError, match="remote server down"):
+        await scheduler.acquire(CapsuleRef(uuid="cap-1"), ResourceSpec())

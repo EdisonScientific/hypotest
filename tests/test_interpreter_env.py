@@ -1239,8 +1239,10 @@ class TestExecutionConfigSandboxFields:
 
     def test_defaults_are_none(self):
         config = ExecutionConfig()
+        assert config.sandbox_memory_request_mb is None
         assert config.sandbox_memory_limit_mb is None
         assert config.sandbox_max_pids is None
+        assert config.sandbox_cpu_request is None
         assert config.sandbox_cpu is None
         assert config.sandbox_ephemeral_storage_gib is None
         assert config.sandbox_gpu_count is None
@@ -1248,15 +1250,19 @@ class TestExecutionConfigSandboxFields:
 
     def test_overrides_work(self):
         config = ExecutionConfig(
+            sandbox_memory_request_mb=512,
             sandbox_memory_limit_mb=8192,
             sandbox_max_pids=512,
+            sandbox_cpu_request=0.25,
             sandbox_cpu=4,
             sandbox_ephemeral_storage_gib=50,
             sandbox_gpu_count=1,
             sandbox_gpu_type="L40S",
         )
+        assert config.sandbox_memory_request_mb == 512
         assert config.sandbox_memory_limit_mb == 8192
         assert config.sandbox_max_pids == 512
+        assert config.sandbox_cpu_request == 0.25
         assert config.sandbox_cpu == 4
         assert config.sandbox_ephemeral_storage_gib == 50
         assert config.sandbox_gpu_count == 1
@@ -1271,6 +1277,20 @@ class TestExecutionConfigSandboxFields:
         config = ExecutionConfig.gpu(sandbox_memory_limit_mb=16384, sandbox_max_pids=1024)
         assert config.sandbox_memory_limit_mb == 16384
         assert config.sandbox_max_pids == 1024
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({"sandbox_cpu_request": 2, "sandbox_cpu": 1}, "sandbox_cpu_request"),
+            (
+                {"sandbox_memory_request_mb": 1024, "sandbox_memory_limit_mb": 512},
+                "sandbox_memory_request_mb",
+            ),
+        ],
+    )
+    def test_request_cannot_exceed_limit(self, overrides, message):
+        with pytest.raises(ValueError, match=message):
+            ExecutionConfig(**overrides)
 
 
 class TestBuildEnrootCmdWithPrefix:

@@ -38,6 +38,7 @@ docker login registry.example
   --image registry.example/hypotest-kernel:latest \
   --capsule-source s3://example-bucket/capsules \
   --s3-region us-west-2 \
+  --kernel-memory-limit-mb 57344 \
   --registry-auth \
   --push
 ```
@@ -79,6 +80,26 @@ Sandbox.create(image[/auth], CAPSULE_SOURCE, CAPSULE_KEY)
 
 See [`deploy/server.opensandbox.example.yaml`](deploy/server.opensandbox.example.yaml)
 for a complete server configuration.
+
+To keep an accidental large allocation from OOM-killing the complete sandbox,
+configure an inner Jupyter limit below the outer OpenSandbox/Kubernetes limit:
+
+```yaml
+opensandbox_spec:
+  kernel_memory_limit_mb: 57344
+execution_config:
+  sandbox_cpu_request: 0.25
+  sandbox_memory_request_mb: 512
+  sandbox_cpu: 4
+  sandbox_memory_limit_mb: 65536
+```
+
+The outer limit remains the sandbox capacity ceiling. The inner limit is a
+Linux `RLIMIT_AS` on only the Jupyter child, leaving the HTTP server outside it.
+Allocations that honor `ENOMEM` surface as normal notebook `MemoryError`s. If a
+native failure still terminates Jupyter, the server returns `KernelDiedError`,
+restarts only the kernel, and preserves workspace files; in-memory variables
+are explicitly reported as lost.
 
 ## Cluster-Mounted Capsule Collections
 
@@ -218,21 +239,99 @@ dataset:
         seconds_per_generation: 12.5
 ```
 
-`generation_latency.mode` may be `none` (the default), `fixed`, `rolling_mean`,
-`rolling_p95`, or `token_throughput`. The rolling modes identify the source of a
-metrics snapshot; the supplied value is charged once per policy
-generation/environment step. The
+`generation_latency.mode` may be `none` (the default), `reported`, `fixed`,
+`rolling_mean`, `rolling_p95`, or `token_throughput`. `reported` consumes the
+measured `generation_seconds` attached to every model turn by the NeMo Gym
+resources server and is the preferred non-simulated mode. The rolling modes
+identify the source of a metrics snapshot; the supplied value is charged once
+per policy generation/environment step. The
 environment deliberately does not infer a random latency distribution from only
 mean and p95. “Kernel execution” is the backend-reported elapsed duration of a
-cell, not summed OS CPU-core utilization. Kernel execution, simulated generation,
-and observed wall-clock totals are all written to rollout metadata. Invalid
-combinations—such as adding generation latency to `wall_clock` mode or supplying
-a non-positive estimate—are rejected during configuration validation.
+cell, not summed OS CPU-core utilization. Kernel execution, measured
+generation, simulated generation, and observed wall-clock totals are all
+written to rollout metadata. Invalid combinations—such as adding generation
+latency to `wall_clock` mode or supplying a non-positive estimate—are rejected
+during configuration validation.
 
 Execution accounting is keyed by the logical cell request ID, so transport or
 Ray wait retries cannot charge the same cell more than once. Client-observed
 retry/wait duration is never substituted for a missing backend execution time;
 it is recorded only as diagnostic metadata.
+
+For measured generation accounting with no latency model:
+
+```yaml
+generation_latency:
+  mode: reported
+```
+
+This mode requires each `nemo_gym.step_context.model_turns` entry to carry a
+finite, non-negative `generation_seconds` value. Queue time is intentionally
+excluded by the producer of that measurement.
+
+#### NeMo Gym integration contract
+
+To use `generation_latency.mode: reported`, the NeMo Gym resources server (or
+the adapter immediately in front of Hypotest) must attach the following
+versioned envelope to the `ToolRequestMessage.info` passed to `env.step()`:
+
+```json
+{
+  "nemo_gym": {
+    "step_context": {
+      "version": 1,
+      "model_turns": [
+        {
+          "response_id": "stable-model-response-id",
+          "turn_index": 1,
+          "generation_seconds": 2.75,
+          "usage": {
+            "input_tokens": 1200,
+            "output_tokens": 388,
+            "total_tokens": 1588
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+`generation_seconds` is measured model-service work for that response (for
+example, prefill plus decode), from admission to generation until the completed
+response is available. It must exclude upstream request queueing and rollout
+scheduling. Gym must forward every newly completed model turn since the prior
+environment step; `response_id` must remain stable when the same action is
+retried and must be new when the policy is genuinely regenerated. Hypotest uses
+that ID to suppress duplicate charges. The adapter must preserve `info` through
+batching, serialization, and `ToolRequestMessage` construction rather than
+placing the measurement in tool arguments or sleeping to simulate it.
+
+Gym may retain a generous wall-clock watchdog for stuck rollouts, but its model
+budget or normal truncation decision must use the environment's accounted
+remaining time, not elapsed wall time since allocation or reset. Otherwise
+OpenSandbox allocation, capsule setup, submit-and-poll transport waits, proxy
+backoff, and cleanup would still shorten the episode outside Hypotest even
+though they are excluded by its clock. The final `time_accounting` object from
+the environment result should be retained in rollout artifacts; Gym should not
+recompute it from end-to-end duration.
+
+With this contract, the training configuration is simply:
+
+```yaml
+time_accounting:
+  mode: kernel_execution
+  generation_latency:
+    mode: reported
+```
+
+No simulated latency is required. Hypotest charges backend-reported kernel
+execution plus the supplied measured model-generation durations, while keeping
+wall time as diagnostic metadata.
+
+For the cluster-side GBS1024 reproduction, exact cleanup workflow, pass/fail
+gates, and NeMo Gym/NRL test-train handoff, see
+[`docs/opensandbox-stress-test-handoff.md`](docs/opensandbox-stress-test-handoff.md).
 
 For deterministic latency proportional to generated output length, use:
 

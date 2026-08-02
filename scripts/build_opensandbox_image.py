@@ -54,6 +54,7 @@ class BuildOptions:
     registry_username_env: str
     registry_password_env: str
     image_pull_policy: str | None
+    kernel_memory_limit_mb: int | None
     push: bool
     pull: bool
     no_cache: bool
@@ -183,6 +184,8 @@ def _print_opensandbox_config(options: BuildOptions, image: str) -> None:
     print("  capsule_mode: object_store")
     print(f"  image: {json.dumps(image)}")
     print("  install_shim_enabled: false")
+    if options.kernel_memory_limit_mb is not None:
+        print(f"  kernel_memory_limit_mb: {options.kernel_memory_limit_mb}")
     if options.capsule_source is None:
         print('  capsule_source: "s3://bucket/base-prefix"')
     else:
@@ -287,6 +290,11 @@ def make_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="omit Hypotest's image-pull-policy extensions and use the OpenSandbox server default",
     )
+    parser.add_argument(
+        "--kernel-memory-limit-mb",
+        type=int,
+        help="inner Jupyter RLIMIT_AS value to print in the OpenSandbox runtime config",
+    )
     output = parser.add_mutually_exclusive_group()
     output.add_argument("--push", action="store_true", help="push the completed image to its registry")
     output.add_argument("--load", action="store_true", help="leave the completed image in the local daemon (default)")
@@ -310,6 +318,8 @@ def _options_from_args(args: argparse.Namespace) -> BuildOptions:
         raise ImageBuildError("--build-cutoff-date must use YYYY-MM-DD") from exc
     if args.push and args.image is None:
         raise ImageBuildError("--push requires an explicit registry --image")
+    if args.kernel_memory_limit_mb is not None and args.kernel_memory_limit_mb <= 0:
+        raise ImageBuildError("--kernel-memory-limit-mb must be positive")
 
     build_base = not args.skip_base_build
     image = _validate_reference(args.image or DEFAULT_IMAGE, "--image")
@@ -333,6 +343,7 @@ def _options_from_args(args: argparse.Namespace) -> BuildOptions:
         registry_username_env=_validate_environment_name(args.registry_username_env, "--registry-username-env"),
         registry_password_env=_validate_environment_name(args.registry_password_env, "--registry-password-env"),
         image_pull_policy=None if args.no_image_pull_policy else args.image_pull_policy,
+        kernel_memory_limit_mb=args.kernel_memory_limit_mb,
         push=args.push,
         pull=args.pull,
         no_cache=args.no_cache,

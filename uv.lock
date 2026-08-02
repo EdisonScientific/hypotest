@@ -1089,7 +1089,7 @@ requires-dist = [
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8" },
     { name = "nbformat" },
     { name = "numpy" },
-    { name = "opensandbox", marker = "extra == 'opensandbox'", specifier = ">=0.1.9" },
+    { name = "opensandbox", marker = "extra == 'opensandbox'", specifier = ">=0.1.14" },
     { name = "pillow" },
     { name = "prek", marker = "extra == 'dev'" },
     { name = "pydantic" },

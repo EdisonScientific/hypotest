@@ -1,5 +1,8 @@
 .git
 .github
+.env
+.env.*
+!.env.example
 **/__pycache__
 **/*.pyc
 **/*.pyo
@@ -10,6 +13,7 @@ venv
 .ruff_cache
 *.egg-info
 benchmark_results
+artifacts
 # The generic OpenSandbox build never consumes task data. Keep common local
 # staging locations out of the build context as well as out of image layers.
 /capsules

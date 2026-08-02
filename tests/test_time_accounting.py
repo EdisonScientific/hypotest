@@ -25,7 +25,13 @@ def _env(tmp_path, problem: ProblemInstance, time_accounting: dict) -> Interpret
     )
 
 
-def _model_turn(response_id: str, turn_index: int, output_tokens: int | None) -> dict:
+def _model_turn(
+    response_id: str,
+    turn_index: int,
+    output_tokens: int | None,
+    *,
+    generation_seconds: float | None = None,
+) -> dict:
     usage = None
     if output_tokens is not None:
         usage = {
@@ -33,11 +39,14 @@ def _model_turn(response_id: str, turn_index: int, output_tokens: int | None) ->
             "output_tokens": output_tokens,
             "total_tokens": 100 + output_tokens,
         }
-    return {
+    turn = {
         "response_id": response_id,
         "turn_index": turn_index,
         "usage": usage,
     }
+    if generation_seconds is not None:
+        turn["generation_seconds"] = generation_seconds
+    return turn
 
 
 def _action_with_model_turns(*turns: dict) -> ToolRequestMessage:
@@ -108,6 +117,16 @@ def test_kernel_execution_accepts_token_throughput() -> None:
     })
     assert config.time_accounting.generation_latency.mode == "token_throughput"
     assert config.time_accounting.generation_latency.output_tokens_per_second == 141
+
+
+def test_kernel_execution_accepts_reported_generation_duration() -> None:
+    config = ExecutionConfig.model_validate({
+        "time_accounting": {
+            "mode": "kernel_execution",
+            "generation_latency": {"mode": "reported"},
+        },
+    })
+    assert config.time_accounting.generation_latency.mode == "reported"
 
 
 @pytest.mark.parametrize(
@@ -198,6 +217,55 @@ def test_token_throughput_charges_all_reported_model_turns(tmp_path, default_pro
     metadata = env.get_time_accounting_metadata()
     assert metadata["policy_generation_count"] == 2
     assert metadata["policy_generation_output_tokens"] == 423
+
+
+def test_reported_mode_charges_measured_generation_without_queue_latency(
+    tmp_path, default_problem: ProblemInstance
+) -> None:
+    env = _env(
+        tmp_path,
+        default_problem,
+        {
+            "mode": "kernel_execution",
+            "generation_latency": {"mode": "reported"},
+        },
+    )
+    action = _action_with_model_turns(
+        _model_turn("resp-1", 1, 141, generation_seconds=1.25),
+        _model_turn("resp-2", 2, 282, generation_seconds=2.5),
+    )
+
+    assert env._record_policy_generation(action) == 3.75
+    metadata = env.get_time_accounting_metadata()
+    assert metadata["model_generation_seconds"] == 3.75
+    assert metadata["reported_generation_seconds"] == 3.75
+    assert metadata["simulated_generation_seconds"] == 0.0
+    assert env.get_elapsed_time() == 3.75
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        ToolRequestMessage(content="", tool_calls=[]),
+        _action_with_model_turns(_model_turn("resp-missing", 1, 10)),
+    ],
+)
+def test_reported_mode_requires_measured_generation_duration(
+    tmp_path, default_problem: ProblemInstance, action: ToolRequestMessage
+) -> None:
+    env = _env(
+        tmp_path,
+        default_problem,
+        {
+            "mode": "kernel_execution",
+            "generation_latency": {"mode": "reported"},
+        },
+    )
+
+    with pytest.raises(ValueError, match="reported generation latency requires"):
+        env._record_policy_generation(action)
+
+    assert env.get_elapsed_time() == 0.0
 
 
 @pytest.mark.parametrize(

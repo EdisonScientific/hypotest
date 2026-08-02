@@ -42,17 +42,47 @@ class DeadlineExceededError(Exception):
         self.msg_id = msg_id
 
 
+class KernelDiedError(RuntimeError):
+    """Raised when the Jupyter kernel exits before returning to idle."""
+
+    def __init__(self, msg_id: str, exit_code: int | None):
+        self.msg_id = msg_id
+        self.exit_code = exit_code
+        detail = f" with exit code {exit_code}" if exit_code is not None else ""
+        super().__init__(f"Jupyter kernel exited unexpectedly{detail}")
+
+
 class KernelExecutionState(StrEnum):
     """Admission state for the single Jupyter execution channel."""
 
     IDLE = auto()
     EXECUTING = auto()
     INTERRUPTING = auto()
+    RECOVERING = auto()
     WEDGED = auto()
     CLOSED = auto()
 
 
 logger = logging.getLogger(__name__)
+
+
+class _PrlimitAsyncKernelManager(AsyncKernelManager):
+    """Prefix only the Jupyter child with a Linux virtual-memory limit."""
+
+    def __init__(self, *args: Any, kernel_memory_limit_mb: int | None = None, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.kernel_memory_limit_mb = kernel_memory_limit_mb
+
+    def format_kernel_cmd(self, extra_arguments: list[str] | None = None) -> list[str]:
+        command = super().format_kernel_cmd(extra_arguments)
+        if self.kernel_memory_limit_mb is None:
+            return command
+
+        prlimit = shutil.which("prlimit")
+        if prlimit is None:
+            raise RuntimeError("kernel_memory_limit_mb requires the util-linux prlimit executable")
+        limit_bytes = self.kernel_memory_limit_mb * 1024 * 1024
+        return [prlimit, f"--as={limit_bytes}", "--", *command]
 
 
 def deterministic_kernel_env(seed: int) -> dict[str, str]:
@@ -254,6 +284,14 @@ class ExecuteResponse(BaseModel):
     timed_out: bool = False
     timeout_recovery: Literal["interrupted", "wedged"] | None = None
     interrupt_seconds: float | None = None
+    kernel_restarted: bool = False
+    kernel_state_lost: bool = False
+    kernel_exit_code: int | None = None
+
+
+def _require_successful_bootstrap(result: ExecuteResponse) -> None:
+    if result.error_occurred:
+        raise RuntimeError("Deterministic kernel RNG bootstrap failed")
 
 
 class ExecuteJobStatus(StrEnum):
@@ -359,15 +397,19 @@ class KernelServer:
         startup_token: str = "",
         safe_execute: bool = True,
         seed: int | None = None,
+        kernel_memory_limit_mb: int | None = None,
         execution_result_ttl_seconds: float = 3600,
         max_retained_executions: int = 256,
     ):
+        if kernel_memory_limit_mb is not None and kernel_memory_limit_mb <= 0:
+            raise ValueError("kernel_memory_limit_mb must be positive")
         self.work_dir = work_dir
         self.language = language
         self.default_timeout = default_timeout
         self.startup_token = startup_token
         self.safe_execute = safe_execute
         self.seed = seed
+        self.kernel_memory_limit_mb = kernel_memory_limit_mb
         self.execution_result_ttl_seconds = execution_result_ttl_seconds
         self.max_retained_executions = max_retained_executions
 
@@ -380,13 +422,21 @@ class KernelServer:
         self._execution_jobs: dict[str, _ExecutionJob] = {}
         self._execution_ids_by_request: dict[str, str] = {}
         self._execution_jobs_lock = asyncio.Lock()
+        self._kernel_lifecycle_lock = asyncio.Lock()
         self._kernel_runtime_dir: Path | None = None
 
     async def start(self) -> None:
         """Start the Jupyter kernel."""
-        if self._is_ready:
-            return
+        async with self._kernel_lifecycle_lock:
+            if self._is_ready and await self._kernel_process_is_alive():
+                return
+            if self._kernel_manager is not None or self._client is not None:
+                await self._dispose_kernel_locked()
+            await self._launch_kernel_locked()
+        await self._set_execution_state(KernelExecutionState.IDLE)
 
+    async def _launch_kernel_locked(self) -> None:
+        """Launch one kernel while the caller holds the lifecycle lock."""
         kernel_name = self.language.make_kernelspec()["name"]
         # ZeroMQ appends an IPC channel suffix to this path. Keeping it under a
         # short private runtime directory avoids macOS/Linux sockaddr_un limits
@@ -395,8 +445,11 @@ class KernelServer:
         self._kernel_runtime_dir = Path(tempfile.mkdtemp(prefix="hk-", dir=runtime_root))
         kernel_connect_file = (self._kernel_runtime_dir / "c.json").resolve()
 
-        self._kernel_manager = AsyncKernelManager(
-            kernel_name=kernel_name, transport="ipc", connection_file=str(kernel_connect_file)
+        self._kernel_manager = _PrlimitAsyncKernelManager(
+            kernel_name=kernel_name,
+            transport="ipc",
+            connection_file=str(kernel_connect_file),
+            kernel_memory_limit_mb=self.kernel_memory_limit_mb,
         )
         kernel_env = os.environ.copy()
         if self.seed is not None:
@@ -412,23 +465,53 @@ class KernelServer:
                     deadline=time.perf_counter() + self.default_timeout,
                     store_history=False,
                 )
-                if bootstrap.error_occurred:
-                    raise RuntimeError("Deterministic kernel RNG bootstrap failed")
+                _require_successful_bootstrap(bootstrap)
             self._is_ready = True
-            await self._set_execution_state(KernelExecutionState.IDLE)
-            logger.info(f"Kernel {kernel_name} started in {self.work_dir}")
+            logger.info(
+                "Kernel %s started in %s (memory limit: %s MiB)",
+                kernel_name,
+                self.work_dir,
+                self.kernel_memory_limit_mb if self.kernel_memory_limit_mb is not None else "unlimited",
+            )
         except Exception as e:
-            if self._client is not None:
-                self._client.stop_channels()
-                self._client = None
-            if self._kernel_manager is not None:
-                with contextlib.suppress(Exception):
-                    await self._kernel_manager.shutdown_kernel(now=True)
-                with contextlib.suppress(Exception):
-                    await self._kernel_manager.cleanup_resources(restart=False)
-            self._is_ready = False
-            self._cleanup_kernel_runtime_dir()
+            await self._dispose_kernel_locked()
             raise RuntimeError(f"Kernel failed to start: {e}") from e
+
+    async def _dispose_kernel_locked(self) -> None:
+        """Dispose the current kernel while the caller holds the lifecycle lock."""
+        client, self._client = self._client, None
+        manager, self._kernel_manager = self._kernel_manager, None
+        self._is_ready = False
+        self._active_msg_id = None
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.stop_channels()
+        if manager is not None:
+            with contextlib.suppress(Exception):
+                await manager.shutdown_kernel(now=True)
+            with contextlib.suppress(Exception):
+                await manager.cleanup_resources(restart=False)
+        self._cleanup_kernel_runtime_dir()
+
+    async def _kernel_process_is_alive(self) -> bool:
+        manager = self._kernel_manager
+        if manager is None:
+            return False
+        try:
+            return bool(await manager.is_alive())
+        except Exception:
+            logger.exception("Failed to inspect Jupyter kernel liveness")
+            return False
+
+    async def kernel_ready(self) -> bool:
+        """Return whether the server has a live, initialized Jupyter kernel."""
+        return self._is_ready and await self._kernel_process_is_alive()
+
+    def _kernel_exit_code(self) -> int | None:
+        manager = self._kernel_manager
+        provisioner = getattr(manager, "provisioner", None) if manager is not None else None
+        process = getattr(provisioner, "process", None)
+        return getattr(process, "returncode", None)
 
     def _cleanup_kernel_runtime_dir(self) -> None:
         runtime_dir, self._kernel_runtime_dir = self._kernel_runtime_dir, None
@@ -578,21 +661,8 @@ class KernelServer:
         if not self._client or not self._is_ready:
             raise RuntimeError("Kernel not ready")
 
-        if self.safe_execute:
-            # Defense-in-depth: lightweight regex safety check
-            block_reason = _kernel_check_code_safety(code)
-            if block_reason is not None:
-                logger.warning("Kernel safety block: %s code=%r", block_reason, code[:200])
-                error_output = MessageType.ERROR.to_notebook_output({
-                    "ename": "SecurityError",
-                    "evalue": block_reason,
-                    "traceback": [f"SecurityError: {block_reason}"],
-                })
-                return ExecuteResponse(
-                    notebook_outputs=[dict(error_output)] if error_output else [],
-                    error_occurred=True,
-                    execution_time=0.0,
-                )
+        if safety_block := self._safety_block_response(code):
+            return safety_block
 
         unavailable = await self._claim_execution()
         if unavailable is not None:
@@ -606,66 +676,135 @@ class KernelServer:
                 code,
                 deadline=start_time + effective_timeout,
             )
+        except KernelDiedError as exc:
+            result = await self._recover_kernel_death(exc, start_time)
         except DeadlineExceededError as exc:
-            execution_time = time.perf_counter() - start_time
-            recovered = False
-            interrupt_seconds: float | None = None
-            if timeout_recovery == "interrupt":
-                await self._set_execution_state(KernelExecutionState.INTERRUPTING)
-                interrupt_started = time.perf_counter()
-                recovered = await self._interrupt_and_drain(exc.msg_id, interrupt_grace_seconds)
-                interrupt_seconds = time.perf_counter() - interrupt_started
-            await self._set_execution_state(KernelExecutionState.IDLE if recovered else KernelExecutionState.WEDGED)
-            if recovered:
-                self._active_msg_id = None
-            timeout_output = MessageType.ERROR.to_notebook_output({
-                "ename": "TimeoutError",
-                "evalue": (
-                    f"Code execution timed out after {effective_timeout} seconds; "
-                    + (
-                        "the cell was interrupted and the kernel is ready"
-                        if recovered
-                        else "the kernel is unresponsive"
-                    )
-                ),
-                "traceback": [f"TimeoutError: Code execution timed out after {effective_timeout} seconds"],
-            })
-            result = ExecuteResponse(
-                notebook_outputs=[dict(timeout_output)] if timeout_output else [],
-                error_occurred=True,
-                execution_time=execution_time,
-                timed_out=True,
-                timeout_recovery="interrupted" if recovered else "wedged",
-                interrupt_seconds=interrupt_seconds,
+            result = await self._recover_deadline(
+                exc,
+                start_time=start_time,
+                effective_timeout=effective_timeout,
+                timeout_recovery=timeout_recovery,
+                interrupt_grace_seconds=interrupt_grace_seconds,
             )
         except asyncio.CancelledError:
-            recovered = False
-            if timeout_recovery == "interrupt" and self._active_msg_id is not None:
-                await self._set_execution_state(KernelExecutionState.INTERRUPTING)
-                recovered = await asyncio.shield(
-                    self._interrupt_and_drain(self._active_msg_id, interrupt_grace_seconds)
-                )
-            await self._set_execution_state(KernelExecutionState.IDLE if recovered else KernelExecutionState.WEDGED)
-            if recovered:
-                self._active_msg_id = None
+            await self._recover_cancelled_execution(timeout_recovery, interrupt_grace_seconds)
             raise
         except Exception as e:
-            await self._set_execution_state(KernelExecutionState.WEDGED)
-            error_output = MessageType.ERROR.to_notebook_output({
-                "ename": type(e).__name__,
-                "evalue": str(e),
-                "traceback": [f"{type(e).__name__}: {e}"],
-            })
-            result = ExecuteResponse(
-                notebook_outputs=[dict(error_output)] if error_output else [],
-                error_occurred=True,
-                execution_time=time.perf_counter() - start_time,
-            )
+            result = await self._recover_execution_exception(e, start_time)
         else:
             await self._set_execution_state(KernelExecutionState.IDLE)
             self._active_msg_id = None
 
         return result
+
+    def _safety_block_response(self, code: str) -> ExecuteResponse | None:
+        if not self.safe_execute:
+            return None
+        block_reason = _kernel_check_code_safety(code)
+        if block_reason is None:
+            return None
+        logger.warning("Kernel safety block: %s code=%r", block_reason, code[:200])
+        error_output = MessageType.ERROR.to_notebook_output({
+            "ename": "SecurityError",
+            "evalue": block_reason,
+            "traceback": [f"SecurityError: {block_reason}"],
+        })
+        return ExecuteResponse(
+            notebook_outputs=[dict(error_output)] if error_output else [],
+            error_occurred=True,
+            execution_time=0.0,
+        )
+
+    async def _recover_deadline(
+        self,
+        exc: DeadlineExceededError,
+        *,
+        start_time: float,
+        effective_timeout: float,
+        timeout_recovery: Literal["none", "interrupt"],
+        interrupt_grace_seconds: float,
+    ) -> ExecuteResponse:
+        recovered = False
+        interrupt_seconds: float | None = None
+        if timeout_recovery == "interrupt":
+            await self._set_execution_state(KernelExecutionState.INTERRUPTING)
+            interrupt_started = time.perf_counter()
+            recovered = await self._interrupt_and_drain(exc.msg_id, interrupt_grace_seconds)
+            interrupt_seconds = time.perf_counter() - interrupt_started
+        await self._set_execution_state(KernelExecutionState.IDLE if recovered else KernelExecutionState.WEDGED)
+        if recovered:
+            self._active_msg_id = None
+        timeout_output = MessageType.ERROR.to_notebook_output({
+            "ename": "TimeoutError",
+            "evalue": (
+                f"Code execution timed out after {effective_timeout} seconds; "
+                + ("the cell was interrupted and the kernel is ready" if recovered else "the kernel is unresponsive")
+            ),
+            "traceback": [f"TimeoutError: Code execution timed out after {effective_timeout} seconds"],
+        })
+        return ExecuteResponse(
+            notebook_outputs=[dict(timeout_output)] if timeout_output else [],
+            error_occurred=True,
+            execution_time=time.perf_counter() - start_time,
+            timed_out=True,
+            timeout_recovery="interrupted" if recovered else "wedged",
+            interrupt_seconds=interrupt_seconds,
+        )
+
+    async def _recover_cancelled_execution(
+        self,
+        timeout_recovery: Literal["none", "interrupt"],
+        interrupt_grace_seconds: float,
+    ) -> None:
+        recovered = False
+        if timeout_recovery == "interrupt" and self._active_msg_id is not None:
+            await self._set_execution_state(KernelExecutionState.INTERRUPTING)
+            recovered = await asyncio.shield(self._interrupt_and_drain(self._active_msg_id, interrupt_grace_seconds))
+        await self._set_execution_state(KernelExecutionState.IDLE if recovered else KernelExecutionState.WEDGED)
+        if recovered:
+            self._active_msg_id = None
+
+    async def _recover_execution_exception(self, exc: Exception, start_time: float) -> ExecuteResponse:
+        if not await self._kernel_process_is_alive():
+            died = KernelDiedError(self._active_msg_id or "", self._kernel_exit_code())
+            return await self._recover_kernel_death(died, start_time)
+        await self._set_execution_state(KernelExecutionState.WEDGED)
+        error_output = MessageType.ERROR.to_notebook_output({
+            "ename": type(exc).__name__,
+            "evalue": str(exc),
+            "traceback": [f"{type(exc).__name__}: {exc}"],
+        })
+        return ExecuteResponse(
+            notebook_outputs=[dict(error_output)] if error_output else [],
+            error_occurred=True,
+            execution_time=time.perf_counter() - start_time,
+        )
+
+    async def _recover_kernel_death(self, exc: KernelDiedError, start_time: float) -> ExecuteResponse:
+        await self._set_execution_state(KernelExecutionState.RECOVERING)
+        recovered = await self._restart_after_kernel_death()
+        await self._set_execution_state(KernelExecutionState.IDLE if recovered else KernelExecutionState.WEDGED)
+        self._active_msg_id = None
+        recovery_message = (
+            "the kernel was restarted; in-memory variables were lost, but workspace files were preserved"
+            if recovered
+            else "automatic kernel restart failed; the kernel is unavailable"
+        )
+        exit_detail = f" (exit code {exc.exit_code})" if exc.exit_code is not None else ""
+        message = f"Jupyter kernel exited during code execution{exit_detail}; {recovery_message}"
+        error_output = MessageType.ERROR.to_notebook_output({
+            "ename": "KernelDiedError",
+            "evalue": message,
+            "traceback": [f"KernelDiedError: {message}"],
+        })
+        return ExecuteResponse(
+            notebook_outputs=[dict(error_output)] if error_output else [],
+            error_occurred=True,
+            execution_time=time.perf_counter() - start_time,
+            kernel_restarted=recovered,
+            kernel_state_lost=True,
+            kernel_exit_code=exc.exit_code,
+        )
 
     async def _claim_execution(self) -> ExecuteResponse | None:
         """Claim the Jupyter channel without queuing behind active work."""
@@ -725,6 +864,17 @@ class KernelServer:
             logger.exception("Failed to interrupt Jupyter request %s", msg_id)
             return False
 
+    async def _restart_after_kernel_death(self) -> bool:
+        """Replace only the dead Jupyter process, preserving the sandbox workspace."""
+        async with self._kernel_lifecycle_lock:
+            await self._dispose_kernel_locked()
+            try:
+                await self._launch_kernel_locked()
+            except Exception:
+                logger.exception("Failed to restart dead Jupyter kernel")
+                return False
+        return True
+
     async def _execute_code(self, code: str, deadline: float, *, store_history: bool = True) -> ExecuteResponse:
         """Internal method to execute code and collect outputs.
 
@@ -761,6 +911,8 @@ class KernelServer:
             try:
                 msg = await self._client.get_iopub_msg(timeout=POLL_INTERVAL_S)
             except Empty:
+                if not await self._kernel_process_is_alive():
+                    raise KernelDiedError(msg_id, self._kernel_exit_code()) from None
                 continue
 
             if msg["parent_header"].get("msg_id") != msg_id:
@@ -797,34 +949,19 @@ class KernelServer:
         await self._cancel_active_execution_jobs()
         if seed is not None:
             self.seed = seed
-        if self._is_ready and self._kernel_manager:
-            if self._client:
-                self._client.stop_channels()
-                self._client = None
-
-            await self._kernel_manager.shutdown_kernel(now=True)
-            await self._kernel_manager.cleanup_resources(restart=False)
-            self._is_ready = False
-            self._cleanup_kernel_runtime_dir()
-
-        await self.start()
+        async with self._kernel_lifecycle_lock:
+            await self._dispose_kernel_locked()
+            await self._launch_kernel_locked()
         await self._set_execution_state(KernelExecutionState.IDLE)
         return ResetResponse(success=True, seed=self.seed)
 
     async def close(self) -> None:
         """Shutdown the kernel."""
         await self._cancel_active_execution_jobs()
-        if self._is_ready and self._kernel_manager:
-            if self._client:
-                self._client.stop_channels()
-                self._client = None
-
-            await self._kernel_manager.shutdown_kernel(now=True)
-            await self._kernel_manager.cleanup_resources(restart=False)
-            self._is_ready = False
-            await self._set_execution_state(KernelExecutionState.CLOSED)
-            self._cleanup_kernel_runtime_dir()
-            logger.info("Kernel shutdown complete")
+        async with self._kernel_lifecycle_lock:
+            await self._dispose_kernel_locked()
+        await self._set_execution_state(KernelExecutionState.CLOSED)
+        logger.info("Kernel shutdown complete")
 
     def list_dir(self, directory: str = ".", max_files: int = 20, show_hidden: bool = False) -> str:
         """List the workspace directory (confined to work_dir) with truncation protection."""
@@ -893,7 +1030,11 @@ def create_app(server: KernelServer) -> FastAPI:
 
     @app.get("/health")
     async def health() -> HealthResponse:
-        return HealthResponse(status="OK", startup_token=server.startup_token, kernel_ready=server._is_ready)
+        return HealthResponse(
+            status="OK",
+            startup_token=server.startup_token,
+            kernel_ready=await server.kernel_ready(),
+        )
 
     @app.get("/list_dir")
     async def list_dir(directory: str = ".", max_files: int = 20, show_hidden: bool = False) -> ListDirResponse:
@@ -913,9 +1054,16 @@ async def run_server(
     port: int = 8000,
     startup_token: str = "",
     seed: int | None = None,
+    kernel_memory_limit_mb: int | None = None,
 ) -> None:
     """Start the kernel server."""
-    server = KernelServer(work_dir, language, startup_token=startup_token, seed=seed)
+    server = KernelServer(
+        work_dir,
+        language,
+        startup_token=startup_token,
+        seed=seed,
+        kernel_memory_limit_mb=kernel_memory_limit_mb,
+    )
     await server.start()
 
     app = create_app(server)
@@ -938,7 +1086,17 @@ if __name__ == "__main__":
     parser.add_argument("--startup-token", type=str, default="")
     parser.add_argument("--safe-execute", action="store_true")
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--kernel-memory-limit-mb", type=int)
     args = parser.parse_args()
 
     language = NBLanguage.PYTHON if args.language == "python" else NBLanguage.R
-    asyncio.run(run_server(args.work_dir, language, args.port, args.startup_token, args.seed))
+    asyncio.run(
+        run_server(
+            args.work_dir,
+            language,
+            args.port,
+            args.startup_token,
+            args.seed,
+            args.kernel_memory_limit_mb,
+        )
+    )

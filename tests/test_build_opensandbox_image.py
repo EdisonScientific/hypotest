@@ -34,6 +34,7 @@ def _options(tmp_path: Path, **overrides):
         "registry_username_env": "REGISTRY_USERNAME",
         "registry_password_env": "REGISTRY_PASSWORD",
         "image_pull_policy": "IfNotPresent",
+        "kernel_memory_limit_mb": None,
         "push": False,
         "pull": False,
         "no_cache": False,
@@ -88,6 +89,8 @@ def test_dry_run_prints_push_and_runtime_configuration(monkeypatch, capsys):
         "--s3-endpoint-url",
         "https://s3.example",
         "--registry-auth",
+        "--kernel-memory-limit-mb",
+        "57344",
         "--registry-username-env",
         "HYPOTEST_REGISTRY_USER",
         "--registry-password-env",
@@ -107,6 +110,7 @@ def test_dry_run_prints_push_and_runtime_configuration(monkeypatch, capsys):
     assert 'username: "${HYPOTEST_REGISTRY_USER}"' in output
     assert 'password: "${HYPOTEST_REGISTRY_TOKEN}"' in output
     assert "image_pull_policy: IfNotPresent" in output
+    assert "kernel_memory_limit_mb: 57344" in output
     assert "fake-registry-password" not in output.lower()
 
 
