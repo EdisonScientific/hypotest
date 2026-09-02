@@ -265,7 +265,7 @@ name = "cffi"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pycparser", marker = "implementation_name != 'PyPy'" },
+    { name = "pycparser" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/eb/56/b1ba7935a17738ae8453301356628e8147c79dbb825bcbc73dc7401f9846/cffi-2.0.0.tar.gz", hash = "sha256:44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529", size = 523588, upload-time = "2025-09-08T23:24:04.541Z" }
 wheels = [
@@ -1082,7 +1082,7 @@ requires-dist = [
     { name = "huggingface-hub", specifier = ">=1.7.1" },
     { name = "ipdb", marker = "extra == 'dev'" },
     { name = "jupyter-client" },
-    { name = "k8s-agent-sandbox", extras = ["async"], marker = "extra == 'k8s'" },
+    { name = "k8s-agent-sandbox", extras = ["async"], marker = "extra == 'k8s'", editable = "vendor/agent-sandbox/clients/python/agentic-sandbox-client" },
     { name = "ldp" },
     { name = "litellm", specifier = "<=1.82.6" },
     { name = "matplotlib", marker = "extra == 'dev'" },
@@ -1113,7 +1113,7 @@ requires-dist = [
 provides-extras = ["dev", "k8s", "opensandbox", "ray"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "hypotest", extras = ["dev"] }]
+dev = [{ name = "hypotest", extras = ["dev"], editable = "." }]
 
 [[package]]
 name = "idna"
@@ -1376,17 +1376,12 @@ wheels = [
 
 [[package]]
 name = "k8s-agent-sandbox"
-version = "0.4.6"
-source = { registry = "https://pypi.org/simple" }
+source = { editable = "vendor/agent-sandbox/clients/python/agentic-sandbox-client" }
 dependencies = [
     { name = "kubernetes" },
     { name = "prometheus-client" },
     { name = "pydantic" },
     { name = "requests" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/fd/70/a17b073ce7479afc44a7756a25655649958b3b60f3b0e126397c90902df5/k8s_agent_sandbox-0.4.6.tar.gz", hash = "sha256:a14d69372b842f4747986dae64e4b09631c8bd5799960d31ad6c3e524e9742d7", size = 99224, upload-time = "2026-05-14T19:36:16.685Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/15/14/699257a55657783a6f2d1ee8d590c3153cc3976557a907a1cbaebceb3c6c/k8s_agent_sandbox-0.4.6-py3-none-any.whl", hash = "sha256:feef320af4302941215641a8fbfaa4d2e673d63a4fa205f6f7e5bf21029d6a7b", size = 64710, upload-time = "2026-05-14T19:36:15.446Z" },
 ]
 
 [package.optional-dependencies]
@@ -1394,6 +1389,26 @@ async = [
     { name = "httpx" },
     { name = "kubernetes-asyncio" },
 ]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", marker = "extra == 'async'" },
+    { name = "httpx", marker = "extra == 'test'" },
+    { name = "kubernetes" },
+    { name = "kubernetes-asyncio", marker = "extra == 'async'" },
+    { name = "kubernetes-asyncio", marker = "extra == 'test'" },
+    { name = "opentelemetry-api", marker = "extra == 'tracing'", specifier = "~=1.39.0" },
+    { name = "opentelemetry-exporter-otlp", marker = "extra == 'tracing'", specifier = "~=1.39.0" },
+    { name = "opentelemetry-instrumentation-requests", marker = "extra == 'tracing'", specifier = "~=0.60b0" },
+    { name = "opentelemetry-sdk", marker = "extra == 'tracing'", specifier = "~=1.39.0" },
+    { name = "prometheus-client" },
+    { name = "pydantic" },
+    { name = "pytest", marker = "extra == 'test'" },
+    { name = "pytest-asyncio", marker = "extra == 'test'" },
+    { name = "pytest-xdist", marker = "extra == 'test'" },
+    { name = "requests" },
+]
+provides-extras = ["async", "test", "tracing"]
 
 [[package]]
 name = "kiwisolver"
@@ -2111,7 +2126,7 @@ name = "pexpect"
 version = "4.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "ptyprocess", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "ptyprocess" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/42/92/cc564bf6381ff43ce1f4d06852fc19a2f11d180f23dc32d9588bee2f149d/pexpect-4.9.0.tar.gz", hash = "sha256:ee7d41123f3c9911050ea2c2dac107568dc43b2d3b0c7557a33212c398ead30f", size = 166450, upload-time = "2023-11-25T09:07:26.339Z" }
 wheels = [

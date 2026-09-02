@@ -40,6 +40,9 @@ from lmi import LiteLLMModel
 from nbformat import NotebookNode
 from pydantic import BaseModel, Field, JsonValue, model_validator
 
+from hypotest.rubric_dispatcher import RubricDispatcher, RubricDispatchError
+from hypotest.rubric_provider_debug import RubricProviderDebugLogger
+
 from . import config as cfg
 from .code_safety import check_code_safety
 from .config import ExecutionConfig
@@ -662,6 +665,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         problem: ProblemInstance,
         work_dir: Path,
         rubric_model: LiteLLMModel | None = None,
+        rubric_dispatcher: RubricDispatcher | None = None,
+        rubric_provider_debug_logger: RubricProviderDebugLogger | None = None,
         config: InterpreterEnvConfig | None = None,
         input_data: list[dict[str, str | int | None]] | None = None,
         use_host_env_vars: bool = False,
@@ -672,6 +677,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         self.config = config or InterpreterEnvConfig()
         self.work_dir = work_dir
         self.rubric_model = rubric_model
+        self.rubric_dispatcher = rubric_dispatcher
+        self.rubric_provider_debug_logger = rubric_provider_debug_logger
         self.done = False
         self.problem = problem
         self.use_host_env_vars = use_host_env_vars
@@ -1271,7 +1278,16 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             "kernel_interrupt_seconds_max": self._kernel_interrupt_seconds_max,
             "kernel_wedged": self._kernel_wedged,
             "time_accounting": self.get_time_accounting_metadata(),
+            "rubric_dispatch_enabled": self.rubric_dispatcher is not None,
         }
+        dispatch_metadata = self.state.score_metadata.get("rubric_dispatch")
+        if isinstance(dispatch_metadata, Mapping):
+            metadata.update(
+                {
+                    f"rubric_dispatch_{key}": cast(JsonValue, value)
+                    for key, value in dispatch_metadata.items()
+                }
+            )
         if self.config.deterministic:
             metadata |= {
                 "deterministic": True,
@@ -1305,25 +1321,44 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
         if self.config.rubric_seed is not None:
             request_kwargs["seed"] = self.config.rubric_seed
 
-        if not rubric_images:
-            return await self.rubric_model.call_single(prompt, **request_kwargs)
+        debug_request = None
+        if self.rubric_provider_debug_logger is not None:
+            debug_request = self.rubric_provider_debug_logger.begin_request(
+                prompt=prompt,
+                rubric_images=rubric_images,
+                env_idx=self.config.env_idx,
+                problem_id=str(self.problem.id),
+            )
+            request_kwargs["metadata"] = self.rubric_provider_debug_logger.metadata_for(debug_request)
 
-        image_urls = [str(image["data_url"]) for image in rubric_images]
-        message = Message.create_message(
-            role="user",
-            text=prompt,
-            images=cast(list[np.ndarray | str], image_urls),
-        )
-        return await self.rubric_model.call_single([message], **request_kwargs)
+        try:
+            if not rubric_images:
+                response = await self.rubric_model.call_single(prompt, **request_kwargs)
+            else:
+                image_urls = [str(image["data_url"]) for image in rubric_images]
+                message = Message.create_message(
+                    role="user",
+                    text=prompt,
+                    images=cast(list[np.ndarray | str], image_urls),
+                )
+                response = await self.rubric_model.call_single([message], **request_kwargs)
+        except BaseException as error:
+            if debug_request is not None:
+                self.rubric_provider_debug_logger.finish_request(debug_request, error)
+            raise
 
-    @tenacity.retry(stop=tenacity.stop_after_attempt(3), retry=tenacity.retry_if_exception_type(ValueError))
-    async def _evaluate_rubric(
+        if debug_request is not None:
+            self.rubric_provider_debug_logger.finish_request(debug_request)
+        return response
+
+    async def _evaluate_rubric_once(
         self,
         solution: str,
         nb_content: str,
         rubric_images: list[Mapping[str, Any]],
+        *,
+        timeout: float,
     ) -> int:
-        """Evaluate the solution against the rubric. Returns raw integer score."""
         assert self.rubric_model is not None
 
         prompt = self.state.score_metadata["prompt"] = RUBRIC_SCORE_PROMPT.format(
@@ -1336,7 +1371,7 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
 
         self.state.score_metadata["rubric_images"] = self._rubric_image_metadata(rubric_images)
         try:
-            resp = await self._call_rubric_model(prompt, rubric_images, timeout=10 * 60)
+            resp = await self._call_rubric_model(prompt, rubric_images, timeout=timeout)
         except Exception as e:
             self._record_rubric_model_failure("request_error", error=e)
             raise
@@ -1355,6 +1390,44 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             raise ValueError("Failed to parse score from response") from e
         self._record_rubric_model_success(response_text)
         return score
+
+    @tenacity.retry(stop=tenacity.stop_after_attempt(3), retry=tenacity.retry_if_exception_type(ValueError))
+    async def _evaluate_rubric_direct(
+        self,
+        solution: str,
+        nb_content: str,
+        rubric_images: list[Mapping[str, Any]],
+    ) -> int:
+        return await self._evaluate_rubric_once(solution, nb_content, rubric_images, timeout=10 * 60)
+
+    async def _evaluate_rubric(
+        self,
+        solution: str,
+        nb_content: str,
+        rubric_images: list[Mapping[str, Any]],
+    ) -> int:
+        """Evaluate the solution against the rubric. Returns raw integer score."""
+        if self.rubric_dispatcher is None:
+            return await self._evaluate_rubric_direct(solution, nb_content, rubric_images)
+
+        timeout = self.rubric_dispatcher.config.attempt_timeout_seconds
+        try:
+            result = await self.rubric_dispatcher.run(
+                lambda _attempt: self._evaluate_rubric_once(
+                    solution,
+                    nb_content,
+                    rubric_images,
+                    timeout=timeout,
+                )
+            )
+        except RubricDispatchError as error:
+            self.state.score_metadata["rubric_dispatch"] = error.metrics.as_dict()
+            if not self.state.rubric_model_failed:
+                self._record_rubric_model_failure("request_error", error=error)
+            raise
+
+        self.state.score_metadata["rubric_dispatch"] = result.metrics.as_dict()
+        return result.value
 
     @tenacity.retry(stop=tenacity.stop_after_attempt(3), retry=tenacity.retry_if_exception_type(ValueError))
     async def _evaluate_faithfulness_gate(

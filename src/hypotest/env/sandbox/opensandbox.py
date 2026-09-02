@@ -63,6 +63,13 @@ _RETRYABLE_MESSAGE_MARKERS = (
     "timeout",
 )
 _ENVIRONMENT_REFERENCE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+_ALLOCATION_CREDENTIAL_ENV_VARS = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_ENDPOINT_URL",
+    "AWS_DEFAULT_REGION",
+)
 
 
 class OpenSandboxUnavailableError(RuntimeError):
@@ -613,6 +620,9 @@ class OpenSandboxSandbox(Sandbox):
         """Build init-time capsule and caller environment for one allocation."""
         env = dict(self._spec.env)
         env.update(self._config.extra_envs)
+        for variable in _ALLOCATION_CREDENTIAL_ENV_VARS:
+            if (value := os.getenv(variable)) is not None:
+                env.setdefault(variable, value)
         if self._ref.delivery == "object_store":
             source = self._ref.source or self._spec.capsule_source
             if source is not None:
@@ -636,6 +646,18 @@ class OpenSandboxSandbox(Sandbox):
             env["HYPOTEST_BUNDLE_CAPSULE_ID"] = self._ref.uuid
         return env
 
+    def _image_auth(self) -> OpenSandboxImageAuth | None:
+        if self._spec.image_auth is not None:
+            return self._spec.image_auth
+
+        username = os.getenv("REGISTRY_USERNAME")
+        password = os.getenv("REGISTRY_PASSWORD")
+        if username is None and password is None:
+            return None
+        if not username or not password:
+            raise ValueError("REGISTRY_USERNAME and REGISTRY_PASSWORD must both be set for image authentication")
+        return OpenSandboxImageAuth(username=username, password=password)
+
     async def _allocate(self, connection_config: Any) -> Any:
         OpenSandbox, _, PlatformSpec, SandboxImageAuth, SandboxImageSpec = _require_opensandbox_sdk()
         image = self._selected_image()
@@ -644,7 +666,7 @@ class OpenSandboxSandbox(Sandbox):
             metadata.setdefault("hypotest-job", self._config.job_id)
 
         kwargs: dict[str, Any] = {
-            "image": _to_image_spec(image, self._spec.image_auth, SandboxImageAuth, SandboxImageSpec),
+            "image": _to_image_spec(image, self._image_auth(), SandboxImageAuth, SandboxImageSpec),
             "timeout": timedelta(seconds=self._spec.ttl_seconds) if self._spec.ttl_seconds is not None else None,
             "ready_timeout": timedelta(seconds=self._spec.ready_timeout_seconds),
             "env": self._allocation_env(),

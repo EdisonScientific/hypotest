@@ -78,6 +78,8 @@ def _install_fakes(
     *,
     health_status=200,
 ):
+    monkeypatch.delenv("REGISTRY_USERNAME", raising=False)
+    monkeypatch.delenv("REGISTRY_PASSWORD", raising=False)
     remote = _FakeRemote(endpoint)
     create_kwargs: dict = {}
 
@@ -142,6 +144,38 @@ def _install_fakes(
 def test_resource_request_cannot_exceed_limit(resources, message):
     with pytest.raises(ValueError, match=message):
         ResourceSpec(**resources)
+
+
+def test_runtime_credentials_are_not_required_in_serialized_spec(tmp_path, monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "runtime-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "runtime-secret-key")
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://object-store.example")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-test-1")
+    monkeypatch.setenv("REGISTRY_USERNAME", "runtime-registry-user")
+    monkeypatch.setenv("REGISTRY_PASSWORD", "runtime-registry-password")
+    config = SandboxConfig(
+        work_dir=tmp_path,
+        language=NBLanguage.PYTHON,
+        execution_timeout=60,
+        safe_execute=True,
+        resources=ResourceSpec(),
+        ref=CapsuleRef(source="s3://capsules/root", uuid="cap-1", delivery="object_store"),
+    )
+    spec = OpenSandboxSpec(image="registry/kernel:latest")
+    sandbox = OpenSandboxSandbox(config, spec)
+
+    allocation_env = sandbox._allocation_env()
+    image_auth = sandbox._image_auth()
+
+    assert allocation_env["AWS_ACCESS_KEY_ID"] == "runtime-access-key"
+    assert allocation_env["AWS_SECRET_ACCESS_KEY"] == "runtime-secret-key"
+    assert allocation_env["AWS_ENDPOINT_URL"] == "https://object-store.example"
+    assert allocation_env["AWS_DEFAULT_REGION"] == "us-test-1"
+    assert image_auth is not None
+    assert image_auth.username == "runtime-registry-user"
+    assert image_auth.password.get_secret_value() == "runtime-registry-password"
+    assert "runtime-secret-key" not in repr(spec)
+    assert "runtime-registry-password" not in repr(spec)
 
 
 @pytest.mark.asyncio

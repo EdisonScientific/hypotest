@@ -24,6 +24,11 @@ from hypotest.env.determinism import EnvSeeds
 from hypotest.env.interpreter_env import InterpreterEnv, InterpreterEnvConfig, ProblemInstance
 from hypotest.env.kernel_server import NBLanguage
 from hypotest.env.sandbox import K8sSandboxSpec, OpenSandboxSpec
+from hypotest.rubric_dispatcher import RubricDispatchConfig, RubricDispatcher
+from hypotest.rubric_provider_debug import (
+    RubricProviderDebugLogger,
+    resolve_rubric_provider_debug_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +47,9 @@ class DatasetConfig(BaseModel):
 
     rubric_model: str = "openai/gpt-5"
     rubric_model_config: dict[str, Any] = Field(default_factory=lambda: {"reasoning_effort": "medium"})
+    rubric_provider_debug_log: bool = False
+    rubric_provider_debug_log_path: Path | None = None
+    rubric_dispatch: RubricDispatchConfig | None = None
 
     # Best-effort deterministic rollouts. `seed` is a base seed: independent
     # kernel, scheduler, and rubric seeds are derived statelessly per env index.
@@ -97,6 +105,27 @@ class DatasetConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def validate_rubric_dispatch(self) -> Self:
+        if self.rubric_dispatch is None or not self.rubric_dispatch.enabled:
+            return self
+        if self.faithfulness_mode != "off":
+            raise ValueError("rubric dispatch currently requires faithfulness_mode=off")
+
+        router_kwargs = self.rubric_model_config.get("router_kwargs", {})
+        if router_kwargs.get("num_retries") != 0:
+            raise ValueError("rubric dispatch requires rubric_model_config.router_kwargs.num_retries=0")
+        if router_kwargs.get("default_max_parallel_requests") is not None:
+            raise ValueError("rubric dispatch owns concurrency; remove default_max_parallel_requests")
+
+        for deployment in self.rubric_model_config.get("model_list", []):
+            params = deployment.get("litellm_params", {})
+            if params.get("max_parallel_requests") is not None:
+                raise ValueError("rubric dispatch owns concurrency; remove max_parallel_requests")
+            if params.get("num_retries", 0) != 0:
+                raise ValueError("rubric dispatch requires deployment num_retries=0")
+        return self
+
+    @model_validator(mode="after")
     def make_dirs(self) -> Self:
         for d in (self.work_dir, self.save_dir, self.data_dir):
             if d:
@@ -121,6 +150,19 @@ class Dataset(TaskDataset[InterpreterEnv]):
         self.problems = self._load_problems()
 
         self.rubric_model = LiteLLMModel(name=self.config.rubric_model, config=self.config.rubric_model_config)
+        self.rubric_dispatcher: RubricDispatcher | None = None
+        if self.config.rubric_dispatch is not None and self.config.rubric_dispatch.enabled:
+            self.rubric_dispatcher = RubricDispatcher(self.config.rubric_dispatch)
+            logger.warning("Rubric dispatcher enabled: %s", self.config.rubric_dispatch.model_dump())
+        self.rubric_provider_debug_logger: RubricProviderDebugLogger | None = None
+        if self.config.rubric_provider_debug_log:
+            debug_path = resolve_rubric_provider_debug_path(self.config.rubric_provider_debug_log_path)
+            self.rubric_provider_debug_logger = RubricProviderDebugLogger(
+                debug_path,
+                model_name=self.config.rubric_model,
+            )
+            self.rubric_provider_debug_logger.register()
+            logger.warning("Rubric provider debug logging enabled at %s", debug_path)
 
         self.problem_counter: Counter[UUID] = Counter()
 
@@ -238,17 +280,21 @@ class Dataset(TaskDataset[InterpreterEnv]):
         else:
             problem_dir = Path(mkdtemp())
 
-        # Always stage the capsule locally, even when the primary backend pulls
-        # it remotely. The staged copy makes the fallback backend data-complete.
-        if self.capsule_dir is None:  # lazy s3: pull this task's capsule straight into the work dir
-            self._pull_capsule_from_s3(problem, problem_dir)
-        else:
-            capsule_path = self.capsule_dir / problem.input_data_path
-            if not capsule_path.exists():
-                capsule_path = self.capsule_dir / f"CapsuleData-{problem.id}"
+        remote_only = (
+            self.config.opensandbox_spec is not None
+            and not self.config.opensandbox_spec.local_fallback_enabled
+        )
+        if not remote_only:
+            # Keep the colocated fallback data-complete when it is enabled.
+            if self.capsule_dir is None:  # lazy s3: pull this task's capsule straight into the work dir
+                self._pull_capsule_from_s3(problem, problem_dir)
+            else:
+                capsule_path = self.capsule_dir / problem.input_data_path
                 if not capsule_path.exists():
-                    capsule_path = self.capsule_dir / f"capsule_{problem.id}"
-            shutil.copytree(capsule_path, problem_dir, dirs_exist_ok=True)
+                    capsule_path = self.capsule_dir / f"CapsuleData-{problem.id}"
+                    if not capsule_path.exists():
+                        capsule_path = self.capsule_dir / f"capsule_{problem.id}"
+                shutil.copytree(capsule_path, problem_dir, dirs_exist_ok=True)
 
         save_dir = Path(self.config.save_dir) / run_id if self.config.save_dir else None
 
@@ -260,6 +306,8 @@ class Dataset(TaskDataset[InterpreterEnv]):
         return InterpreterEnv(
             problem=problem,
             rubric_model=self.rubric_model,
+            rubric_dispatcher=self.rubric_dispatcher,
+            rubric_provider_debug_logger=self.rubric_provider_debug_logger,
             work_dir=problem_dir,
             save_dir=save_dir,
             config=InterpreterEnvConfig(language=language, **env_config),

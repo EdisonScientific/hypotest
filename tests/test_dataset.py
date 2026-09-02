@@ -2,6 +2,8 @@ import json
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 
+import pytest
+
 import hypotest.dataset_server as datasetmod
 from hypotest.dataset_server import Dataset, DatasetConfig
 from hypotest.env.interpreter_env import ProblemInstance
@@ -63,3 +65,47 @@ def test_remote_capsule_is_still_staged_for_local_fallback(tmp_path, monkeypatch
     env = dataset.get_new_env_by_idx(0)
 
     assert (env.work_dir / "matrix.tsv").read_text(encoding="utf-8") == "gene\tvalue\nA\t1\n"
+
+
+def test_remote_only_opensandbox_skips_local_capsule_staging(tmp_path, monkeypatch):
+    problem_id = uuid4()
+    problem_jsonl = tmp_path / "problems.jsonl"
+    problem_jsonl.write_text(
+        json.dumps({
+            "id": str(problem_id),
+            "hypothesis": "A is enriched",
+            "protocol": "Test enrichment",
+            "answer": True,
+            "rubric": "Show the test",
+            "max_points": 1,
+            "input_data_path": "capsule-a",
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(datasetmod, "LiteLLMModel", lambda **kwargs: object())
+    monkeypatch.setattr(
+        Dataset,
+        "_pull_capsule_from_s3",
+        lambda *args, **kwargs: pytest.fail("remote-only setup must not stage the capsule locally"),
+    )
+    dataset = Dataset(
+        DatasetConfig(
+            problem_jsonl=str(problem_jsonl),
+            capsule_dir="s3://remote-capsules/root",
+            work_dir=tmp_path / "work",
+            use_ray=False,
+            use_enroot=False,
+            opensandbox_spec=OpenSandboxSpec(
+                image="registry/kernel:latest",
+                capsule_source="s3://remote-capsules/root",
+                local_fallback_enabled=False,
+                create_attempts=1,
+            ),
+        )
+    )
+
+    env = dataset.get_new_env_by_idx(0)
+
+    assert env.work_dir.is_dir()
+    assert list(env.work_dir.iterdir()) == []
