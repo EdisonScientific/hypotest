@@ -587,6 +587,11 @@ class InterpreterEnvConfig(BaseModel):
     use_enroot: bool = False
     container_sqsh_path: Path | None = None
     normalize_reward: bool = True
+    include_answer_feedback: bool = Field(
+        default=True,
+        description="Include correctness feedback in submit_answer's response. Disable when the policy continues "
+        "generating after submission to keep ground-truth feedback out of its context.",
+    )
     enable_faithfulness_gate: bool = False
     faithfulness_mode: Literal["off", "binary", "shadow", "hybrid"] = "off"
     wager_mode: Literal["off", "shadow", "active"] = "off"
@@ -1767,6 +1772,8 @@ class InterpreterEnv(Environment[InterpreterEnvState]):
             correct = await self._score_solution(answer)
         finally:
             self.state.done = True
+        if not self.config.include_answer_feedback:
+            return "Answer submitted."
         return CORRECT_MSG if correct else INCORRECT_MSG
 
     # ========== Time Management ==========

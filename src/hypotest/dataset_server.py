@@ -79,6 +79,10 @@ class DatasetConfig(BaseModel):
     pull_capsule_in_pod: bool = True
     force_python: bool = True
     normalize_reward: bool = True
+    include_answer_feedback: bool = Field(
+        default=True,
+        description="Include correctness feedback in submit_answer's response. Disable for post-submission generation.",
+    )
     enable_faithfulness_gate: bool = False
     faithfulness_mode: Literal["off", "binary", "shadow", "hybrid"] = "off"
     wager_mode: Literal["off", "shadow", "active"] = "off"
